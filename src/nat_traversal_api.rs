@@ -3822,12 +3822,21 @@ impl NatTraversalEndpoint {
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
-                debug!("Reusing existing relay session to {}", relay_addr);
+                debug!(
+                    relay = %relay_addr,
+                    public_address = ?session.public_address,
+                    "relay session: reusing active CONNECT-UDP session"
+                );
                 return Ok((session.public_address, None));
             }
         }
 
-        info!("Establishing relay session to {}", relay_addr);
+        info!(
+            relay = %relay_addr,
+            tracked_connections = self.connections.len(),
+            active_relay_sessions = self.relay_sessions.len(),
+            "relay session: establishing CONNECT-UDP Bind session"
+        );
 
         // Prefer reusing an existing peer connection to the relay.
         // The relay server's handle_relay_requests is spawned for each ACCEPTED
@@ -3835,15 +3844,28 @@ impl NatTraversalEndpoint {
         // already listening for bidi streams.
         let connection = if let Some(existing) = self.connections.get(&relay_addr) {
             if existing.close_reason().is_none() {
-                info!("Reusing existing peer connection to relay {}", relay_addr);
+                info!(
+                    relay = %relay_addr,
+                    stable_id = existing.stable_id(),
+                    "relay session: reusing existing peer connection to relay"
+                );
                 existing.clone()
             } else {
                 // Existing connection is dead — fall back to creating a new one
+                debug!(
+                    relay = %relay_addr,
+                    close_reason = ?existing.close_reason(),
+                    "relay session: existing peer connection is closed; cold-dialing relay"
+                );
                 drop(existing);
                 self.connect_new_to_relay(relay_addr).await?
             }
         } else {
             // No existing connection — create one
+            debug!(
+                relay = %relay_addr,
+                "relay session: no existing peer connection; cold-dialing relay"
+            );
             self.connect_new_to_relay(relay_addr).await?
         };
 
@@ -3992,6 +4014,11 @@ impl NatTraversalEndpoint {
         })?;
 
         let server_name = relay_addr.ip().to_string();
+        debug!(
+            relay = %relay_addr,
+            timeout = ?self.config.coordination_timeout,
+            "relay session: cold-dialing advertised relay address"
+        );
         let connecting = endpoint.connect(relay_addr, &server_name).map_err(|e| {
             NatTraversalError::ConnectionFailed(format!(
                 "Failed to initiate relay connection: {}",
