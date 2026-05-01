@@ -59,6 +59,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::MtuDiscoveryConfig;
 use crate::Side;
 use crate::bootstrap_cache::{BootstrapCache, BootstrapTokenStore};
 use crate::bounded_pending_buffer::BoundedPendingBuffer;
@@ -73,6 +74,7 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
+    RELAY_TUNNEL_INITIAL_MTU,
 };
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
@@ -2113,10 +2115,25 @@ impl P2pEndpoint {
             original_socket,
         );
 
-        let client_config = existing_endpoint
+        let mut client_config = existing_endpoint
             .default_client_config
             .clone()
             .ok_or_else(|| EndpointError::Config("No client config available".to_string()))?;
+
+        // Clamp the relay-tunnelled dialer's MTU to QUIC's safe
+        // minimum so the very first Initial+Handshake we coalesce can
+        // never exceed any real Internet egress path that the relay
+        // hands off to.  DPLPMTUD then probes upward as
+        // `TunnelControlFrame::PmtuUpdate` (out-of-band tunnel
+        // control frames) trim the per-target cap on the relay side.
+        // Other transport settings — congestion control, idle timeout,
+        // flow control windows — are inherited from the existing
+        // client config.
+        let mut tunnel_tc = (*client_config.transport).clone();
+        tunnel_tc.initial_mtu(RELAY_TUNNEL_INITIAL_MTU);
+        tunnel_tc.min_mtu(RELAY_TUNNEL_INITIAL_MTU);
+        tunnel_tc.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+        client_config.transport_config(Arc::new(tunnel_tc));
 
         let runtime = crate::high_level::default_runtime()
             .ok_or_else(|| EndpointError::Config("No async runtime available".to_string()))?;
@@ -2493,15 +2510,18 @@ impl P2pEndpoint {
                     EndpointError::Connection(e.to_string())
                 })?;
 
-                // Wait for the peer to acknowledge receipt of all stream data.
-                // Without this, finish() only buffers a FIN locally — if the
-                // connection is dead the caller would see Ok(()) despite the
-                // data never arriving.
+                // Give Quinn a short chance to observe stream completion.
+                // `finish()` only queues the FIN locally, while `stopped()`
+                // resolves when all stream data has been acknowledged or the
+                // peer explicitly stops the stream. A missing ACK within this
+                // local window is not proof of delivery failure, especially on
+                // busy testnets where ACKs can be delayed behind other work.
                 //
-                // The base timeout handles small messages and dead-connection
-                // detection. For large payloads we add time proportional to
-                // size at an assumed 256 KB/s per connection — conservative
-                // enough for concurrent uploads sharing the uplink.
+                // Keep hard errors for explicit stop/connection loss, but
+                // treat timeout as "queued to QUIC" and let later connection
+                // state or application-level request timeouts handle retries.
+                // For large payloads we add time proportional to size at an
+                // assumed 256 KB/s per connection.
                 let base_timeout = self.config.timeouts.send_ack_timeout;
                 let size_budget =
                     std::time::Duration::from_millis((data.len() as u64).saturating_div(256));
@@ -2519,9 +2539,10 @@ impl P2pEndpoint {
                         )));
                     }
                     Err(_elapsed) => {
-                        return Err(EndpointError::Connection(format!(
-                            "peer did not acknowledge stream data within {ack_timeout:?}"
-                        )));
+                        debug!(
+                            "send({}): stream data queued but not fully acknowledged within {:?}",
+                            addr, ack_timeout
+                        );
                     }
                 }
 

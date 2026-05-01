@@ -38,6 +38,7 @@
 //! when the tunnel cannot keep up.
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use parking_lot::Mutex as PlMutex;
 use std::fmt;
 use std::future::Future;
@@ -54,6 +55,9 @@ use quinn_udp::{RecvMeta, Transmit};
 use crate::VarInt;
 use crate::high_level::{AsyncUdpSocket, UdpPoller};
 use crate::masque::UncompressedDatagram;
+use crate::masque::tunnel_control::{
+    CONTROL_FRAME_MARKER, MAX_CONTROL_FRAME_BODY, TunnelControlFrame,
+};
 
 /// Interval at which the relay client sends a zero-length keepalive
 /// frame through the relay stream.  Must be shorter than the NAT
@@ -113,6 +117,15 @@ pub struct MasqueRelaySocket {
     /// `notify_waiters`) so a drain that races with a poller entering
     /// the wait state stores a permit, avoiding lost wakeups.
     send_capacity_freed: Arc<Notify>,
+    /// Per-target maximum payload size enforced by [`Self::try_send`],
+    /// populated by [`TunnelControlFrame::PmtuUpdate`] frames decoded by
+    /// the reader task.  When a destination has an entry, any
+    /// [`Transmit`] whose `contents.len()` exceeds the cap is silently
+    /// dropped at try_send time, simulating packet loss for Quinn's
+    /// DPLPMTUD machinery so the inner connection's MTU estimate
+    /// converges to the true egress path MTU.  Targets without an
+    /// entry are unconstrained by this layer (Quinn governs sizing).
+    target_mtu: Arc<DashMap<SocketAddr, u16>>,
     /// The original socket is kept alive so the relay connection's own
     /// QUIC traffic (keepalives, ACKs, stream data) continues to flow
     /// directly.  Without this reference the OS may reclaim the socket.
@@ -165,11 +178,15 @@ impl MasqueRelaySocket {
         let closed = Arc::new(Notify::new());
         let send_capacity_freed = Arc::new(Notify::new());
 
+        let target_mtu: Arc<DashMap<SocketAddr, u16>> = Arc::new(DashMap::new());
+        let target_mtu_reader = Arc::clone(&target_mtu);
+
         let socket = Arc::new(Self {
             relay_public_addr,
             recv_rx: PlMutex::new(recv_rx),
             send_tx: send_tx.clone(),
             send_capacity_freed: Arc::clone(&send_capacity_freed),
+            target_mtu,
             _original_socket: original_socket,
         });
 
@@ -184,12 +201,61 @@ impl MasqueRelaySocket {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (length)");
                     break;
                 }
-                let frame_len = u32::from_be_bytes(len_buf) as usize;
+                let frame_len = u32::from_be_bytes(len_buf);
+
                 // Zero-length frame = keepalive ping from the relay
                 // server, skip without trying to decode a datagram.
                 if frame_len == 0 {
                     continue;
                 }
+
+                // Sentinel marker for an out-of-band control frame.
+                // Wire layout:
+                //   [4-byte BE CONTROL_FRAME_MARKER]
+                //   [4-byte BE body_len]
+                //   [body_len bytes body]
+                if frame_len == CONTROL_FRAME_MARKER {
+                    let mut body_len_buf = [0u8; 4];
+                    if let Err(e) = recv_stream.read_exact(&mut body_len_buf).await {
+                        tracing::debug!(error = %e, "MasqueRelaySocket: control frame read error (body_len)");
+                        break;
+                    }
+                    let body_len = u32::from_be_bytes(body_len_buf);
+                    if body_len > MAX_CONTROL_FRAME_BODY {
+                        tracing::warn!(
+                            body_len,
+                            cap = MAX_CONTROL_FRAME_BODY,
+                            "MasqueRelaySocket: control frame body too large, closing"
+                        );
+                        break;
+                    }
+                    let mut body = vec![0u8; body_len as usize];
+                    if let Err(e) = recv_stream.read_exact(&mut body).await {
+                        tracing::debug!(error = %e, "MasqueRelaySocket: control frame read error (body)");
+                        break;
+                    }
+                    match TunnelControlFrame::decode_body(&body) {
+                        Some(TunnelControlFrame::PmtuUpdate { target, mtu }) => {
+                            tracing::debug!(
+                                relay = %relay_public_addr,
+                                target = %target,
+                                mtu,
+                                "RELAY_TUNNEL[clt]: PmtuUpdate received → clamping per-target MTU"
+                            );
+                            target_mtu_reader.insert(target, mtu);
+                        }
+                        None => {
+                            tracing::debug!(
+                                relay = %relay_public_addr,
+                                body_len,
+                                "RELAY_TUNNEL[clt]: unknown / malformed control frame, ignoring"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                let frame_len = frame_len as usize;
                 if frame_len > MAX_RELAY_FRAME {
                     tracing::warn!(frame_len, "MasqueRelaySocket: corrupt frame length");
                     break;
@@ -351,6 +417,30 @@ impl AsyncUdpSocket for MasqueRelaySocket {
             segment_size = ?transmit.segment_size,
             "RELAY_TUNNEL[clt]: try_send → enqueue outbound for relay-server"
         );
+
+        // Per-target MTU enforcement: if a previous PmtuUpdate control
+        // frame told us the egress path to this destination caps at
+        // `mtu` bytes, drop oversized packets here so they never reach
+        // the relay-server's fragmentation-rejecting socket.  Returning
+        // `Ok(())` makes Quinn treat the packet as successfully sent;
+        // its loss-detection then observes the missing ACK and lowers
+        // the connection's MTU estimate via DPLPMTUD's normal path.
+        // We do NOT return an Err here because that would skip Quinn's
+        // PMTUD machinery entirely and leave the size unchanged.
+        if let Some(cap) = self.target_mtu.get(&transmit.destination) {
+            let segment = transmit.segment_size.unwrap_or(transmit.contents.len());
+            if segment > usize::from(*cap) {
+                tracing::debug!(
+                    relay = %self.relay_public_addr,
+                    destination = %transmit.destination,
+                    segment,
+                    cap = *cap,
+                    "RELAY_TUNNEL[clt]: try_send dropping oversized packet (per-target MTU exceeded)"
+                );
+                return Ok(());
+            }
+        }
+
         if let Some(segment_size) = transmit.segment_size {
             for chunk in transmit.contents.chunks(segment_size) {
                 let datagram = UncompressedDatagram::new(

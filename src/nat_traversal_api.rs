@@ -34,6 +34,22 @@ const MAX_RELAY_CLIENTS_PER_PUBLIC_PEER: usize = 4;
 /// rather than retrying against the same one. See [`NatTraversalError::RelayAtCapacity`].
 const MASQUE_RELAY_FULL_STATUS: u16 = 503;
 
+/// Initial UDP payload size for connections accepted through a MASQUE
+/// relay tunnel.  Set to QUIC's mandatory minimum (1200 bytes) so the
+/// inner endpoint never produces a coalesced packet larger than what
+/// any conformant Internet path can carry; DPLPMTUD is then enabled
+/// to probe upward as the per-target PMTU map (populated by
+/// [`crate::masque::tunnel_control::TunnelControlFrame::PmtuUpdate`]
+/// frames) refines the egress cap.  This neutralises the
+/// "server-flight 4KB coalesced packet" first-packet failure mode
+/// observed when relay-tunnelled handshakes inherited the regular
+/// endpoint's higher MTU estimate.
+///
+/// Shared with the client-side dial-through-relay path in
+/// `p2p_endpoint.rs` so the same MTU discipline applies to both
+/// directions of relay-tunnelled traffic.
+pub(crate) const RELAY_TUNNEL_INITIAL_MTU: u16 = 1200;
+
 /// Buffer for completed handshakes. Sized above the peak backlog observed
 /// in the ant-rc-18 testnet (1 079 connections) so transient consumer
 /// stalls don't block the accept loop.
@@ -282,7 +298,7 @@ use crate::{
 };
 
 use crate::{
-    ClientConfig, EndpointConfig, ServerConfig, Side, TransportConfig,
+    ClientConfig, EndpointConfig, MtuDiscoveryConfig, ServerConfig, Side, TransportConfig,
     high_level::{Connection as InnerConnection, Endpoint as InnerEndpoint},
 };
 
@@ -4697,6 +4713,20 @@ impl NatTraversalEndpoint {
             .lock()
             .map_err(|_| NatTraversalError::ConfigError("mutex poisoned".to_string()))?
             .clone();
+
+        // Override the inner endpoint's TransportConfig with a
+        // relay-tunnel-safe MTU profile while preserving every other
+        // setting the main endpoint cares about (NAT traversal,
+        // congestion control, idle timeouts, flow control).  We clone
+        // the existing transport config, clamp MTU, and re-attach.
+        let server_config = server_config.map(|mut sc| {
+            let mut tunnel_tc = (*sc.transport).clone();
+            tunnel_tc.initial_mtu(RELAY_TUNNEL_INITIAL_MTU);
+            tunnel_tc.min_mtu(RELAY_TUNNEL_INITIAL_MTU);
+            tunnel_tc.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+            sc.transport = Arc::new(tunnel_tc);
+            sc
+        });
 
         let runtime = crate::high_level::default_runtime().ok_or_else(|| {
             NatTraversalError::ConfigError("No async runtime available".to_string())

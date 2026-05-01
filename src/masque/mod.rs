@@ -100,6 +100,7 @@ pub mod relay_client;
 pub mod relay_server;
 pub mod relay_session;
 pub mod relay_socket;
+pub(crate) mod tunnel_control;
 
 // Re-export primary types for convenience
 pub use capsule::{

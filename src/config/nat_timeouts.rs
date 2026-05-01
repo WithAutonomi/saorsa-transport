@@ -131,10 +131,10 @@ impl Default for RelayTimeouts {
     }
 }
 
-/// Default time to wait for the peer to acknowledge stream data after a send.
+/// Default best-effort window to observe stream-data acknowledgement after a send.
 const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Fast-network send ACK timeout (halved from default, matching the fast profile pattern).
+/// Fast-network best-effort send ACK window (halved from default).
 const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Master timeout configuration
@@ -149,14 +149,13 @@ pub struct TimeoutConfig {
     /// Relay timeouts
     pub relay: RelayTimeouts,
 
-    /// Maximum time to wait for the peer to acknowledge stream data after
-    /// `finish()`.  If this expires the send is treated as failed and the
-    /// connection is considered dead.
+    /// Best-effort time to wait for Quinn to observe acknowledgement of stream
+    /// data after `finish()`.
     ///
-    /// This must be **shorter** than any outer send timeout applied by the
-    /// caller (e.g. saorsa-core's `connection_timeout`) so that the
-    /// transport layer can surface the error before the caller's timeout
-    /// fires.
+    /// Explicit stream stop or connection loss is still returned as a send
+    /// error. Expiry of this window only means the data has been queued to
+    /// QUIC but not confirmed locally yet; later connection state or
+    /// application-level timeouts are responsible for retries.
     pub send_ack_timeout: Duration,
 }
 

@@ -888,7 +888,9 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        let min_size = self.pqc_state.min_initial_size();
+                        let min_size = self
+                            .pqc_state
+                            .min_initial_size_for_path_mtu(self.path.current_mtu());
                         builder.pad_to(min_size);
                     }
 
@@ -1145,7 +1147,9 @@ impl Connection {
                     }
                     buf.write(token);
                     self.stats.frame_tx.path_response += 1;
-                    let min_size = self.pqc_state.min_initial_size();
+                    let min_size = self
+                        .pqc_state
+                        .min_initial_size_for_path_mtu(self.path.current_mtu());
                     builder.pad_to(min_size);
                     builder.finish_and_track(
                         now,
@@ -1232,7 +1236,9 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                let min_size = self.pqc_state.min_initial_size();
+                let min_size = self
+                    .pqc_state
+                    .min_initial_size_for_path_mtu(self.path.current_mtu());
                 builder.pad_to(min_size);
             }
 
@@ -1435,7 +1441,10 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
+        buf.reserve(min_size as usize);
         let buf_capacity = buf.capacity();
 
         let mut builder = PacketBuilder::new(
@@ -1463,7 +1472,9 @@ impl Connection {
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
-        let min_size = self.pqc_state.min_initial_size();
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
         builder.pad_to(min_size);
         builder.finish_and_track(now, self, None, buf);
 
@@ -1531,7 +1542,10 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
+        buf.reserve(min_size as usize);
         let buf_capacity = buf.capacity();
 
         // Use current connection ID for NAT traversal PATH_CHALLENGE
@@ -1561,7 +1575,9 @@ impl Connection {
         self.stats.frame_tx.path_challenge += 1;
 
         // PATH_CHALLENGE frames must be padded to at least 1200 bytes
-        let min_size = self.pqc_state.min_initial_size();
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
         builder.pad_to(min_size);
 
         builder.finish_and_track(now, self, None, buf);
@@ -1595,7 +1611,10 @@ impl Connection {
             SpaceId::Data,
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(prev_path.current_mtu());
+        buf.reserve(min_size as usize);
 
         let buf_capacity = buf.capacity();
 
@@ -1629,7 +1648,6 @@ impl Connection {
         // to at least the smallest allowed maximum datagram size of 1200 bytes,
         // unless the anti-amplification limit for the path does not permit
         // sending a datagram of this size
-        let min_size = self.pqc_state.min_initial_size();
         builder.pad_to(min_size);
 
         builder.finish(self, buf);
@@ -2712,10 +2730,12 @@ impl Connection {
 
         // Check if we should trigger MTU discovery for PQC
         if self.pqc_state.should_trigger_mtu_discovery() {
-            // Request larger MTU for PQC handshakes
-            self.path
-                .mtud
-                .reset(self.pqc_state.min_initial_size(), self.config.min_mtu);
+            // Restart MTU discovery from the current path MTU. PQC handshakes
+            // may benefit from larger packets, but raising `current_mtu`
+            // directly would let the first server flight exceed the path
+            // before DPLPMTUD has proven it.
+            let current_mtu = self.path.current_mtu();
+            self.path.mtud.reset(current_mtu, self.config.min_mtu);
             trace!("Triggered MTU discovery for PQC handshake");
         }
 
@@ -2776,10 +2796,14 @@ impl Connection {
 
             if use_pqc_fragmentation {
                 // Fragment large CRYPTO data for PQC handshakes
+                let max_crypto_frame_size = usize::from(
+                    self.pqc_state
+                        .min_initial_size_for_path_mtu(self.path.current_mtu()),
+                );
                 let frames = self.pqc_state.packet_handler.fragment_crypto_data(
                     &outgoing,
                     offset,
-                    self.pqc_state.min_initial_size() as usize,
+                    max_crypto_frame_size,
                 );
                 for frame in frames {
                     self.spaces[space].pending.crypto.push_back(frame);
@@ -6498,6 +6522,12 @@ impl PqcState {
         }
     }
 
+    /// Return the PQC-preferred minimum packet size, bounded by the
+    /// path MTU that has actually been established for this connection.
+    fn min_initial_size_for_path_mtu(&self, path_mtu: u16) -> u16 {
+        self.min_initial_size().min(path_mtu)
+    }
+
     /// Update PQC state based on peer's transport parameters
     fn update_from_peer_params(&mut self, params: &TransportParameters) {
         if let Some(ref algorithms) = params.pqc_algorithms {
@@ -7039,8 +7069,30 @@ impl AddressObservationRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport_parameters::AddressDiscoveryConfig;
+    use crate::transport_parameters::{AddressDiscoveryConfig, PqcAlgorithms};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn pqc_min_initial_size_is_capped_by_path_mtu() {
+        let mut state = PqcState::new();
+        let params = TransportParameters {
+            pqc_algorithms: Some(PqcAlgorithms {
+                ml_kem_768: true,
+                ml_dsa_65: true,
+            }),
+            ..TransportParameters::default()
+        };
+
+        state.update_from_peer_params(&params);
+
+        assert_eq!(state.min_initial_size(), 4096);
+        assert_eq!(
+            state.min_initial_size_for_path_mtu(INITIAL_MTU),
+            INITIAL_MTU
+        );
+        assert_eq!(state.min_initial_size_for_path_mtu(1452), 1452);
+        assert_eq!(state.min_initial_size_for_path_mtu(9000), 4096);
+    }
 
     #[test]
     fn address_discovery_state_new() {
