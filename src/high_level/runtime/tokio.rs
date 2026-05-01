@@ -11,11 +11,11 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
 };
 
 use tokio::{
-    io::Interest,
+    io::ReadBuf,
     time::{Sleep, sleep_until},
 };
 
@@ -35,14 +35,11 @@ impl Runtime for TokioRuntime {
         tokio::spawn(future);
     }
 
-    fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        // `quinn_udp::UdpSocketState::new` configures the socket (non-blocking,
-        // GRO, IP_PMTUDISC_PROBE, IPV6_RECVPKTINFO, etc.); we must call it
-        // before handing the std socket to tokio.
-        let inner = quinn_udp::UdpSocketState::new((&sock).into())?;
+    fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        t.set_nonblocking(true)?;
         Ok(Arc::new(UdpSocket {
-            io: tokio::net::UdpSocket::from_std(sock)?,
-            inner,
+            inner: tokio::net::UdpSocket::from_std(t)?,
+            may_fragment: true, // Default to true for now
         }))
     }
 
@@ -65,30 +62,30 @@ impl AsyncTimer for TokioTimer {
     }
 }
 
-/// Tokio UDP socket implementation backed by `quinn_udp::UdpSocketState`.
-///
-/// The socket performs batched I/O: `recvmmsg` (with GRO coalescing on Linux)
-/// on receive and `sendmmsg` (with GSO segmentation) on send. This is the path
-/// that lets a single relay endpoint absorb thousands of packets per second
-/// without the kernel UDP receive buffer overflowing on every burst.
+/// Tokio UDP socket implementation
 #[derive(Debug)]
 struct UdpSocket {
-    io: tokio::net::UdpSocket,
-    inner: quinn_udp::UdpSocketState,
+    inner: tokio::net::UdpSocket,
+    may_fragment: bool,
 }
 
 impl AsyncUdpSocket for UdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(UdpPollHelper::new(move || {
             let socket = self.clone();
-            async move { socket.io.writable().await }
+            async move {
+                loop {
+                    socket.inner.writable().await?;
+                    return Ok(());
+                }
+            }
         }))
     }
 
     fn try_send(&self, transmit: &quinn_udp::Transmit) -> io::Result<()> {
-        self.io.try_io(Interest::WRITABLE, || {
-            self.inner.send((&self.io).into(), transmit)
-        })
+        self.inner
+            .try_send_to(transmit.contents, transmit.destination)?;
+        Ok(())
     }
 
     fn poll_recv(
@@ -97,30 +94,38 @@ impl AsyncUdpSocket for UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [quinn_udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        loop {
-            ready!(self.io.poll_recv_ready(cx))?;
-            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
-                self.inner.recv((&self.io).into(), bufs, meta)
-            }) {
-                return Poll::Ready(Ok(res));
-            }
+        // For now, use a simple single-packet receive
+        // In production, should use quinn_udp::recv for GSO/GRO support
+
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
         }
+
+        let mut buf = ReadBuf::new(&mut bufs[0]);
+        let addr = match self.inner.poll_recv_from(cx, &mut buf) {
+            Poll::Ready(Ok(addr)) => addr,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        };
+
+        let len = buf.filled().len();
+        let mut recv_meta = quinn_udp::RecvMeta::default();
+        recv_meta.len = len;
+        recv_meta.stride = len;
+        recv_meta.addr = addr;
+        recv_meta.ecn = None;
+        recv_meta.dst_ip = None;
+        meta[0] = recv_meta;
+
+        Poll::Ready(Ok(1))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.local_addr()
+        self.inner.local_addr()
     }
 
     fn may_fragment(&self) -> bool {
-        self.inner.may_fragment()
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        self.inner.max_gso_segments()
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        self.may_fragment
     }
 }
 
