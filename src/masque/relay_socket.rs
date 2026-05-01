@@ -206,6 +206,14 @@ impl MasqueRelaySocket {
                     Ok(datagram) => {
                         // `datagram.payload` is a zero-copy slice of
                         // the original frame buffer — no clone needed.
+                        let inbound_source = datagram.target;
+                        let inbound_len = datagram.payload.len();
+                        tracing::debug!(
+                            relay = %relay_public_addr,
+                            source = %inbound_source,
+                            len = inbound_len,
+                            "RELAY_TUNNEL[clt]: decoded inbound frame → enqueue for Quinn poll_recv"
+                        );
                         if recv_tx
                             .send((datagram.payload, datagram.target))
                             .await
@@ -336,6 +344,13 @@ impl AsyncUdpSocket for MasqueRelaySocket {
         // of `segment_size` bytes.  Each segment must be sent as its
         // own tunnel frame — the relay server has a per-frame size
         // limit and cannot handle the entire batch as one.
+        tracing::debug!(
+            relay = %self.relay_public_addr,
+            destination = %transmit.destination,
+            len = transmit.contents.len(),
+            segment_size = ?transmit.segment_size,
+            "RELAY_TUNNEL[clt]: try_send → enqueue outbound for relay-server"
+        );
         if let Some(segment_size) = transmit.segment_size {
             for chunk in transmit.contents.chunks(segment_size) {
                 let datagram = UncompressedDatagram::new(

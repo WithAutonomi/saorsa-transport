@@ -888,11 +888,11 @@ impl MasqueRelayServer {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, source)) => {
                             let payload = Bytes::copy_from_slice(&buf[..len]);
-                            tracing::trace!(
+                            tracing::debug!(
                                 session_id,
                                 source = %source,
                                 len,
-                                "Relay: received UDP from target"
+                                "RELAY_TUNNEL[srv]: dgram-loop dir1 recv UDP → forwarding to relay-client"
                             );
 
                             // Encode as uncompressed datagram (includes source address
@@ -961,21 +961,32 @@ impl MasqueRelayServer {
                             };
                             match resolved {
                                 Some((target, payload)) => {
-                                    tracing::trace!(
+                                    tracing::debug!(
                                         session_id,
                                         target = %target,
                                         len = payload.len(),
-                                        "Relay: forwarding to target via UDP"
+                                        "RELAY_TUNNEL[srv]: dgram-loop dir2 recv from relay-client → sendto target"
                                     );
                                     server2.stats.record_bytes(payload.len() as u64);
                                     server2.stats.record_datagram();
-                                    if let Err(e) = socket2.send_to(&payload, target).await {
-                                        tracing::warn!(
-                                            session_id,
-                                            target = %target,
-                                            error = %e,
-                                            "Failed to send UDP to target"
-                                        );
+                                    match socket2.send_to(&payload, target).await {
+                                        Ok(n) => {
+                                            tracing::debug!(
+                                                session_id,
+                                                target = %target,
+                                                len = payload.len(),
+                                                sent = n,
+                                                "RELAY_TUNNEL[srv]: dgram-loop dir2 sendto OK"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                session_id,
+                                                target = %target,
+                                                error = %e,
+                                                "Failed to send UDP to target"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
@@ -1072,9 +1083,9 @@ impl MasqueRelayServer {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
                         let payload = Bytes::copy_from_slice(&buf[..len]);
-                        tracing::trace!(
+                        tracing::debug!(
                             session_id, source = %source, len,
-                            "Stream relay: received UDP from target"
+                            "RELAY_TUNNEL[srv]: stream-loop dir1 recv UDP → forwarding to relay-client"
                         );
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
@@ -1167,18 +1178,31 @@ impl MasqueRelayServer {
                     let mut cursor = Bytes::from(frame_buf);
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
-                            tracing::trace!(
+                            tracing::debug!(
                                 session_id, target = %datagram.target,
                                 len = datagram.payload.len(),
-                                "Stream relay: forwarding to target via UDP"
+                                "RELAY_TUNNEL[srv]: stream-loop dir2 recv from relay-client → sendto target"
                             );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
-                            if let Err(e) = socket2.send_to(&datagram.payload, datagram.target).await {
-                                tracing::warn!(
-                                    session_id, target = %datagram.target, error = %e,
-                                    "Failed to send UDP to target"
-                                );
+                            let target = datagram.target;
+                            let payload_len = datagram.payload.len();
+                            match socket2.send_to(&datagram.payload, target).await {
+                                Ok(n) => {
+                                    tracing::debug!(
+                                        session_id,
+                                        target = %target,
+                                        len = payload_len,
+                                        sent = n,
+                                        "RELAY_TUNNEL[srv]: stream-loop dir2 sendto OK"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        session_id, target = %target, error = %e,
+                                        "Failed to send UDP to target"
+                                    );
+                                }
                             }
                         }
                         Err(_) => {
