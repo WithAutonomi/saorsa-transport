@@ -431,6 +431,22 @@ pub enum P2pEvent {
         addr: TransportAddr,
     },
 
+    /// A connected peer reported observing one of our external addresses
+    /// via an OBSERVED_ADDRESS frame.
+    ///
+    /// Fires on the first observation from each peer for a given external
+    /// address (once per `(peer, observed_external)` pair), regardless of
+    /// whether saorsa-transport's pinning quorum has been reached. Upper
+    /// layers can use this for per-address attribution of cold-dialability
+    /// proof: the peer is stating, with their own observation, that they
+    /// reached us at `observed_external`.
+    PeerObservedExternal {
+        /// The peer's socket address (the source of the OBSERVED_ADDRESS frame)
+        peer_addr: SocketAddr,
+        /// The external address the peer reports observing us at
+        observed_external: SocketAddr,
+    },
+
     /// A connected peer advertised a new reachable address (relay or migration).
     PeerAddressUpdated {
         /// The connected peer that sent the advertisement
@@ -768,6 +784,15 @@ impl P2pEndpoint {
                         info!("External address discovered: {}", address);
                         let _ = event_tx.send(P2pEvent::ExternalAddressDiscovered {
                             addr: TransportAddr::Quic(*address),
+                        });
+                    }
+                    NatTraversalEvent::PeerObservedExternal {
+                        peer_addr,
+                        observed_external,
+                    } => {
+                        let _ = event_tx.send(P2pEvent::PeerObservedExternal {
+                            peer_addr: *peer_addr,
+                            observed_external: *observed_external,
                         });
                     }
                     _ => {}

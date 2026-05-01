@@ -1237,6 +1237,20 @@ pub enum NatTraversalEvent {
         /// Our observed external address
         address: SocketAddr,
     },
+    /// A peer reported an OBSERVED_ADDRESS observation of us, before
+    /// `MIN_OBSERVERS_FOR_QUORUM` was necessarily reached.
+    ///
+    /// Emitted on the first observation from each peer for a given external
+    /// address (i.e. once per (peer, observed-address) pair). Allows upper
+    /// layers to do per-address attribution of cold-dialability proof —
+    /// the peer's frame is their own statement that they reached us at
+    /// `observed_external`.
+    PeerObservedExternal {
+        /// The peer that sent the OBSERVED_ADDRESS frame
+        peer_addr: SocketAddr,
+        /// The external address the peer reports observing us at
+        observed_external: SocketAddr,
+    },
     /// A connected peer advertised a new reachable address (ADD_ADDRESS frame).
     ///
     /// The upper layer should update its routing table so that future lookups
@@ -3501,6 +3515,18 @@ impl NatTraversalEndpoint {
                         );
                     }
 
+                    // Surface every distinct (peer, observed) pair so upper
+                    // layers can attribute cold-dialability proof to the
+                    // specific external the peer reached us at — independent
+                    // of whether quorum is reached. Required for
+                    // saorsa-core's per-address `proven_externals` model.
+                    if check.new_observer {
+                        let _ = event_tx.send(NatTraversalEvent::PeerObservedExternal {
+                            peer_addr: remote_addr,
+                            observed_external: observed_addr,
+                        });
+                    }
+
                     // Broadcast ADD_ADDRESS on the *first* observer, not the
                     // quorum cross. Rationale: peers need our external
                     // address early to coordinate hole-punches back to us.
@@ -3618,6 +3644,13 @@ impl NatTraversalEndpoint {
                                 check.observer_count,
                                 MIN_OBSERVERS_FOR_QUORUM
                             );
+                        }
+
+                        if check.new_observer {
+                            let _ = event_tx.send(NatTraversalEvent::PeerObservedExternal {
+                                peer_addr: *bootstrap_node,
+                                observed_external: candidate.address,
+                            });
                         }
 
                         // Broadcast ADD_ADDRESS to connected peers on the
