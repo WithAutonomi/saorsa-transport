@@ -4916,11 +4916,20 @@ impl Connection {
         // Normalize the address to handle IPv4-mapped IPv6 addresses
         // This is critical for nodes bound to IPv4-only sockets
         let normalized_addr = crate::shared::normalize_socket_addr(add_address.address);
+        let peer_addr = crate::shared::normalize_socket_addr(self.path.remote);
 
         info!(
             "handle_add_address: RECEIVED ADD_ADDRESS from peer addr={} (normalized={}) seq={} priority={}",
             add_address.address, normalized_addr, add_address.sequence, add_address.priority
         );
+
+        if peer_addr.ip() == normalized_addr.ip() {
+            debug!(
+                "handle_add_address: dropping same-IP ADD_ADDRESS from peer={} addr={} seq={}",
+                peer_addr, normalized_addr, add_address.sequence
+            );
+            return Ok(());
+        }
 
         match nat_state.add_remote_candidate(
             add_address.sequence,

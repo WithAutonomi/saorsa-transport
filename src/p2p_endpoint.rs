@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -76,6 +76,7 @@ use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
     RELAY_TUNNEL_INITIAL_MTU,
 };
+use crate::shared::{normalize_socket_addr, socket_addr_variants};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
 use rustls;
@@ -88,6 +89,12 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// traffic.  Kept short so the reaper acts as a fast safety net behind the
 /// event-driven reader-exit detection.
 const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Payload size above which QUIC sends are serialized per remote address.
+const LARGE_SEND_BACKPRESSURE_THRESHOLD: usize = 1024 * 1024;
+
+/// Number of large sends allowed in flight per remote address.
+const LARGE_SEND_PER_ADDR_PERMITS: usize = 1;
 
 /// Quick direct connection attempt after a failed hole-punch round.
 /// If the target's outgoing packets created a NAT binding, a QUIC handshake
@@ -231,6 +238,9 @@ pub struct P2pEndpoint {
     pending_dials: Arc<
         tokio::sync::Mutex<HashMap<SocketAddr, broadcast::Sender<Result<PeerConnection, String>>>>,
     >,
+
+    /// Per-address semaphore used to serialize large QUIC stream messages.
+    large_send_permits: Arc<dashmap::DashMap<SocketAddr, Arc<Semaphore>>>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -592,10 +602,17 @@ pub enum EndpointError {
 fn broadcast_peer_connected_once(
     emitted: &dashmap::DashSet<SocketAddr>,
     event_tx: &broadcast::Sender<P2pEvent>,
-    addr: TransportAddr,
+    mut addr: TransportAddr,
     public_key: Option<Vec<u8>>,
     side: Side,
 ) {
+    addr = match addr {
+        TransportAddr::Quic(socket_addr) => TransportAddr::Quic(normalize_socket_addr(socket_addr)),
+        TransportAddr::Tcp(socket_addr) => TransportAddr::Tcp(normalize_socket_addr(socket_addr)),
+        TransportAddr::Udp(socket_addr) => TransportAddr::Udp(normalize_socket_addr(socket_addr)),
+        other => other,
+    };
+
     if let Some(socket_addr) = addr.as_socket_addr() {
         if !emitted.insert(socket_addr) {
             debug!(
@@ -636,38 +653,74 @@ async fn do_cleanup_connection(
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
     emitted_peer_connected: &dashmap::DashSet<SocketAddr>,
+    large_send_permits: &dashmap::DashMap<SocketAddr, Arc<Semaphore>>,
     addr: &SocketAddr,
     reason: DisconnectReason,
     expected_stable_id: Option<usize>,
 ) -> bool {
+    let variants = socket_addr_variants(*addr);
+
     // Step 1: Try to remove from the NAT traversal layer first (lock-free
     // DashMap). When the caller is a reader-exit firing for an older
     // connection that has since been replaced via simultaneous-open, the
     // stable_id guard rejects the removal — in that case the current
     // DashMap entry belongs to a newer connection and the per-addr
     // tracking (connected_peers, reader_handles) must NOT be torn down.
-    let inner_removed = matches!(
-        inner.remove_connection(addr, expected_stable_id),
-        Ok(Some(_))
-    );
-    if expected_stable_id.is_some() && !inner_removed {
+    let inner_removed = variants.iter().any(|candidate| {
+        matches!(
+            inner.remove_connection(candidate, expected_stable_id),
+            Ok(Some(_))
+        )
+    });
+    if let Some(expected_id) = expected_stable_id
+        && !inner_removed
+    {
+        if let Ok(Some(current)) = inner.get_connection(addr) {
+            debug!(
+                "do_cleanup_connection: {} — current connection stable_id {} \
+                 differs from reader-exit stable_id {}, leaving state intact",
+                addr,
+                current.stable_id(),
+                expected_id
+            );
+            return false;
+        }
         debug!(
-            "do_cleanup_connection: {} — DashMap holds a newer connection, \
-             leaving connected_peers/reader_handles intact",
-            addr
+            "do_cleanup_connection: {} — no current connection for reader-exit stable_id {}, \
+             cleaning remaining endpoint state",
+            addr, expected_id
         );
-        return false;
     }
 
     // Step 2: Remove from connected_peers (canonical lock #1)
-    let removed = connected_peers.write().await.remove(addr);
+    let removed = {
+        let mut peers = connected_peers.write().await;
+        let mut removed = None;
+        for candidate in &variants {
+            if let Some(peer) = peers.remove(candidate) {
+                if removed.is_none() {
+                    removed = Some(peer);
+                }
+            }
+        }
+        removed
+    };
 
     // Allow a future reconnect to broadcast a fresh PeerConnected event.
-    emitted_peer_connected.remove(addr);
+    for candidate in &variants {
+        emitted_peer_connected.remove(candidate);
+        large_send_permits.remove(candidate);
+    }
 
     // Step 3: Remove and abort reader task (canonical lock #2)
-    let abort_handle = reader_handles.write().await.remove(addr);
-    if let Some(handle) = abort_handle {
+    let abort_handles: Vec<_> = {
+        let mut handles = reader_handles.write().await;
+        variants
+            .iter()
+            .filter_map(|candidate| handles.remove(candidate))
+            .collect()
+    };
+    for handle in abort_handles {
         handle.abort();
     }
 
@@ -906,6 +959,7 @@ impl P2pEndpoint {
             reader_handles,
             reader_exit_tx,
             pending_dials: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            large_send_permits: Arc::new(dashmap::DashMap::new()),
         };
 
         // Spawn background constrained poller task
@@ -946,13 +1000,14 @@ impl P2pEndpoint {
         &self,
         addr: &SocketAddr,
     ) -> Result<Option<crate::high_level::Connection>, EndpointError> {
+        let addr = normalize_socket_addr(*addr);
         let peers = self.connected_peers.read().await;
-        if !peers.contains_key(addr) {
+        if !peers.contains_key(&addr) {
             return Ok(None);
         }
         drop(peers);
         self.inner
-            .get_connection(addr)
+            .get_connection(&addr)
             .map_err(EndpointError::NatTraversal)
     }
 
@@ -996,6 +1051,7 @@ impl P2pEndpoint {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
+        let addr = normalize_socket_addr(addr);
 
         // Dedup check: if we already have a live connection to this address, return it.
         {
@@ -1851,6 +1907,7 @@ impl P2pEndpoint {
         connection: crate::high_level::Connection,
         addr: SocketAddr,
     ) -> Result<PeerConnection, EndpointError> {
+        let addr = normalize_socket_addr(addr);
         // Extract public key from TLS
         let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
@@ -1956,6 +2013,8 @@ impl P2pEndpoint {
         target: SocketAddr,
         coordinator: SocketAddr,
     ) -> Result<PeerConnection, EndpointError> {
+        let target = normalize_socket_addr(target);
+        let coordinator = normalize_socket_addr(coordinator);
         info!(
             "try_hole_punch: ENTER target={} coordinator={}",
             target, coordinator
@@ -2046,6 +2105,7 @@ impl P2pEndpoint {
             };
 
             if let Some(actual_addr) = connected_addr {
+                let actual_addr = normalize_socket_addr(actual_addr);
                 info!(
                     "try_hole_punch: connection to {} established (actual addr: {})!",
                     target, actual_addr
@@ -2244,7 +2304,7 @@ impl P2pEndpoint {
 
     /// Check if we're connected to a specific address
     async fn is_connected_to_addr(&self, addr: SocketAddr) -> bool {
-        let transport_addr = TransportAddr::Quic(addr);
+        let transport_addr = TransportAddr::Quic(normalize_socket_addr(addr));
         let peers = self.connected_peers.read().await;
         peers.values().any(|p| p.remote_addr == transport_addr)
     }
@@ -2357,6 +2417,7 @@ impl P2pEndpoint {
             &*self.stats,
             &self.event_tx,
             &self.emitted_peer_connected,
+            &self.large_send_permits,
             addr,
             reason,
             None,
@@ -2366,7 +2427,14 @@ impl P2pEndpoint {
 
     /// Disconnect from a peer by address
     pub async fn disconnect(&self, addr: &SocketAddr) -> Result<(), EndpointError> {
-        if self.connected_peers.read().await.contains_key(addr) {
+        let variants = socket_addr_variants(*addr);
+        if self
+            .connected_peers
+            .read()
+            .await
+            .keys()
+            .any(|known| variants.contains(known))
+        {
             self.cleanup_connection(addr, DisconnectReason::Normal)
                 .await;
             Ok(())
@@ -2427,10 +2495,10 @@ impl P2pEndpoint {
         // plain IPv4. Try both forms when looking up the peer.
         let (transport_addr, cached_connection) = {
             let peer_info = self.connected_peers.read().await;
-            let alt = crate::shared::dual_stack_alternate(addr);
-            let found = peer_info
-                .get(addr)
-                .or_else(|| alt.as_ref().and_then(|a| peer_info.get(a)));
+            let variants = socket_addr_variants(*addr);
+            let found = variants
+                .iter()
+                .find_map(|candidate| peer_info.get(candidate));
             if let Some(peer_conn) = found {
                 (peer_conn.remote_addr.clone(), None)
             } else {
@@ -2438,31 +2506,31 @@ impl P2pEndpoint {
                 // address (e.g. from a hole-punch that bypassed the normal path).
                 // Capture the connection now before it can be cleaned up.
                 drop(peer_info);
-                let conn = self.inner.get_connection(addr).ok().flatten().or_else(|| {
-                    alt.as_ref()
-                        .and_then(|a| self.inner.get_connection(a).ok().flatten())
-                });
+                let conn = variants
+                    .iter()
+                    .find_map(|candidate| self.inner.get_connection(candidate).ok().flatten());
                 if let Some(conn) = conn {
+                    let key = normalize_socket_addr(*addr);
                     info!(
                         "send: found hole-punched connection to {}, registering",
-                        addr
+                        key
                     );
                     let peer_conn = PeerConnection {
                         public_key: None,
-                        remote_addr: TransportAddr::Quic(*addr),
+                        remote_addr: TransportAddr::Quic(key),
                         authenticated: true,
                         connected_at: Instant::now(),
                         last_activity: Instant::now(),
                     };
-                    self.connected_peers.write().await.insert(*addr, peer_conn);
+                    self.connected_peers.write().await.insert(key, peer_conn);
                     broadcast_peer_connected_once(
                         &self.emitted_peer_connected,
                         &self.event_tx,
-                        TransportAddr::Quic(*addr),
+                        TransportAddr::Quic(key),
                         None,
                         Side::Server,
                     );
-                    (TransportAddr::Quic(*addr), Some(conn))
+                    (TransportAddr::Quic(key), Some(conn))
                 } else {
                     return Err(EndpointError::PeerNotFound(*addr));
                 }
@@ -2514,6 +2582,31 @@ impl P2pEndpoint {
                     );
                     return Err(EndpointError::PeerNotFound(*addr));
                 }
+
+                let _large_send_permit = if data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD {
+                    let permit_key = match transport_addr {
+                        TransportAddr::Quic(addr) => normalize_socket_addr(addr),
+                        _ => normalize_socket_addr(*addr),
+                    };
+                    let semaphore = self
+                        .large_send_permits
+                        .entry(permit_key)
+                        .or_insert_with(|| Arc::new(Semaphore::new(LARGE_SEND_PER_ADDR_PERMITS)))
+                        .clone();
+                    debug!(
+                        "send({}): waiting for large-send permit ({} bytes)",
+                        permit_key,
+                        data.len()
+                    );
+                    Some(
+                        semaphore
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| EndpointError::ShuttingDown)?,
+                    )
+                } else {
+                    None
+                };
 
                 let mut send_stream = connection.open_uni().await.map_err(|e| {
                     warn!("send({}): open_uni failed: {}", addr, e);
@@ -2812,7 +2905,10 @@ impl P2pEndpoint {
 
     /// Check if an address is connected
     pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
-        self.connected_peers.read().await.contains_key(addr)
+        self.connected_peers
+            .read()
+            .await
+            .contains_key(&normalize_socket_addr(*addr))
     }
 
     /// Check if a live QUIC connection exists at the NatTraversalEndpoint level.
@@ -2836,6 +2932,11 @@ impl P2pEndpoint {
     pub fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
         self.inner
             .register_connection_peer_id(addr, crate::nat_traversal_api::PeerId(peer_id));
+    }
+
+    /// Return whether this endpoint owns an active QUIC connection for `addr`.
+    pub fn has_active_connection(&self, addr: &SocketAddr) -> bool {
+        self.inner.is_connected(addr)
     }
 
     /// Check if a peer is connected at the transport level.
@@ -2879,6 +2980,7 @@ impl P2pEndpoint {
         // Abort all background reader tasks
         self.reader_tasks.lock().await.abort_all();
         self.reader_handles.write().await.clear();
+        self.large_send_permits.clear();
 
         // Disconnect all peers
         let addrs: Vec<SocketAddr> = self.connected_peers.read().await.keys().copied().collect();
@@ -2915,20 +3017,9 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let max_read_bytes = self.config.max_message_size;
         let exit_tx = self.reader_exit_tx.clone();
-        let inner = Arc::clone(&self.inner);
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             info!("Reader task STARTED for {}", addr);
-
-            // Ensure the connection is in the NatTraversalEndpoint's DashMap
-            // so the send path can find it. This is critical for NAT-traversed
-            // connections where the accept-time DashMap entry may be missing
-            // or removed by competing accept paths.
-            debug!("Reader task: calling add_connection for {}", addr);
-            match inner.add_connection(addr, connection.clone()) {
-                Ok(()) => debug!("Reader task: add_connection OK for {}", addr),
-                Err(e) => warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e),
-            }
 
             loop {
                 // Accept the next unidirectional stream
@@ -3001,7 +3092,10 @@ impl P2pEndpoint {
             addr
         });
 
-        self.reader_handles.write().await.insert(addr, abort_handle);
+        let key = normalize_socket_addr(addr);
+        if let Some(old) = self.reader_handles.write().await.insert(key, abort_handle) {
+            old.abort();
+        }
     }
 
     /// Spawn a single background task that polls constrained transport events
@@ -3195,6 +3289,7 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
+        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3224,6 +3319,7 @@ impl P2pEndpoint {
                     &stats,
                     &event_tx,
                     &emitted_peer_connected,
+                    &large_send_permits,
                     &addr,
                     DisconnectReason::Timeout,
                     Some(stable_id),
@@ -3254,6 +3350,7 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
+        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3295,6 +3392,7 @@ impl P2pEndpoint {
                         &stats,
                         &event_tx,
                         &emitted_peer_connected,
+                        &large_send_permits,
                         addr,
                         DisconnectReason::Timeout,
                         None,
@@ -3462,14 +3560,9 @@ impl P2pEndpoint {
                     let data_tx = data_tx.clone();
                     let event_tx = event_tx.clone();
                     let exit_tx = reader_exit_tx.clone();
-                    let inner2 = Arc::clone(&inner);
 
                     let abort_handle = reader_tasks.lock().await.spawn(async move {
                         info!("Reader task STARTED for {} (via forwarder)", addr);
-                        match inner2.add_connection(addr, conn.clone()) {
-                            Ok(()) => debug!("Reader task (forwarder): add_connection OK for {}", addr),
-                            Err(e) => warn!("Reader task (forwarder): add_connection FAILED for {}: {:?}", addr, e),
-                        }
 
                         loop {
                             let mut recv_stream = match conn.accept_uni().await {
@@ -3507,7 +3600,10 @@ impl P2pEndpoint {
                         addr
                     });
 
-                    reader_handles.write().await.insert(addr, abort_handle);
+                    let key = normalize_socket_addr(addr);
+                    if let Some(old) = reader_handles.write().await.insert(key, abort_handle) {
+                        old.abort();
+                    }
                 } else {
                     warn!(
                         "Incoming connection forwarder: no connection found for {} in DashMap",
@@ -3515,7 +3611,10 @@ impl P2pEndpoint {
                     );
                 }
 
-                connected_peers.write().await.insert(addr, peer_conn);
+                connected_peers
+                    .write()
+                    .await
+                    .insert(normalize_socket_addr(addr), peer_conn);
                 broadcast_peer_connected_once(
                     &emitted_peer_connected,
                     &event_tx,
@@ -3523,69 +3622,6 @@ impl P2pEndpoint {
                     None,
                     Side::Server,
                 );
-
-                // Spawn a reader task for the connection so incoming streams
-                // (DHT, chunk protocol) are actually read. Without this, relayed
-                // connections are registered but never processed.
-                match inner.get_connection(&addr) {
-                    Ok(Some(conn)) => {
-                        info!(
-                            "Incoming connection forwarder: spawning reader task for {}",
-                            addr
-                        );
-                        let data_tx = data_tx.clone();
-                        let event_tx_for_reader = event_tx.clone();
-                        let exit_tx = reader_exit_tx.clone();
-                        let inner_for_reader = Arc::clone(&inner);
-                        reader_tasks.lock().await.spawn(async move {
-                            info!("Reader task STARTED for {} (via forwarder)", addr);
-                            match inner_for_reader.add_connection(addr, conn.clone()) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e);
-                                }
-                            }
-                            loop {
-                                let mut recv_stream = match conn.accept_uni().await {
-                                    Ok(stream) => stream,
-                                    Err(e) => {
-                                        info!("Reader task for {} (forwarder) ending: {}", addr, e);
-                                        break;
-                                    }
-                                };
-                                let data = match recv_stream.read_to_end(max_read_bytes).await {
-                                    Ok(data) if data.is_empty() => continue,
-                                    Ok(data) => data,
-                                    Err(e) => {
-                                        info!("Reader task for {} (forwarder): read error: {}", addr, e);
-                                        break;
-                                    }
-                                };
-                                let data_len = data.len();
-                                let _ = event_tx_for_reader.send(P2pEvent::DataReceived {
-                                    addr, bytes: data_len,
-                                });
-                                if data_tx.try_send((addr, data)).is_err() {
-                                    warn!("Reader task for {} (forwarder): data channel full, dropping {} bytes", addr, data_len);
-                                }
-                            }
-                            let _ = exit_tx.send((addr, conn.stable_id()));
-                            addr
-                        });
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "Incoming connection forwarder: get_connection({}) returned None — no reader task",
-                            addr
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Incoming connection forwarder: get_connection({}) failed: {} — no reader task",
-                            addr, e
-                        );
-                    }
-                }
             }
         });
     }
@@ -3620,6 +3656,7 @@ impl Clone for P2pEndpoint {
             reader_handles: Arc::clone(&self.reader_handles),
             reader_exit_tx: self.reader_exit_tx.clone(),
             pending_dials: Arc::clone(&self.pending_dials),
+            large_send_permits: Arc::clone(&self.large_send_permits),
         }
     }
 }

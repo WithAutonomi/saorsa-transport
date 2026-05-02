@@ -165,7 +165,7 @@ fn extract_ml_dsa_from_spki(spki: &[u8]) -> Option<crate::crypto::pqc::types::Ml
 }
 
 // Import shared normalize_socket_addr utility
-use crate::shared::{dual_stack_alternate, normalize_socket_addr};
+use crate::shared::{dual_stack_alternate, normalize_socket_addr, socket_addr_variants};
 
 /// Broadcast an ADD_ADDRESS frame to all connected peers.
 ///
@@ -2429,7 +2429,10 @@ impl NatTraversalEndpoint {
         }
 
         // CRITICAL: Check for existing active session FIRST to prevent race conditions.
-        if self.active_sessions.contains_key(&target_addr) {
+        if socket_addr_variants(target_addr)
+            .iter()
+            .any(|addr| self.active_sessions.contains_key(addr))
+        {
             debug!(
                 "NAT traversal already in progress for {}, skipping duplicate request",
                 target_addr
@@ -2507,14 +2510,18 @@ impl NatTraversalEndpoint {
 
                     // Check if any connection attempts succeeded
                     // First, check the connections DashMap to see if a connection was established
-                    let has_connection = self.connections.contains_key(&target_addr);
+                    let connected =
+                        socket_addr_variants(target_addr)
+                            .into_iter()
+                            .find_map(|addr| {
+                                self.connections.get(&addr).map(|conn| conn.value().clone())
+                            });
+                    let has_connection = connected.is_some();
 
                     if has_connection || session.session_state.connection.is_some() {
                         // Update session_state.connection from the connections DashMap
                         if session.session_state.connection.is_none() {
-                            if let Some(conn_ref) = self.connections.get(&target_addr) {
-                                session.session_state.connection = Some(conn_ref.clone());
-                            }
+                            session.session_state.connection = connected;
                         }
 
                         session.session_state.state = ConnectionState::Connected;
@@ -3166,29 +3173,30 @@ impl NatTraversalEndpoint {
                                 // Always overwrite — the latest connection from the
                                 // accept handler is most likely alive, replacing any
                                 // dead duplicate from simultaneous-open.
-                                connections.insert(remote_address, connection.clone());
+                                let connection_key = normalize_socket_addr(remote_address);
+                                connections.insert(connection_key, connection.clone());
 
                                 // Notify the P2pEndpoint's forwarder about the new connection
-                                match accepted_addrs_tx.send(remote_address) {
+                                match accepted_addrs_tx.send(connection_key) {
                                     Ok(()) => info!(
                                         "accept_connections: sent {} to forwarder channel",
-                                        remote_address
+                                        connection_key
                                     ),
                                     Err(e) => error!(
                                         "accept_connections: forwarder channel send FAILED for {}: {}",
-                                        remote_address, e
+                                        connection_key, e
                                     ),
                                 }
 
                                 // Only emit ConnectionEstablished if we haven't already for this address
                                 // DashSet::insert returns true if the value was newly inserted
-                                let should_emit = emitted_events.insert(remote_address);
+                                let should_emit = emitted_events.insert(connection_key);
 
                                 if should_emit {
                                     // Background accept = they connected to us = Server side
                                     let _ =
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
-                                            remote_address,
+                                            remote_address: connection_key,
                                             side: Side::Server,
                                             public_key,
                                         });
@@ -3705,6 +3713,7 @@ impl NatTraversalEndpoint {
         connection: InnerConnection,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
     ) {
+        let remote_address = normalize_socket_addr(remote_address);
         let closed = connection.closed();
         tokio::pin!(closed);
 
@@ -3760,7 +3769,7 @@ impl NatTraversalEndpoint {
         // Send event notification (we initiated = Client side)
         if let Some(ref event_tx) = self.event_tx {
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
-                remote_address: remote_addr,
+                remote_address: normalize_socket_addr(remote_addr),
                 side: Side::Client,
                 public_key,
             });
@@ -4311,14 +4320,15 @@ impl NatTraversalEndpoint {
                         );
                         return; // new connection is not tracked in `connections`
                     }
-                    connections2.insert(remote_address, connection.clone());
+                    let connection_key = normalize_socket_addr(remote_address);
+                    connections2.insert(connection_key, connection.clone());
 
                     // Only forward to handshake_tx if this is the first time
                     // we've seen this address. Without this guard, a
                     // simultaneous-open (both sides connect at the same time)
                     // sends two entries to handshake_tx, causing duplicate
                     // reader tasks for the same connection address.
-                    if emitted2.insert(remote_address) {
+                    if emitted2.insert(connection_key) {
                         if let Some(ref server) = relay_server2 {
                             let conn_clone = connection.clone();
                             let server_clone = Arc::clone(server);
@@ -4335,14 +4345,14 @@ impl NatTraversalEndpoint {
 
                         if let Some(ref etx) = event_tx2 {
                             let etx = etx.clone();
-                            let addr = remote_address;
+                            let addr = connection_key;
                             let conn = connection.clone();
                             tokio::spawn(async move {
                                 Self::handle_connection(addr, conn, etx).await;
                             });
                         }
 
-                        let _ = tx2.send(Ok((remote_address, connection))).await;
+                        let _ = tx2.send(Ok((connection_key, connection))).await;
                     } else {
                         debug!(
                             "Duplicate connection from {} already emitted, skipping",
@@ -4380,21 +4390,23 @@ impl NatTraversalEndpoint {
     }
 
     pub fn is_connected(&self, addr: &SocketAddr) -> bool {
-        if let Some(entry) = self.connections.get(addr) {
+        for candidate in socket_addr_variants(*addr) {
+            let Some(entry) = self.connections.get(&candidate) else {
+                continue;
+            };
             if let Some(reason) = entry.value().close_reason() {
                 // Connection is dead — remove it and report not connected.
                 info!(
                     "is_connected: {} has close_reason={}, removing from DashMap",
-                    addr, reason
+                    candidate, reason
                 );
                 drop(entry); // release the DashMap ref before removing
-                self.connections.remove(addr);
+                self.connections.remove(&candidate);
                 return false;
             }
-            true
-        } else {
-            false
+            return true;
         }
+        false
     }
 
     /// Number of tracked connections (for diagnostics).
@@ -4408,10 +4420,12 @@ impl NatTraversalEndpoint {
         addr: &SocketAddr,
     ) -> Result<Option<InnerConnection>, NatTraversalError> {
         // DashMap provides lock-free .get()
-        Ok(self
-            .connections
-            .get(addr)
-            .map(|entry| entry.value().clone()))
+        for candidate in socket_addr_variants(*addr) {
+            if let Some(entry) = self.connections.get(&candidate) {
+                return Ok(Some(entry.value().clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Get the receiver for accepted connection addresses.
@@ -4435,8 +4449,9 @@ impl NatTraversalEndpoint {
         addr: SocketAddr,
         connection: InnerConnection,
     ) -> Result<(), NatTraversalError> {
+        let key = normalize_socket_addr(addr);
         let observed = connection.observed_address();
-        info!("add_connection: {} observed_address={:?}", addr, observed);
+        info!("add_connection: {} observed_address={:?}", key, observed);
         // Always overwrite with the newer connection. The previous
         // logic skipped overwrite when the existing connection had no
         // close_reason, but a connection can become a zombie (driver no
@@ -4444,10 +4459,10 @@ impl NatTraversalEndpoint {
         // Frames queued on such a connection are never transmitted.
         // The newest connection is the one most likely to have an active
         // driver, so always use it.
-        if self.connections.contains_key(&addr) {
+        if self.connections.contains_key(&key) {
             info!(
                 "add_connection: {} replacing existing connection with newer one",
-                addr
+                key
             );
         }
         // Symmetric P2P: spawn the relay-request handler so peers on the
@@ -4462,7 +4477,7 @@ impl NatTraversalEndpoint {
             &self.relay_handler_connections,
             &connection,
         );
-        self.connections.insert(addr, connection);
+        self.connections.insert(key, connection);
         info!(
             "add_connection: now have {} connections",
             self.connections.len()
@@ -4474,9 +4489,9 @@ impl NatTraversalEndpoint {
         // because they never initiate hole-punching.
         if self.advertise_external_addresses {
             let mut nodes = self.bootstrap_nodes.write();
-            if !nodes.iter().any(|n| n.address == addr) {
+            if !nodes.iter().any(|n| n.address == key) {
                 nodes.push(BootstrapNode {
-                    address: addr,
+                    address: key,
                     last_seen: std::time::Instant::now(),
                     can_coordinate: true,
                     rtt: None,
@@ -4484,7 +4499,7 @@ impl NatTraversalEndpoint {
                 });
                 info!(
                     "add_connection: registered {} as NAT traversal coordinator ({} total)",
-                    addr,
+                    key,
                     nodes.len()
                 );
             }
@@ -4513,11 +4528,12 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("NAT traversal event channel not configured".to_string())
         })?;
 
-        let remote_address = connection.remote_address();
+        let event_key = normalize_socket_addr(addr);
+        let remote_address = normalize_socket_addr(connection.remote_address());
 
         // Only emit ConnectionEstablished if we haven't already for this address
         // DashSet::insert returns true if this is a new address (not already present)
-        let should_emit = self.emitted_established_events.insert(addr);
+        let should_emit = self.emitted_established_events.insert(event_key);
 
         if should_emit {
             let public_key = Self::extract_public_key_from_connection(&connection);
@@ -4560,21 +4576,23 @@ impl NatTraversalEndpoint {
         addr: &SocketAddr,
         expected_stable_id: Option<usize>,
     ) -> Result<Option<InnerConnection>, NatTraversalError> {
-        // Clear emitted event tracking so reconnections can generate new events
-        // DashSet provides lock-free .remove()
-        self.emitted_established_events.remove(addr);
+        let variants = socket_addr_variants(*addr);
 
-        if let Some(entry) = self.connections.get(addr) {
+        let mut remove_keys = Vec::new();
+        for candidate in &variants {
+            let Some(entry) = self.connections.get(candidate) else {
+                continue;
+            };
             if let Some(expected_id) = expected_stable_id {
                 let current_id = entry.value().stable_id();
                 if current_id != expected_id {
                     info!(
                         "remove_connection: {} DashMap has a different connection \
                          (stable_id {} vs expected {}), keeping",
-                        addr, current_id, expected_id
+                        candidate, current_id, expected_id
                     );
                     drop(entry);
-                    return Ok(None);
+                    continue;
                 }
             }
 
@@ -4587,8 +4605,27 @@ impl NatTraversalEndpoint {
                     .value()
                     .close(VarInt::from_u32(0), b"saorsa-transport: force-closed");
             }
+            drop(entry);
+            self.emitted_established_events.remove(candidate);
+            self.active_sessions.remove(candidate);
+            self.closed_at.remove(candidate);
+            self.transport_candidates.remove(candidate);
+            remove_keys.push(*candidate);
         }
-        Ok(self.connections.remove(addr).map(|(_, v)| v))
+
+        if expected_stable_id.is_some() && remove_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let mut removed = None;
+        for key in remove_keys {
+            if let Some((_, connection)) = self.connections.remove(&key) {
+                if removed.is_none() {
+                    removed = Some(connection);
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// List all active connections
@@ -4603,9 +4640,13 @@ impl NatTraversalEndpoint {
     /// Returns the raw SPKI bytes if the connection has a valid ML-DSA-65 public key,
     /// `None` otherwise.
     pub fn peer_public_key(&self, addr: &SocketAddr) -> Option<Vec<u8>> {
-        self.connections
-            .get(addr)
-            .and_then(|entry| Self::extract_public_key_from_connection(entry.value()))
+        socket_addr_variants(*addr)
+            .into_iter()
+            .find_map(|candidate| {
+                self.connections
+                    .get(&candidate)
+                    .and_then(|entry| Self::extract_public_key_from_connection(entry.value()))
+            })
     }
 
     /// Get the external/reflexive address as observed by remote peers
@@ -5653,11 +5694,12 @@ impl NatTraversalEndpoint {
                             match connecting.await {
                                 Ok(connection) => {
                                     let remote = connection.remote_address();
+                                    let remote_key = normalize_socket_addr(remote);
                                     // Check if another task already inserted a connection
-                                    if connections.contains_key(&remote) {
+                                    if connections.contains_key(&remote_key) {
                                         debug!(
                                             "Connection already exists for {}, discarding duplicate from {}",
-                                            remote, address
+                                            remote_key, address
                                         );
                                         // Close the duplicate connection to free resources
                                         connection.close(0u32.into(), b"duplicate connection");
@@ -5673,20 +5715,21 @@ impl NatTraversalEndpoint {
                                     // live connection. The reader task may have already
                                     // registered the incoming connection from the same peer.
                                     let mut inserted = false;
-                                    if let Some(existing) = connections.get(&remote) {
+                                    let key = normalize_socket_addr(remote);
+                                    if let Some(existing) = connections.get(&key) {
                                         if existing.value().close_reason().is_none() {
                                             info!(
                                                 "attempt_hole_punch: {} already has live connection, skipping insert",
-                                                remote
+                                                key
                                             );
                                             drop(existing);
                                         } else {
                                             drop(existing);
-                                            connections.insert(remote, connection.clone());
+                                            connections.insert(key, connection.clone());
                                             inserted = true;
                                         }
                                     } else {
-                                        connections.insert(remote, connection.clone());
+                                        connections.insert(key, connection.clone());
                                         inserted = true;
                                     }
                                     if inserted {
@@ -6442,10 +6485,11 @@ impl NatTraversalEndpoint {
                                 info!("Connected to coordinator {}", coordinator);
 
                                 // Check if another task already established a coordinator connection
-                                if connections.contains_key(&coordinator) {
+                                let coordinator_key = normalize_socket_addr(coordinator);
+                                if connections.contains_key(&coordinator_key) {
                                     debug!(
                                         "Coordinator connection already exists for {}, discarding duplicate",
-                                        coordinator
+                                        coordinator_key
                                     );
                                     // Close the duplicate connection to free resources
                                     connection.close(0u32.into(), b"duplicate coordinator");
@@ -6454,7 +6498,7 @@ impl NatTraversalEndpoint {
 
                                 // Store the connection keyed by SocketAddr
                                 // DashMap provides lock-free .insert()
-                                connections.insert(coordinator, connection.clone());
+                                connections.insert(coordinator_key, connection.clone());
                                 // Symmetric P2P: ensure the coordinator (which accepted)
                                 // can open CONNECT-UDP bidi streams toward us too.
                                 Self::spawn_relay_handler_task(
@@ -6721,11 +6765,13 @@ impl NatTraversalEndpoint {
     fn check_punch_results(&self, addr: &SocketAddr) -> Option<SocketAddr> {
         // Check if we have an established connection to this address
         // DashMap provides lock-free .get()
-        if let Some(entry) = self.connections.get(addr) {
-            // We have a connection! Return its address
-            let remote = entry.value().remote_address();
-            info!("Found successful connection to {} at {}", addr, remote);
-            return Some(remote);
+        for candidate in socket_addr_variants(*addr) {
+            if let Some(entry) = self.connections.get(&candidate) {
+                // We have a connection! Return its address
+                let remote = entry.value().remote_address();
+                info!("Found successful connection to {} at {}", addr, remote);
+                return Some(remote);
+            }
         }
 
         // No connection found, check if we have any validated candidates
@@ -6776,7 +6822,10 @@ impl NatTraversalEndpoint {
 
         // Check if we have a connection to validate
         // DashMap provides lock-free .get()
-        if let Some(entry) = self.connections.get(&target_addr) {
+        for candidate_addr in socket_addr_variants(target_addr) {
+            let Some(entry) = self.connections.get(&candidate_addr) else {
+                continue;
+            };
             let conn = entry.value();
             // Connection exists, check if it's to the expected address
             if conn.remote_address() == address {
@@ -6819,7 +6868,9 @@ impl NatTraversalEndpoint {
     /// wasted resources on hole punching attempts.
     #[inline]
     fn has_existing_connection(&self, addr: &SocketAddr) -> bool {
-        self.connections.contains_key(addr)
+        socket_addr_variants(*addr)
+            .iter()
+            .any(|addr| self.connections.contains_key(addr))
     }
 
     /// Check if path validation succeeded
@@ -6854,7 +6905,10 @@ impl NatTraversalEndpoint {
     fn is_connection_healthy(&self, addr: &SocketAddr) -> bool {
         // In real implementation, check QUIC connection status
         // DashMap provides lock-free .get()
-        if self.connections.get(addr).is_some() {
+        if socket_addr_variants(*addr)
+            .iter()
+            .any(|addr| self.connections.get(addr).is_some())
+        {
             // Check if connection is still active
             // Note: Connection doesn't have is_closed/is_drained methods
             // We use the closed() future to check if still active
@@ -7156,7 +7210,8 @@ impl NatTraversalEndpoint {
 
         // Step 3: Now safe to insert into connections keyed by remote address
         let remote_address = connection.remote_address();
-        self.connections.insert(remote_address, connection.clone());
+        let connection_key = normalize_socket_addr(remote_address);
+        self.connections.insert(connection_key, connection.clone());
         // Symmetric P2P: this is a dial-side insert (we initiated via
         // `endpoint.connect`), so spawn the relay handler to mirror what
         // the accept-side does. Without this, a later

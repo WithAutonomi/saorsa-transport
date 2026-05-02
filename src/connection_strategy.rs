@@ -53,11 +53,12 @@ use std::time::{Duration, Instant};
 /// Timeout for direct connection attempts (both IPv4 and IPv6).
 /// Relay-allocated addresses (advertised via the DHT as plain socket
 /// addresses) are indistinguishable from direct addresses at the
-/// transport level.  A relay handshake adds one extra RTT through the
-/// relay server, so cross-continent relay paths need up to ~1.5 s.
-/// 3 s gives comfortable headroom without meaningfully delaying
-/// fallback to hole-punching for truly unreachable endpoints.
-const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// transport level. After a congested send timeout, immediately
+/// classifying a peer as unreachable on a tiny direct-dial budget creates
+/// false negatives. Eight seconds still bounds lookup latency while giving
+/// a busy peer or relay path enough time to complete the QUIC + PQC
+/// handshake.
+const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How a connection was established
 #[derive(Debug, Clone, PartialEq, Eq)]
