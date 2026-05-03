@@ -1819,12 +1819,14 @@ impl P2pEndpoint {
                     }
 
                     let he_config = HappyEyeballsConfig::default();
-                    let direct_timeout = strategy.ipv4_timeout().max(strategy.ipv6_timeout());
+                    let connect_timeout = strategy.direct_connect_timeout();
+                    let handshake_timeout = strategy.direct_handshake_timeout();
 
                     info!(
-                        "Happy Eyeballs: racing {} direct addresses (timeout: {:?})",
+                        "Happy Eyeballs: racing {} direct addresses (connect timeout: {:?}, handshake timeout: {:?})",
                         direct_addresses.len(),
-                        direct_timeout
+                        connect_timeout,
+                        handshake_timeout
                     );
 
                     // Clone the QUIC endpoint for use in the Happy Eyeballs closure.
@@ -1840,24 +1842,32 @@ impl P2pEndpoint {
                     };
 
                     let addrs = direct_addresses.clone();
-                    let he_result = timeout(direct_timeout, async {
-                        happy_eyeballs::race_connect(&addrs, &he_config, |addr| {
-                            let ep = quic_endpoint.clone();
-                            async move {
-                                let connecting = ep
-                                    .connect(addr, "peer")
-                                    .map_err(|e| format!("connect error: {e}"))?;
-                                connecting
-                                    .await
-                                    .map_err(|e| format!("handshake error: {e}"))
-                            }
-                        })
-                        .await
+                    let he_result = happy_eyeballs::race_connect(&addrs, &he_config, move |addr| {
+                        let ep = quic_endpoint.clone();
+                        async move {
+                            let mut connecting = ep
+                                .connect(addr, "peer")
+                                .map_err(|e| format!("connect error: {e}"))?;
+
+                            timeout(connect_timeout, connecting.handshake_data())
+                                .await
+                                .map_err(|_| {
+                                    format!("direct connect timed out after {:?}", connect_timeout)
+                                })?
+                                .map_err(|e| format!("direct connect error: {e}"))?;
+
+                            timeout(handshake_timeout, connecting)
+                                .await
+                                .map_err(|_| {
+                                    format!("handshake timed out after {:?}", handshake_timeout)
+                                })?
+                                .map_err(|e| format!("handshake error: {e}"))
+                        }
                     })
                     .await;
 
                     match he_result {
-                        Ok(Ok((connection, winning_addr))) => {
+                        Ok((connection, winning_addr)) => {
                             let method = if winning_addr.is_ipv6() {
                                 ConnectionMethod::DirectIPv6
                             } else {
@@ -1874,15 +1884,10 @@ impl P2pEndpoint {
                                 .await?;
                             return Ok((peer_conn, method));
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             debug!("Happy Eyeballs: all direct attempts failed: {}", e);
                             strategy.transition_to_ipv6(e.to_string());
                             strategy.transition_to_holepunch("Happy Eyeballs exhausted");
-                        }
-                        Err(_) => {
-                            debug!("Happy Eyeballs: direct connection timed out");
-                            strategy.transition_to_ipv6("Timeout");
-                            strategy.transition_to_holepunch("Happy Eyeballs timed out");
                         }
                     }
                 }

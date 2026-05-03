@@ -50,15 +50,15 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-/// Timeout for direct connection attempts (both IPv4 and IPv6).
-/// Relay-allocated addresses (advertised via the DHT as plain socket
-/// addresses) are indistinguishable from direct addresses at the
-/// transport level. After a congested send timeout, immediately
-/// classifying a peer as unreachable on a tiny direct-dial budget creates
-/// false negatives. Eight seconds still bounds lookup latency while giving
-/// a busy peer or relay path enough time to complete the QUIC + PQC
-/// handshake.
-const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Timeout for observing direct connection progress (both IPv4 and IPv6).
+///
+/// This bounds how long we wait for a peer to show handshake progress before
+/// treating the address as dead. Full QUIC + PQC handshake completion is
+/// governed separately by [`DEFAULT_DIRECT_HANDSHAKE_TIMEOUT`].
+const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Timeout for full direct QUIC + PQC handshake completion after progress.
+const DEFAULT_DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How a connection was established
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,10 +165,10 @@ pub enum ConnectionStage {
 /// Configuration for connection strategy timeouts and behavior
 #[derive(Debug, Clone)]
 pub struct StrategyConfig {
-    /// Timeout for direct IPv4 connection attempts
-    pub ipv4_timeout: Duration,
-    /// Timeout for direct IPv6 connection attempts
-    pub ipv6_timeout: Duration,
+    /// Timeout for direct connection attempts (applies to both IPv4 and IPv6)
+    pub direct_connect_timeout: Duration,
+    /// Timeout for full direct handshake completion after progress
+    pub direct_handshake_timeout: Duration,
     /// Timeout for each hole-punch round
     pub holepunch_timeout: Duration,
     /// Timeout for relay connection
@@ -190,8 +190,8 @@ pub struct StrategyConfig {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            ipv4_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
-            ipv6_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
+            direct_connect_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
+            direct_handshake_timeout: DEFAULT_DIRECT_HANDSHAKE_TIMEOUT,
             holepunch_timeout: Duration::from_secs(8),
             relay_timeout: Duration::from_secs(10),
             max_holepunch_rounds: 2,
@@ -223,15 +223,15 @@ impl StrategyConfig {
         }
     }
 
-    /// Set the IPv4 timeout
-    pub fn with_ipv4_timeout(mut self, timeout: Duration) -> Self {
-        self.ipv4_timeout = timeout;
+    /// Set the direct connection timeout (applies to both IPv4 and IPv6)
+    pub fn with_direct_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_connect_timeout = timeout;
         self
     }
 
-    /// Set the IPv6 timeout
-    pub fn with_ipv6_timeout(mut self, timeout: Duration) -> Self {
-        self.ipv6_timeout = timeout;
+    /// Set the direct handshake timeout
+    pub fn with_direct_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_handshake_timeout = timeout;
         self
     }
 
@@ -323,14 +323,14 @@ impl ConnectionStrategy {
         &self.config
     }
 
-    /// Get the IPv4 timeout
-    pub fn ipv4_timeout(&self) -> Duration {
-        self.config.ipv4_timeout
+    /// Get the direct connection timeout
+    pub fn direct_connect_timeout(&self) -> Duration {
+        self.config.direct_connect_timeout
     }
 
-    /// Get the IPv6 timeout
-    pub fn ipv6_timeout(&self) -> Duration {
-        self.config.ipv6_timeout
+    /// Get the direct handshake timeout
+    pub fn direct_handshake_timeout(&self) -> Duration {
+        self.config.direct_handshake_timeout
     }
 
     /// Get the hole-punch timeout
@@ -520,8 +520,14 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = StrategyConfig::default();
-        assert_eq!(config.ipv4_timeout, DEFAULT_DIRECT_CONNECT_TIMEOUT);
-        assert_eq!(config.ipv6_timeout, DEFAULT_DIRECT_CONNECT_TIMEOUT);
+        assert_eq!(
+            config.direct_connect_timeout,
+            DEFAULT_DIRECT_CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            config.direct_handshake_timeout,
+            DEFAULT_DIRECT_HANDSHAKE_TIMEOUT
+        );
         assert_eq!(config.holepunch_timeout, Duration::from_secs(8));
         assert_eq!(config.relay_timeout, Duration::from_secs(10));
         assert_eq!(config.max_holepunch_rounds, 2);
@@ -532,12 +538,13 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let config = StrategyConfig::new()
-            .with_ipv4_timeout(Duration::from_secs(2))
-            .with_ipv6_timeout(Duration::from_secs(2))
+            .with_direct_connect_timeout(Duration::from_secs(2))
+            .with_direct_handshake_timeout(Duration::from_secs(4))
             .with_max_holepunch_rounds(5)
             .with_ipv6_enabled(false);
 
-        assert_eq!(config.ipv4_timeout, Duration::from_secs(2));
+        assert_eq!(config.direct_connect_timeout, Duration::from_secs(2));
+        assert_eq!(config.direct_handshake_timeout, Duration::from_secs(4));
         assert_eq!(config.max_holepunch_rounds, 5);
         assert!(!config.ipv6_enabled);
     }
