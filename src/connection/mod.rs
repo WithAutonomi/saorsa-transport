@@ -1899,6 +1899,11 @@ impl Connection {
         stats
     }
 
+    /// Number of packets received from the peer that authenticated successfully.
+    pub(crate) fn authenticated_packets(&self) -> u64 {
+        self.total_authed_packets
+    }
+
     /// Set the bound peer identity for token v2 issuance.
     pub fn set_token_binding_peer_id(&mut self, pid: PeerId) {
         self.peer_id_for_tokens = Some(pid);

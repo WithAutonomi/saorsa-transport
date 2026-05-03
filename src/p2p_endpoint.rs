@@ -1849,10 +1849,13 @@ impl P2pEndpoint {
                                 .connect(addr, "peer")
                                 .map_err(|e| format!("connect error: {e}"))?;
 
-                            timeout(connect_timeout, connecting.handshake_data())
+                            timeout(connect_timeout, connecting.first_peer_response())
                                 .await
                                 .map_err(|_| {
-                                    format!("direct connect timed out after {:?}", connect_timeout)
+                                    format!(
+                                        "direct connect timed out after {:?} waiting for first QUIC response",
+                                        connect_timeout
+                                    )
                                 })?
                                 .map_err(|e| format!("direct connect error: {e}"))?;
 

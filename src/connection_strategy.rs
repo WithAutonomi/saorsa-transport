@@ -52,9 +52,9 @@ use std::time::{Duration, Instant};
 
 /// Timeout for observing direct connection progress (both IPv4 and IPv6).
 ///
-/// This bounds how long we wait for a peer to show handshake progress before
-/// treating the address as dead. Full QUIC + PQC handshake completion is
-/// governed separately by [`DEFAULT_DIRECT_HANDSHAKE_TIMEOUT`].
+/// This bounds how long we wait for the first authenticated QUIC packet from a
+/// peer before treating the address as dead. Full QUIC + PQC handshake
+/// completion is governed separately by [`DEFAULT_DIRECT_HANDSHAKE_TIMEOUT`].
 const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Timeout for full direct QUIC + PQC handshake completion after progress.
@@ -165,7 +165,7 @@ pub enum ConnectionStage {
 /// Configuration for connection strategy timeouts and behavior
 #[derive(Debug, Clone)]
 pub struct StrategyConfig {
-    /// Timeout for direct connection attempts (applies to both IPv4 and IPv6)
+    /// Timeout for receiving the first authenticated QUIC packet on direct attempts
     pub direct_connect_timeout: Duration,
     /// Timeout for full direct handshake completion after progress
     pub direct_handshake_timeout: Duration,
