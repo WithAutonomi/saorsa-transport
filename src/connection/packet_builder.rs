@@ -236,6 +236,12 @@ impl PacketBuilder {
 
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
+        if size != 0 {
+            conn.path
+                .congestion
+                .on_sent(now, u64::from(size), sample_pn, ack_eliciting);
+            conn.path.pacing.on_transmit(size);
+        }
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
         if size != 0 {
@@ -247,7 +253,6 @@ impl PacketBuilder {
                 conn.permit_idle_reset = false;
             }
             conn.set_loss_detection_timer(now);
-            conn.path.pacing.on_transmit(size);
 
             // Update PQC state for packet tracking
             conn.pqc_state.on_packet_sent(space_id, size);

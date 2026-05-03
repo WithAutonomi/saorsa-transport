@@ -87,6 +87,15 @@ pub trait Controller: Send + Sync {
         let _ = pn;
     }
 
+    /// A packet left the recovery state without being acked or declared lost.
+    ///
+    /// This includes discarded packet-number spaces, rejected 0-RTT packets,
+    /// and PLPMTUD probes that should not trigger a congestion response.
+    fn on_packet_abandoned(&mut self, pn: u64, bytes: u64) {
+        let _ = bytes;
+        self.on_packet_neutered(pn);
+    }
+
     /// Called when the known in-flight packet count has decreased (should be called exactly once per on_ack_received)
     fn on_end_acks(
         &mut self,

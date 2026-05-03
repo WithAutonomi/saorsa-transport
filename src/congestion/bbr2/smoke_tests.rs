@@ -33,9 +33,7 @@ mod tests {
         let a = make_adapter();
         let w = a.window();
         assert!(w > 0, "initial window must be positive, got {w}");
-        // Default initial_window is 200 packets × 1200 bytes. The cwnd is
-        // derived as initial_cwnd_pkts × mss, so it should land in that
-        // ballpark (allow slack for BBRv2's internal clamping).
+        assert_eq!(a.initial_window(), 10 * TEST_MTU as u64);
         assert!(w >= 4 * TEST_MTU as u64, "got {w}");
     }
 
@@ -94,6 +92,44 @@ mod tests {
         );
         // cwnd shouldn't have collapsed to zero.
         assert!(a.window() > 0);
+    }
+
+    #[test]
+    fn out_of_order_ack_keeps_least_unacked_at_oldest_outstanding_packet() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+        let rtt = rtt_of(Duration::from_millis(50));
+
+        for pn in 1..=10_u64 {
+            a.on_sent(t0 + Duration::from_micros(pn), 1200, pn, true);
+        }
+
+        a.on_ack(t0 + Duration::from_millis(50), t0, 1200, false, &rtt, 10);
+
+        assert_eq!(a.debug_least_unacked(), 1);
+        assert!(!a.debug_is_unacked(10));
+        assert!(a.debug_is_unacked(1));
+
+        for pn in 1..=9_u64 {
+            a.on_ack(t0 + Duration::from_millis(50), t0, 1200, false, &rtt, pn);
+        }
+
+        assert_eq!(a.debug_least_unacked(), 11);
+    }
+
+    #[test]
+    fn abandoned_packet_leaves_sampler_tracking_without_congestion_event() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+
+        a.on_sent(t0, 1200, 1, true);
+        a.on_sent(t0, 1200, 2, true);
+
+        a.on_packet_abandoned(1, 1200);
+
+        assert_eq!(a.debug_least_unacked(), 2);
+        assert!(!a.debug_is_unacked(1));
+        assert!(a.debug_is_unacked(2));
     }
 
     #[test]

@@ -17,6 +17,7 @@
 // no-op when both buffers are empty.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,9 +28,11 @@ use crate::connection::RttEstimator;
 use super::BBRv2;
 use super::types::{Acked, BbrParams, CongestionControl, Lost, RecoveryStats, RttStats};
 
-/// Default packet count for the initial congestion window — matches BBRv1
-/// in this crate (200 × BASE_DATAGRAM_SIZE).
-const K_INITIAL_WINDOW_PACKETS: u64 = 200;
+/// Default packet count for the initial congestion window.
+///
+/// Keep this aligned with RFC 9002/quiche-style defaults; callers that want a
+/// more aggressive startup can still override `Bbr2Config::initial_window`.
+const K_INITIAL_WINDOW_PACKETS: u64 = 10;
 
 /// Cap the max congestion window at something generous but not
 /// unbounded. 20k packets × 1500 = 30 MB, enough for 10 Gbps×100ms BDP.
@@ -108,10 +111,15 @@ pub(crate) struct Bbr2Adapter {
     pending_acked: Vec<Acked>,
     /// Packets lost during the current batch.
     pending_lost: Vec<Lost>,
-    /// Smallest packet number still unacked, tracked for BBRv2's
-    /// sampler-GC hint. Updated every time we see a pn we haven't
-    /// before — either at send or at ack.
-    least_unacked: u64,
+    /// Ack-eliciting packets still outstanding in the BBRv2 sampler.
+    ///
+    /// BBRv2 uses the smallest of these as the sampler-GC boundary. This must
+    /// not be approximated with highest-acked+1, because out-of-order ACKs can
+    /// leave lower packets legitimately outstanding.
+    unacked_packets: BTreeSet<u64>,
+    /// Highest acked/lost/neutered packet number observed. Used only when no
+    /// sampler-tracked packets remain outstanding.
+    largest_removed_packet: Option<u64>,
     /// Unused `RttStats` placeholder — the vendored BBRv2 only takes it
     /// as a typed parameter and never reads it.
     rtt_stats: RttStats,
@@ -139,10 +147,36 @@ impl Bbr2Adapter {
             prior_in_flight: 0,
             pending_acked: Vec::new(),
             pending_lost: Vec::new(),
-            least_unacked: 0,
+            unacked_packets: BTreeSet::new(),
+            largest_removed_packet: None,
             rtt_stats: RttStats,
             recovery_stats: RecoveryStats::default(),
         }
+    }
+
+    fn least_unacked(&self) -> u64 {
+        self.unacked_packets
+            .iter()
+            .next()
+            .copied()
+            .or_else(|| self.largest_removed_packet.map(|pn| pn.saturating_add(1)))
+            .unwrap_or(0)
+    }
+
+    fn mark_packet_removed(&mut self, pn: u64) {
+        self.unacked_packets.remove(&pn);
+        self.largest_removed_packet =
+            Some(self.largest_removed_packet.map_or(pn, |old| old.max(pn)));
+    }
+
+    #[cfg(test)]
+    pub(super) fn debug_least_unacked(&self) -> u64 {
+        self.least_unacked()
+    }
+
+    #[cfg(test)]
+    pub(super) fn debug_is_unacked(&self, pn: u64) -> bool {
+        self.unacked_packets.contains(&pn)
     }
 
     /// Flush the pending acks/losses into a single BBRv2 congestion
@@ -157,7 +191,7 @@ impl Bbr2Adapter {
         // newly-acked packet update RTT? We approximate by checking the
         // batch has any ack-eliciting acks (which is what's buffered).
         let rtt_updated = !self.pending_acked.is_empty();
-        let least_unacked = self.least_unacked;
+        let least_unacked = self.least_unacked();
         self.inner.on_congestion_event(
             rtt_updated,
             self.prior_in_flight as usize,
@@ -194,6 +228,7 @@ impl Controller for Bbr2Adapter {
             is_retransmissible,
         );
         if is_retransmissible {
+            self.unacked_packets.insert(last_packet_number);
             self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);
         }
     }
@@ -217,11 +252,7 @@ impl Controller for Bbr2Adapter {
             pkt_num: pn,
             time_sent: sent,
         });
-        // Advance least_unacked monotonically past the highest pn we've
-        // seen acked. The sampler uses this as a GC hint; overestimating
-        // would cause premature state deletion, so we bump only when the
-        // ack is at or beyond the current mark.
-        self.least_unacked = self.least_unacked.max(pn.saturating_add(1));
+        self.mark_packet_removed(pn);
     }
 
     fn on_packet_lost(&mut self, _now: Instant, pn: u64, bytes: u64) {
@@ -233,6 +264,7 @@ impl Controller for Bbr2Adapter {
             packet_number: pn,
             bytes_lost: bytes as usize,
         });
+        self.mark_packet_removed(pn);
     }
 
     fn on_app_limited(&mut self, bytes_in_flight: u64) {
@@ -241,6 +273,13 @@ impl Controller for Bbr2Adapter {
 
     fn on_packet_neutered(&mut self, pn: u64) {
         self.inner.on_packet_neutered(pn);
+        self.mark_packet_removed(pn);
+    }
+
+    fn on_packet_abandoned(&mut self, pn: u64, bytes: u64) {
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes);
+        self.inner.on_packet_neutered(pn);
+        self.mark_packet_removed(pn);
     }
 
     fn on_end_acks(
@@ -316,7 +355,7 @@ impl std::fmt::Debug for Bbr2Adapter {
         f.debug_struct("Bbr2Adapter")
             .field("mss", &self.mss)
             .field("bytes_in_flight", &self.bytes_in_flight)
-            .field("least_unacked", &self.least_unacked)
+            .field("least_unacked", &self.least_unacked())
             .field("cwnd", &self.inner.get_congestion_window())
             .finish()
     }
