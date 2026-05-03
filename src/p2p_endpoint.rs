@@ -96,6 +96,17 @@ const LARGE_SEND_BACKPRESSURE_THRESHOLD: usize = 1024 * 1024;
 /// Number of large sends allowed in flight per remote address.
 const LARGE_SEND_PER_ADDR_PERMITS: usize = 1;
 
+/// Per-write chunk size used for stream write progress accounting.
+const STREAM_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Maximum time a QUIC stream write may make no forward progress.
+const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Application error code used when aborting a stuck/failed send stream.
+/// `0` is the conventional "generic abort, no specific application error"
+/// QUIC application error code.
+const STREAM_RESET_ABORT_CODE: u32 = 0;
+
 /// Quick direct connection attempt after a failed hole-punch round.
 /// If the target's outgoing packets created a NAT binding, a QUIC handshake
 /// through the pinhole needs only 1-2 RTTs (~600ms at 300ms worst-case RTT).
@@ -543,6 +554,40 @@ pub enum DisconnectReason {
 
 // TraversalPhase is re-exported from nat_traversal_api
 
+/// Stage at which a QUIC send failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailureStage {
+    /// The send failed before a stream could be opened.
+    OpenStream,
+    /// Opening a stream made no progress within the progress timeout.
+    OpenStreamProgressTimeout,
+    /// A stream write made no progress within the progress timeout.
+    WriteProgressTimeout,
+    /// A stream write returned an error.
+    Write,
+    /// The stream could not be finished after all bytes were queued.
+    Finish,
+    /// The peer explicitly stopped the stream.
+    Stopped,
+    /// The stream failed while waiting for acknowledgement/stop state.
+    Acknowledgement,
+}
+
+impl std::fmt::Display for SendFailureStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::OpenStream => "open_stream",
+            Self::OpenStreamProgressTimeout => "open_stream_progress_timeout",
+            Self::WriteProgressTimeout => "write_progress_timeout",
+            Self::Write => "write",
+            Self::Finish => "finish",
+            Self::Stopped => "stopped",
+            Self::Acknowledgement => "acknowledgement",
+        };
+        f.write_str(label)
+    }
+}
+
 /// Error type for P2pEndpoint operations
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
@@ -553,6 +598,17 @@ pub enum EndpointError {
     /// Connection error
     #[error("Connection error: {0}")]
     Connection(String),
+
+    /// Send failure with enough context for upper layers to decide retry policy.
+    #[error("Send failed at {stage}: {reason} (bytes_written={bytes_written})")]
+    SendFailed {
+        /// Stage at which the send failed.
+        stage: SendFailureStage,
+        /// Bytes accepted by the QUIC stream before failure.
+        bytes_written: usize,
+        /// Human-readable failure reason.
+        reason: String,
+    },
 
     /// NAT traversal error
     #[error("NAT traversal error: {0}")]
@@ -585,6 +641,79 @@ pub enum EndpointError {
     /// No target address provided
     #[error("No target address provided")]
     NoAddress,
+}
+
+fn send_failed(
+    stage: SendFailureStage,
+    bytes_written: usize,
+    reason: impl Into<String>,
+) -> EndpointError {
+    EndpointError::SendFailed {
+        stage,
+        bytes_written,
+        reason: reason.into(),
+    }
+}
+
+async fn write_stream_with_progress_timeout(
+    send_stream: &mut crate::high_level::SendStream,
+    addr: SocketAddr,
+    data: &[u8],
+) -> Result<usize, EndpointError> {
+    let mut bytes_written = 0usize;
+
+    while bytes_written < data.len() {
+        let end = bytes_written
+            .saturating_add(STREAM_WRITE_CHUNK_SIZE)
+            .min(data.len());
+        let slice = &data[bytes_written..end];
+
+        match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, send_stream.write(slice)).await {
+            Ok(Ok(0)) => {
+                return Err(send_failed(
+                    SendFailureStage::Write,
+                    bytes_written,
+                    "stream write returned zero bytes",
+                ));
+            }
+            Ok(Ok(written)) => {
+                bytes_written += written;
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "send({}): stream write failed after {}/{} bytes: {}",
+                    addr,
+                    bytes_written,
+                    data.len(),
+                    e
+                );
+                return Err(send_failed(
+                    SendFailureStage::Write,
+                    bytes_written,
+                    e.to_string(),
+                ));
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "send({}): stream write made no progress for {:?} after {}/{} bytes",
+                    addr,
+                    STREAM_WRITE_PROGRESS_TIMEOUT,
+                    bytes_written,
+                    data.len()
+                );
+                return Err(send_failed(
+                    SendFailureStage::WriteProgressTimeout,
+                    bytes_written,
+                    format!(
+                        "stream write made no progress for {:?}",
+                        STREAM_WRITE_PROGRESS_TIMEOUT
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(bytes_written)
 }
 
 /// Broadcast `P2pEvent::PeerConnected` for `addr` exactly once per
@@ -2608,24 +2737,46 @@ impl P2pEndpoint {
                     None
                 };
 
-                let mut send_stream = connection.open_uni().await.map_err(|e| {
-                    warn!("send({}): open_uni failed: {}", addr, e);
-                    EndpointError::Connection(e.to_string())
-                })?;
+                let mut send_stream =
+                    match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, connection.open_uni()).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => {
+                            warn!("send({}): open_uni failed: {}", addr, e);
+                            return Err(send_failed(
+                                SendFailureStage::OpenStream,
+                                0,
+                                e.to_string(),
+                            ));
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                "send({}): open_uni made no progress for {:?}",
+                                addr, STREAM_WRITE_PROGRESS_TIMEOUT
+                            );
+                            return Err(send_failed(
+                                SendFailureStage::OpenStreamProgressTimeout,
+                                0,
+                                format!(
+                                    "open_uni made no progress for {:?}",
+                                    STREAM_WRITE_PROGRESS_TIMEOUT
+                                ),
+                            ));
+                        }
+                    };
 
-                send_stream.write_all(data).await.map_err(|e| {
-                    warn!(
-                        "send({}): write_all ({} bytes) failed: {}",
-                        addr,
-                        data.len(),
-                        e
-                    );
-                    EndpointError::Connection(e.to_string())
-                })?;
+                let bytes_written =
+                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
+                        Ok(bytes_written) => bytes_written,
+                        Err(e) => {
+                            let _ =
+                                send_stream.reset(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+                            return Err(e);
+                        }
+                    };
 
                 send_stream.finish().map_err(|e| {
                     warn!("send({}): finish failed: {}", addr, e);
-                    EndpointError::Connection(e.to_string())
+                    send_failed(SendFailureStage::Finish, bytes_written, e.to_string())
                 })?;
 
                 // Give Quinn a short chance to observe stream completion.
@@ -2647,14 +2798,18 @@ impl P2pEndpoint {
                 match timeout(ack_timeout, send_stream.stopped()).await {
                     Ok(Ok(None)) => {}
                     Ok(Ok(Some(stop_code))) => {
-                        return Err(EndpointError::Connection(format!(
-                            "peer stopped stream with code {stop_code}"
-                        )));
+                        return Err(send_failed(
+                            SendFailureStage::Stopped,
+                            bytes_written,
+                            format!("peer stopped stream with code {stop_code}"),
+                        ));
                     }
                     Ok(Err(e)) => {
-                        return Err(EndpointError::Connection(format!(
-                            "peer did not acknowledge stream data: {e}"
-                        )));
+                        return Err(send_failed(
+                            SendFailureStage::Acknowledgement,
+                            bytes_written,
+                            format!("peer did not acknowledge stream data: {e}"),
+                        ));
                     }
                     Err(_elapsed) => {
                         debug!(
@@ -3719,6 +3874,14 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
         let err = EndpointError::PeerNotFound(addr);
         assert!(err.to_string().contains("not found"));
+
+        let err = EndpointError::SendFailed {
+            stage: SendFailureStage::WriteProgressTimeout,
+            bytes_written: 1024,
+            reason: "no progress".to_string(),
+        };
+        assert!(err.to_string().contains("write_progress_timeout"));
+        assert!(err.to_string().contains("bytes_written=1024"));
     }
 
     #[tokio::test]
