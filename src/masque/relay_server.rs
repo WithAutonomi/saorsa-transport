@@ -172,8 +172,19 @@ fn set_dont_fragment(_socket: &UdpSocket) -> std::io::Result<()> {
 /// Linux returns `EMSGSIZE` (errno 90); BSD returns `EMSGSIZE` as well.
 /// Treated as the only signal that warrants emitting a PMTU control
 /// frame back through the tunnel.
+#[cfg(unix)]
 fn is_message_too_large(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EMSGSIZE)
+}
+
+/// Non-Unix targets do not link `libc`, and the corresponding
+/// `set_dont_fragment` is a best-effort no-op there. Mirror that
+/// behaviour: never claim a send error is PMTU-related, so the
+/// tunnel-level PMTU control frame loop simply does not fire and we
+/// fall back to the kernel's default fragmentation behaviour.
+#[cfg(not(unix))]
+fn is_message_too_large(_err: &std::io::Error) -> bool {
+    false
 }
 
 /// Item carried over the bounded channel between the UDP reader task
