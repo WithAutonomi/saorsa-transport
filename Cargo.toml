@@ -110,7 +110,7 @@ dirs = "5.0"
 keyring = "3"
 
 # Crypto dependencies (required for PQC)
-rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "aws-lc-rs"] }
 aws-lc-rs = { version = "1.12", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"] }
 rustls-platform-verifier = { version = "0.6", optional = true }
 # PQC crypto - required in v0.12.0+
@@ -145,7 +145,7 @@ qlog = { version = "0.13", optional = true }
 
 # Essential dependencies
 uuid = { version = "1.0", features = ["v4", "serde"] }
-unicode-width = "=0.2.0"  # Pinned to match ratatui's requirement
+unicode-width = "=0.2.2"  # Pinned to match ratatui's requirement
 hex = "0.4"
 blake3 = "1"
 once_cell = "1.21"
