@@ -229,6 +229,36 @@ enum AttemptResult<C> {
     Failure(SocketAddr, String),
 }
 
+/// Join handles for spawned connection attempts.
+///
+/// Dropping a `JoinHandle` detaches the task; it does not cancel the QUIC
+/// dial. `race_connect` is commonly wrapped in an outer timeout, so this
+/// guard ensures timed-out Happy Eyeballs races abort their in-flight
+/// handshakes instead of letting orphaned connection drivers complete later.
+struct AttemptHandles(Vec<JoinHandle<()>>);
+
+impl AttemptHandles {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.0.push(handle);
+    }
+
+    fn abort_all(&self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AttemptHandles {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 /// Spawn a single connection attempt as a tokio task.
 ///
 /// The task sends its result (success or failure) through the provided channel sender.
@@ -319,7 +349,7 @@ where
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AttemptResult<C>>();
-    let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(sorted.len());
+    let mut handles = AttemptHandles::with_capacity(sorted.len());
     let mut errors: Vec<(SocketAddr, String)> = Vec::new();
     let mut next_index: usize = 0;
     let total = sorted.len();
@@ -347,7 +377,7 @@ where
                     match result {
                         Some(AttemptResult::Success(conn, addr)) => {
                             info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                            abort_all(&handles);
+                            handles.abort_all();
                             return Ok((conn, addr));
                         }
                         Some(AttemptResult::Failure(addr, err)) => {
@@ -402,7 +432,7 @@ where
             match rx.recv().await {
                 Some(AttemptResult::Success(conn, addr)) => {
                     info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                    abort_all(&handles);
+                    handles.abort_all();
                     return Ok((conn, addr));
                 }
                 Some(AttemptResult::Failure(addr, err)) => {
@@ -419,13 +449,6 @@ where
     }
 
     Err(HappyEyeballsError::AllAttemptsFailed { errors })
-}
-
-/// Abort all spawned task handles.
-fn abort_all(handles: &[JoinHandle<()>]) {
-    for handle in handles {
-        handle.abort();
-    }
 }
 
 #[cfg(test)]
@@ -795,6 +818,66 @@ mod tests {
         // Only one task should have completed (the fast successful one).
         // The others should have been aborted.
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_race_aborts_in_flight_attempts_when_dropped() {
+        struct DropGuard {
+            dropped: Arc<AtomicUsize>,
+            notify: Arc<tokio::sync::Notify>,
+        }
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                self.notify.notify_one();
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let dropped_notify = Arc::new(tokio::sync::Notify::new());
+
+        let addrs = vec![v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        {
+            let started_clone = Arc::clone(&started);
+            let dropped_clone = Arc::clone(&dropped);
+            let dropped_notify_clone = Arc::clone(&dropped_notify);
+
+            let race = race_connect(&addrs, &config, move |_addr| {
+                let started = Arc::clone(&started_clone);
+                let dropped = Arc::clone(&dropped_clone);
+                let dropped_notify = Arc::clone(&dropped_notify_clone);
+
+                async move {
+                    let _drop_guard = DropGuard {
+                        dropped,
+                        notify: dropped_notify,
+                    };
+                    started.notify_one();
+                    std::future::pending::<Result<String, String>>().await
+                }
+            });
+            tokio::pin!(race);
+
+            tokio::select! {
+                _ = started.notified() => {}
+                result = &mut race => panic!("race completed unexpectedly: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    panic!("timed out waiting for connection attempt to start")
+                }
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_notify.notified())
+            .await
+            .expect("timed out waiting for aborted connection attempt to be dropped");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     #[test]

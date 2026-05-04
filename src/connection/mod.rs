@@ -115,6 +115,10 @@ mod timer;
 use crate::congestion::Controller;
 use timer::{Timer, TimerTable};
 
+fn would_exceed_congestion_window(in_flight: u64, bytes_to_send: u64, window: u64) -> bool {
+    in_flight.saturating_add(bytes_to_send) > window
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -853,7 +857,11 @@ impl Connection {
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    if would_exceed_congestion_window(
+                        self.path.in_flight.bytes,
+                        bytes_to_send,
+                        self.path.congestion.window(),
+                    ) {
                         space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
@@ -888,7 +896,9 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        let min_size = self.pqc_state.min_initial_size();
+                        let min_size = self
+                            .pqc_state
+                            .min_initial_size_for_path_mtu(self.path.current_mtu());
                         builder.pad_to(min_size);
                     }
 
@@ -1145,7 +1155,9 @@ impl Connection {
                     }
                     buf.write(token);
                     self.stats.frame_tx.path_response += 1;
-                    let min_size = self.pqc_state.min_initial_size();
+                    let min_size = self
+                        .pqc_state
+                        .min_initial_size_for_path_mtu(self.path.current_mtu());
                     builder.pad_to(min_size);
                     builder.finish_and_track(
                         now,
@@ -1156,7 +1168,7 @@ impl Connection {
                         }),
                         buf,
                     );
-                    self.stats.udp_tx.on_sent(1, buf.len());
+                    self.account_udp_transmit(1, buf.len());
 
                     // Trace packet sent
                     #[cfg(feature = "trace")]
@@ -1232,7 +1244,9 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                let min_size = self.pqc_state.min_initial_size();
+                let min_size = self
+                    .pqc_state
+                    .min_initial_size_for_path_mtu(self.path.current_mtu());
                 builder.pad_to(min_size);
             }
 
@@ -1245,12 +1259,7 @@ impl Connection {
                 builder.pad_to(segment_size as u16);
             }
 
-            let sample_pn = builder.sample_pn;
-            let ack_eliciting = builder.ack_eliciting;
             builder.finish_and_track(now, self, sent_frames, buf);
-            self.path
-                .congestion
-                .on_sent(now, buf.len() as u64, sample_pn, ack_eliciting);
 
             #[cfg(feature = "__qlog")]
             self.emit_qlog_recovery_metrics(now);
@@ -1324,9 +1333,7 @@ impl Connection {
         }
 
         trace!("sending {} bytes in {} datagrams", buf.len(), num_datagrams);
-        self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
-
-        self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
+        self.account_udp_transmit(num_datagrams as u64, buf.len());
 
         // Trace packets sent
         #[cfg(feature = "trace")]
@@ -1359,6 +1366,11 @@ impl Connection {
             },
             src_ip: self.local_ip,
         })
+    }
+
+    fn account_udp_transmit(&mut self, datagrams: u64, bytes: usize) {
+        self.path.total_sent = self.path.total_sent.saturating_add(bytes as u64);
+        self.stats.udp_tx.on_sent(datagrams, bytes);
     }
 
     /// Send PUNCH_ME_NOW for coordination if necessary
@@ -1435,7 +1447,10 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
+        buf.reserve(min_size as usize);
         let buf_capacity = buf.capacity();
 
         let mut builder = PacketBuilder::new(
@@ -1445,7 +1460,7 @@ impl Connection {
             buf,
             buf_capacity,
             0,
-            false,
+            true,
             self,
         )?;
 
@@ -1463,9 +1478,20 @@ impl Connection {
         buf.write(challenge);
         self.stats.frame_tx.path_challenge += 1;
 
-        let min_size = self.pqc_state.min_initial_size();
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
         builder.pad_to(min_size);
-        builder.finish_and_track(now, self, None, buf);
+        builder.finish_and_track(
+            now,
+            self,
+            Some(SentFrames {
+                non_retransmits: true,
+                ..SentFrames::default()
+            }),
+            buf,
+        );
+        self.account_udp_transmit(1, buf.len());
 
         // Mark coordination as validating after packet is built
         if let Some(nat_traversal) = &mut self.nat_traversal {
@@ -1531,7 +1557,10 @@ impl Connection {
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
 
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
+        buf.reserve(min_size as usize);
         let buf_capacity = buf.capacity();
 
         // Use current connection ID for NAT traversal PATH_CHALLENGE
@@ -1542,7 +1571,7 @@ impl Connection {
             buf,
             buf_capacity,
             0,
-            false,
+            true,
             self,
         )?;
 
@@ -1561,10 +1590,21 @@ impl Connection {
         self.stats.frame_tx.path_challenge += 1;
 
         // PATH_CHALLENGE frames must be padded to at least 1200 bytes
-        let min_size = self.pqc_state.min_initial_size();
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(self.path.current_mtu());
         builder.pad_to(min_size);
 
-        builder.finish_and_track(now, self, None, buf);
+        builder.finish_and_track(
+            now,
+            self,
+            Some(SentFrames {
+                non_retransmits: true,
+                ..SentFrames::default()
+            }),
+            buf,
+        );
+        self.account_udp_transmit(1, buf.len());
 
         Some(Transmit {
             destination: remote_addr,
@@ -1595,7 +1635,10 @@ impl Connection {
             SpaceId::Data,
             "PATH_CHALLENGE queued without 1-RTT keys"
         );
-        buf.reserve(self.pqc_state.min_initial_size() as usize);
+        let min_size = self
+            .pqc_state
+            .min_initial_size_for_path_mtu(prev_path.current_mtu());
+        buf.reserve(min_size as usize);
 
         let buf_capacity = buf.capacity();
 
@@ -1611,7 +1654,7 @@ impl Connection {
             buf,
             buf_capacity,
             0,
-            false,
+            true,
             self,
         )?;
         trace!("validating previous path with PATH_CHALLENGE {:08x}", token);
@@ -1629,11 +1672,18 @@ impl Connection {
         // to at least the smallest allowed maximum datagram size of 1200 bytes,
         // unless the anti-amplification limit for the path does not permit
         // sending a datagram of this size
-        let min_size = self.pqc_state.min_initial_size();
         builder.pad_to(min_size);
 
-        builder.finish(self, buf);
-        self.stats.udp_tx.on_sent(1, buf.len());
+        builder.finish_and_track(
+            now,
+            self,
+            Some(SentFrames {
+                non_retransmits: true,
+                ..SentFrames::default()
+            }),
+            buf,
+        );
+        self.account_udp_transmit(1, buf.len());
 
         Some(Transmit {
             destination,
@@ -1847,6 +1897,11 @@ impl Connection {
         stats.path.current_mtu = self.path.mtud.current_mtu();
 
         stats
+    }
+
+    /// Number of packets received from the peer that authenticated successfully.
+    pub(crate) fn authenticated_packets(&self) -> u64 {
+        self.total_authed_packets
     }
 
     /// Set the bound peer identity for token v2 issuance.
@@ -2413,6 +2468,9 @@ impl Connection {
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+            self.path
+                .congestion
+                .on_packet_abandoned(info.sample_pn, info.size.into());
             self.remove_in_flight(packet, &info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
@@ -2630,7 +2688,7 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(now, remote, ecn, Some(packet_number), packet.into())?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
@@ -2712,10 +2770,12 @@ impl Connection {
 
         // Check if we should trigger MTU discovery for PQC
         if self.pqc_state.should_trigger_mtu_discovery() {
-            // Request larger MTU for PQC handshakes
-            self.path
-                .mtud
-                .reset(self.pqc_state.min_initial_size(), self.config.min_mtu);
+            // Restart MTU discovery from the current path MTU. PQC handshakes
+            // may benefit from larger packets, but raising `current_mtu`
+            // directly would let the first server flight exceed the path
+            // before DPLPMTUD has proven it.
+            let current_mtu = self.path.current_mtu();
+            self.path.mtud.reset(current_mtu, self.config.min_mtu);
             trace!("Triggered MTU discovery for PQC handshake");
         }
 
@@ -2776,10 +2836,14 @@ impl Connection {
 
             if use_pqc_fragmentation {
                 // Fragment large CRYPTO data for PQC handshakes
+                let max_crypto_frame_size = usize::from(
+                    self.pqc_state
+                        .min_initial_size_for_path_mtu(self.path.current_mtu()),
+                );
                 let frames = self.pqc_state.packet_handler.fragment_crypto_data(
                     &outgoing,
                     offset,
-                    self.pqc_state.min_initial_size() as usize,
+                    max_crypto_frame_size,
                 );
                 for frame in frames {
                     self.spaces[space].pending.crypto.push_back(frame);
@@ -2838,7 +2902,9 @@ impl Connection {
             // Neuter the packet in the congestion controller too — BBRv2's
             // per-packet sampler would otherwise keep the send-time state
             // around indefinitely as a zombie entry.
-            self.path.congestion.on_packet_neutered(packet.sample_pn);
+            self.path
+                .congestion
+                .on_packet_abandoned(packet.sample_pn, packet.size.into());
             self.remove_in_flight(pn, &packet);
         }
         self.set_loss_detection_timer(now)
@@ -2989,7 +3055,7 @@ impl Connection {
                         }
                     }
 
-                    if !self.state.is_closed() {
+                    if !self.state.is_closed() && number.is_some() {
                         let spin = match packet.header {
                             Header::Short { spin, .. } => spin,
                             _ => false,
@@ -3004,7 +3070,7 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_decrypted_packet(now, remote, ecn, number, packet)
                 }
             }
         };
@@ -3060,6 +3126,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
         number: Option<u64>,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
@@ -3110,7 +3177,7 @@ impl Connection {
                     return Err(TransportError::PROTOCOL_VIOLATION("client sent Retry").into());
                 }
 
-                if self.total_authed_packets > 1
+                if self.total_authed_packets > 0
                             || packet.payload.len() <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
                                 &self.rem_cids.active(),
@@ -3131,6 +3198,7 @@ impl Connection {
 
                 trace!("retrying with CID {}", rem_cid);
                 let client_hello = state.client_hello.take().unwrap();
+                self.on_packet_authenticated(now, SpaceId::Initial, ecn, None, false, false);
                 self.retry_src_cid = Some(rem_cid);
                 self.rem_cids.update_initial_cid(rem_cid);
                 self.rem_handshake_cid = rem_cid;
@@ -3158,6 +3226,9 @@ impl Connection {
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                 for (pn, info) in zero_rtt {
+                    self.path
+                        .congestion
+                        .on_packet_abandoned(info.sample_pn, info.size.into());
                     self.remove_in_flight(pn, &info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
@@ -3224,6 +3295,9 @@ impl Connection {
                             let sent_packets =
                                 mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                             for (pn, packet) in sent_packets {
+                                self.path
+                                    .congestion
+                                    .on_packet_abandoned(packet.sample_pn, packet.size.into());
                                 self.remove_in_flight(pn, &packet);
                             }
                         } else {
@@ -3296,7 +3370,7 @@ impl Connection {
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
-                if self.total_authed_packets > 1 {
+                if self.total_authed_packets > 0 {
                     return Ok(());
                 }
                 let supported = packet
@@ -3315,6 +3389,47 @@ impl Connection {
             Header::Short { .. } => unreachable!(
                 "short packets received during handshake are discarded in handle_packet"
             ),
+        }
+    }
+
+    fn illegal_frame(frame: &Frame, reason: &'static str) -> TransportError {
+        let mut err = TransportError::PROTOCOL_VIOLATION(reason);
+        err.frame = Some(frame.ty());
+        err
+    }
+
+    fn ensure_early_frame_allowed(frame: &Frame) -> Result<(), TransportError> {
+        match frame {
+            Frame::Padding
+            | Frame::Ping
+            | Frame::Crypto(_)
+            | Frame::Ack(_)
+            | Frame::Close(Close::Connection(_)) => Ok(()),
+            _ => Err(Self::illegal_frame(
+                frame,
+                "illegal frame type in handshake",
+            )),
+        }
+    }
+
+    fn ensure_0rtt_frame_allowed(frame: &Frame) -> Result<(), TransportError> {
+        match frame {
+            Frame::Padding
+            | Frame::Ping
+            | Frame::ResetStream(_)
+            | Frame::StopSending(_)
+            | Frame::Stream(_)
+            | Frame::MaxData(_)
+            | Frame::MaxStreamData { .. }
+            | Frame::MaxStreams { .. }
+            | Frame::DataBlocked { .. }
+            | Frame::StreamDataBlocked { .. }
+            | Frame::StreamsBlocked { .. }
+            | Frame::NewConnectionId(_)
+            | Frame::PathChallenge(_)
+            | Frame::Close(_)
+            | Frame::Datagram(_) => Ok(()),
+            _ => Err(Self::illegal_frame(frame, "illegal frame type in 0-RTT")),
         }
     }
 
@@ -3337,6 +3452,7 @@ impl Connection {
             self.stats.frame_rx.record(&frame);
 
             let _guard = span.as_ref().map(|x| x.enter());
+            Self::ensure_early_frame_allowed(&frame)?;
             ack_eliciting |= frame.is_ack_eliciting();
 
             // Process frames
@@ -3354,10 +3470,10 @@ impl Connection {
                     return Ok(());
                 }
                 _ => {
-                    let mut err =
-                        TransportError::PROTOCOL_VIOLATION("illegal frame type in handshake");
-                    err.frame = Some(frame.ty());
-                    return Err(err);
+                    return Err(Self::illegal_frame(
+                        &frame,
+                        "illegal frame type in handshake",
+                    ));
                 }
             }
         }
@@ -3412,14 +3528,7 @@ impl Connection {
 
             let _guard = span.as_ref().map(|x| x.enter());
             if packet.header.is_0rtt() {
-                match frame {
-                    Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "illegal frame type in 0-RTT",
-                        ));
-                    }
-                    _ => {}
-                }
+                Self::ensure_0rtt_frame_allowed(&frame)?;
             }
             ack_eliciting |= frame.is_ack_eliciting();
 
@@ -4892,11 +5001,20 @@ impl Connection {
         // Normalize the address to handle IPv4-mapped IPv6 addresses
         // This is critical for nodes bound to IPv4-only sockets
         let normalized_addr = crate::shared::normalize_socket_addr(add_address.address);
+        let peer_addr = crate::shared::normalize_socket_addr(self.path.remote);
 
         info!(
             "handle_add_address: RECEIVED ADD_ADDRESS from peer addr={} (normalized={}) seq={} priority={}",
             add_address.address, normalized_addr, add_address.sequence, add_address.priority
         );
+
+        if peer_addr.ip() == normalized_addr.ip() {
+            debug!(
+                "handle_add_address: dropping same-IP ADD_ADDRESS from peer={} addr={} seq={}",
+                peer_addr, normalized_addr, add_address.sequence
+            );
+            return Ok(());
+        }
 
         match nat_state.add_remote_candidate(
             add_address.sequence,
@@ -6498,6 +6616,12 @@ impl PqcState {
         }
     }
 
+    /// Return the PQC-preferred minimum packet size, bounded by the
+    /// path MTU that has actually been established for this connection.
+    fn min_initial_size_for_path_mtu(&self, path_mtu: u16) -> u16 {
+        self.min_initial_size().min(path_mtu)
+    }
+
     /// Update PQC state based on peer's transport parameters
     fn update_from_peer_params(&mut self, params: &TransportParameters) {
         if let Some(ref algorithms) = params.pqc_algorithms {
@@ -7039,8 +7163,30 @@ impl AddressObservationRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport_parameters::AddressDiscoveryConfig;
+    use crate::transport_parameters::{AddressDiscoveryConfig, PqcAlgorithms};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn pqc_min_initial_size_is_capped_by_path_mtu() {
+        let mut state = PqcState::new();
+        let params = TransportParameters {
+            pqc_algorithms: Some(PqcAlgorithms {
+                ml_kem_768: true,
+                ml_dsa_65: true,
+            }),
+            ..TransportParameters::default()
+        };
+
+        state.update_from_peer_params(&params);
+
+        assert_eq!(state.min_initial_size(), 4096);
+        assert_eq!(
+            state.min_initial_size_for_path_mtu(INITIAL_MTU),
+            INITIAL_MTU
+        );
+        assert_eq!(state.min_initial_size_for_path_mtu(1452), 1452);
+        assert_eq!(state.min_initial_size_for_path_mtu(9000), 4096);
+    }
 
     #[test]
     fn address_discovery_state_new() {
@@ -7274,6 +7420,71 @@ mod tests {
             assert_eq!(negotiate_max_idle_timeout(left, right), result);
             assert_eq!(negotiate_max_idle_timeout(right, left), result);
         }
+    }
+
+    fn ack_frame() -> Frame {
+        Frame::Ack(frame::Ack {
+            largest: 0,
+            delay: 0,
+            additional: Bytes::new(),
+            ecn: None,
+        })
+    }
+
+    fn app_close_frame() -> Frame {
+        Frame::Close(Close::Application(frame::ApplicationClose {
+            error_code: VarInt::from_u32(0),
+            reason: Bytes::new(),
+        }))
+    }
+
+    fn transport_close_frame() -> Frame {
+        Frame::Close(Close::Connection(frame::ConnectionClose {
+            error_code: TransportErrorCode::NO_ERROR,
+            frame_type: None,
+            reason: Bytes::new(),
+        }))
+    }
+
+    #[test]
+    fn zero_rtt_rejects_frames_forbidden_by_rfc9000() {
+        let forbidden = vec![
+            ack_frame(),
+            Frame::Crypto(frame::Crypto {
+                offset: 0,
+                data: Bytes::new(),
+            }),
+            Frame::NewToken(NewToken {
+                token: Bytes::from_static(b"token"),
+            }),
+            Frame::PathResponse(1),
+            Frame::RetireConnectionId { sequence: 0 },
+            Frame::HandshakeDone,
+        ];
+
+        for frame in forbidden {
+            let err = Connection::ensure_0rtt_frame_allowed(&frame).unwrap_err();
+            assert_eq!(err.code, TransportErrorCode::PROTOCOL_VIOLATION);
+            assert_eq!(err.frame, Some(frame.ty()));
+        }
+    }
+
+    #[test]
+    fn zero_rtt_allows_application_data_close_but_early_packets_do_not() {
+        assert!(Connection::ensure_0rtt_frame_allowed(&app_close_frame()).is_ok());
+
+        let err = Connection::ensure_early_frame_allowed(&app_close_frame()).unwrap_err();
+        assert_eq!(err.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert_eq!(err.frame, Some(frame::FrameType::APPLICATION_CLOSE));
+
+        assert!(Connection::ensure_early_frame_allowed(&transport_close_frame()).is_ok());
+    }
+
+    #[test]
+    fn congestion_gate_allows_exact_window_fill() {
+        assert!(!would_exceed_congestion_window(10_800, 1_200, 12_000));
+        assert!(would_exceed_congestion_window(10_801, 1_200, 12_000));
+        assert!(would_exceed_congestion_window(12_000, 1, 12_000));
     }
 
     #[test]

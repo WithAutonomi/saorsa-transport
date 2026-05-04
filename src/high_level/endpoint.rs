@@ -319,18 +319,19 @@ impl Endpoint {
     ) {
         if let Ok(mut state) = self.inner.0.state.lock() {
             // Find the connection handle for this address
-            let handle = state.inner.connection_handle_for_addr(&addr);
+            let normalized = crate::shared::normalize_socket_addr(addr);
+            let handle = state.inner.connection_handle_for_addr(&normalized);
             if let Some(ch) = handle {
                 state.inner.set_connection_peer_id(ch, peer_id);
                 tracing::info!(
                     "Registered peer ID {} for connection {} at low-level endpoint",
                     hex::encode(&peer_id.0[..8]),
-                    addr
+                    normalized
                 );
             } else {
                 tracing::debug!(
                     "No connection handle found for {} — peer ID not registered",
-                    addr
+                    normalized
                 );
             }
         }
@@ -501,13 +502,7 @@ impl Endpoint {
             return None;
         };
         let normalized = crate::shared::normalize_socket_addr(*addr);
-        let handle = state
-            .inner
-            .connection_handle_for_addr(&normalized)
-            .or_else(|| {
-                crate::shared::dual_stack_alternate(&normalized)
-                    .and_then(|alt| state.inner.connection_handle_for_addr(&alt))
-            });
+        let handle = state.inner.connection_handle_for_addr(&normalized);
         handle.map(|h| state.inner.connection_stable_id(h))
     }
 
