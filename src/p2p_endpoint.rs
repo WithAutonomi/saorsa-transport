@@ -567,10 +567,6 @@ pub enum SendFailureStage {
     Write,
     /// The stream could not be finished after all bytes were queued.
     Finish,
-    /// The peer explicitly stopped the stream.
-    Stopped,
-    /// The stream failed while waiting for acknowledgement/stop state.
-    Acknowledgement,
 }
 
 impl std::fmt::Display for SendFailureStage {
@@ -581,8 +577,6 @@ impl std::fmt::Display for SendFailureStage {
             Self::WriteProgressTimeout => "write_progress_timeout",
             Self::Write => "write",
             Self::Finish => "finish",
-            Self::Stopped => "stopped",
-            Self::Acknowledgement => "acknowledgement",
         };
         f.write_str(label)
     }
@@ -2701,11 +2695,7 @@ impl P2pEndpoint {
                 //
                 // If the QUIC connection has a close_reason, every step of
                 // the send path below is guaranteed to either fail or hang
-                // until the per-step timeout. In particular,
-                // `send_stream.stopped()` waits the full ack_timeout
-                // (~1 s + payload budget) for a peer that can never
-                // acknowledge — 1 s of dead latency per attempted send
-                // against a torn-down connection. Short-circuiting here
+                // until a per-step progress timeout. Short-circuiting here
                 // collapses that to a microsecond-scale error.
                 //
                 // The upper layer (transport_handle channel recovery)
@@ -2786,46 +2776,6 @@ impl P2pEndpoint {
                     warn!("send({}): finish failed: {}", addr, e);
                     send_failed(SendFailureStage::Finish, bytes_written, e.to_string())
                 })?;
-
-                // Give Quinn a short chance to observe stream completion.
-                // `finish()` only queues the FIN locally, while `stopped()`
-                // resolves when all stream data has been acknowledged or the
-                // peer explicitly stops the stream. A missing ACK within this
-                // local window is not proof of delivery failure, especially on
-                // busy testnets where ACKs can be delayed behind other work.
-                //
-                // Keep hard errors for explicit stop/connection loss, but
-                // treat timeout as "queued to QUIC" and let later connection
-                // state or application-level request timeouts handle retries.
-                // For large payloads we add time proportional to size at an
-                // assumed 256 KB/s per connection.
-                let base_timeout = self.config.timeouts.send_ack_timeout;
-                let size_budget =
-                    std::time::Duration::from_millis((data.len() as u64).saturating_div(256));
-                let ack_timeout = base_timeout + size_budget;
-                match timeout(ack_timeout, send_stream.stopped()).await {
-                    Ok(Ok(None)) => {}
-                    Ok(Ok(Some(stop_code))) => {
-                        return Err(send_failed(
-                            SendFailureStage::Stopped,
-                            bytes_written,
-                            format!("peer stopped stream with code {stop_code}"),
-                        ));
-                    }
-                    Ok(Err(e)) => {
-                        return Err(send_failed(
-                            SendFailureStage::Acknowledgement,
-                            bytes_written,
-                            format!("peer did not acknowledge stream data: {e}"),
-                        ));
-                    }
-                    Err(_elapsed) => {
-                        debug!(
-                            "send({}): stream data queued but not fully acknowledged within {:?}",
-                            addr, ack_timeout
-                        );
-                    }
-                }
 
                 debug!("Sent {} bytes to {} via QUIC", data.len(), addr);
             }

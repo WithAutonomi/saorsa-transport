@@ -131,14 +131,8 @@ impl Default for RelayTimeouts {
     }
 }
 
-/// Default best-effort window to observe stream-data acknowledgement after a send.
-const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Fast-network best-effort send ACK window (halved from default).
-const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(500);
-
 /// Master timeout configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TimeoutConfig {
     /// NAT traversal timeouts
     pub nat_traversal: NatTraversalTimeouts,
@@ -148,26 +142,6 @@ pub struct TimeoutConfig {
 
     /// Relay timeouts
     pub relay: RelayTimeouts,
-
-    /// Best-effort time to wait for Quinn to observe acknowledgement of stream
-    /// data after `finish()`.
-    ///
-    /// Explicit stream stop or connection loss is still returned as a send
-    /// error. Expiry of this window only means the data has been queued to
-    /// QUIC but not confirmed locally yet; later connection state or
-    /// application-level timeouts are responsible for retries.
-    pub send_ack_timeout: Duration,
-}
-
-impl Default for TimeoutConfig {
-    fn default() -> Self {
-        Self {
-            nat_traversal: NatTraversalTimeouts::default(),
-            discovery: DiscoveryTimeouts::default(),
-            relay: RelayTimeouts::default(),
-            send_ack_timeout: DEFAULT_SEND_ACK_TIMEOUT,
-        }
-    }
 }
 
 impl TimeoutConfig {
@@ -177,7 +151,6 @@ impl TimeoutConfig {
             nat_traversal: NatTraversalTimeouts::fast(),
             discovery: DiscoveryTimeouts::default(),
             relay: RelayTimeouts::default(),
-            send_ack_timeout: FAST_SEND_ACK_TIMEOUT,
         }
     }
 
@@ -187,7 +160,6 @@ impl TimeoutConfig {
             nat_traversal: NatTraversalTimeouts::conservative(),
             discovery: DiscoveryTimeouts::default(),
             relay: RelayTimeouts::default(),
-            send_ack_timeout: DEFAULT_SEND_ACK_TIMEOUT,
         }
     }
 }
