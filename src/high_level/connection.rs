@@ -42,6 +42,7 @@ use crate::{
 pub struct Connecting {
     conn: Option<ConnectionRef>,
     connected: oneshot::Receiver<bool>,
+    first_peer_response: Option<oneshot::Receiver<()>>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
 }
 
@@ -54,6 +55,7 @@ impl Connecting {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let (on_first_peer_response_send, on_first_peer_response_recv) = oneshot::channel();
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
         let conn = ConnectionRef::new(
@@ -61,6 +63,7 @@ impl Connecting {
             conn,
             endpoint_events,
             conn_events,
+            on_first_peer_response_send,
             on_handshake_data_send,
             on_connected_send,
             socket,
@@ -80,6 +83,7 @@ impl Connecting {
         Self {
             conn: Some(conn),
             connected: on_connected_recv,
+            first_peer_response: Some(on_first_peer_response_recv),
             handshake_data_ready: Some(on_handshake_data_recv),
         }
     }
@@ -184,6 +188,45 @@ impl Connecting {
                     ))
                 })
             })
+    }
+
+    /// Wait for the first authenticated QUIC packet from the peer.
+    ///
+    /// This completes before the full handshake and can be used to distinguish basic peer
+    /// reachability from handshake completion.
+    pub async fn first_peer_response(&mut self) -> Result<(), ConnectionError> {
+        if !self.has_peer_response()? {
+            if let Some(x) = self.first_peer_response.take() {
+                let _ = x.await;
+            }
+        }
+
+        let conn = self.conn.as_ref().ok_or_else(|| {
+            tracing::error!("Connection state missing while waiting for first peer response");
+            ConnectionError::LocallyClosed
+        })?;
+        let inner = conn.state.lock("first_peer_response");
+        if inner.peer_response_received {
+            Ok(())
+        } else {
+            Err(inner.error.clone().unwrap_or_else(|| {
+                error!("Spurious peer response notification with no error");
+                ConnectionError::TransportError(crate::transport_error::Error::INTERNAL_ERROR(
+                    "Spurious peer response notification".to_string(),
+                ))
+            }))
+        }
+    }
+
+    fn has_peer_response(&self) -> Result<bool, ConnectionError> {
+        let conn = self.conn.as_ref().ok_or_else(|| {
+            tracing::error!("Connection state missing while checking first peer response");
+            ConnectionError::LocallyClosed
+        })?;
+        Ok(conn
+            .state
+            .lock("first_peer_response")
+            .peer_response_received)
     }
 
     /// The local IP address which was used when the peer established
@@ -1160,20 +1203,24 @@ impl ConnectionRef {
         conn: crate::Connection,
         endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
         conn_events: mpsc::Receiver<ConnectionEvent>,
+        on_first_peer_response: oneshot::Sender<()>,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let remote_addr = conn.remote_address();
+        let peer_response_received = conn.authenticated_packets() > 0;
         Self(Arc::new(ConnectionInner {
             initial_remote_addr: remote_addr,
             state: Mutex::new(State {
                 inner: conn,
                 driver: None,
                 handle,
+                on_first_peer_response: Some(on_first_peer_response),
                 on_handshake_data: Some(on_handshake_data),
                 on_connected: Some(on_connected),
+                peer_response_received,
                 connected: false,
                 timer: None,
                 timer_deadline: None,
@@ -1256,8 +1303,10 @@ pub(crate) struct State {
     pub(crate) inner: crate::Connection,
     driver: Option<Waker>,
     handle: ConnectionHandle,
+    on_first_peer_response: Option<oneshot::Sender<()>>,
     on_handshake_data: Option<oneshot::Sender<()>>,
     on_connected: Option<oneshot::Sender<bool>>,
+    peer_response_received: bool,
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
@@ -1389,7 +1438,11 @@ impl State {
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                    let needs_first_response_check = !self.peer_response_received;
                     self.inner.handle_event(event);
+                    if needs_first_response_check && self.inner.authenticated_packets() > 0 {
+                        self.notify_first_peer_response();
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
                     self.close(error_code, reason, shared);
@@ -1408,16 +1461,27 @@ impl State {
         }
     }
 
+    fn notify_first_peer_response(&mut self) {
+        if !self.peer_response_received {
+            self.peer_response_received = true;
+            if let Some(x) = self.on_first_peer_response.take() {
+                let _ = x.send(());
+            }
+        }
+    }
+
     fn forward_app_events(&mut self, shared: &Shared) {
         while let Some(event) = self.inner.poll() {
             use crate::Event::*;
             match event {
                 HandshakeDataReady => {
+                    self.notify_first_peer_response();
                     if let Some(x) = self.on_handshake_data.take() {
                         let _ = x.send(());
                     }
                 }
                 Connected => {
+                    self.notify_first_peer_response();
                     self.connected = true;
                     if let Some(x) = self.on_connected.take() {
                         // We don't care if the on-connected future was dropped
@@ -1533,6 +1597,9 @@ impl State {
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
+        if let Some(x) = self.on_first_peer_response.take() {
+            let _ = x.send(());
+        }
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }

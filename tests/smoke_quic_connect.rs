@@ -80,6 +80,57 @@ async fn connect_classical_tls_loopback() {
     do_connect_classical_tls_loopback().await;
 }
 
+#[tokio::test]
+async fn first_peer_response_completes_before_full_connect_wait() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let (chain, key) = gen_self_signed_cert();
+    let server_cfg =
+        ServerConfig::with_single_cert(chain.clone(), key).expect("failed to build ServerConfig");
+
+    let server_addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let server_ep = Endpoint::server(server_cfg, server_addr).expect("server endpoint");
+    let listen_addr = server_ep.local_addr().expect("obtain server local addr");
+
+    let accept_task = tokio::spawn(async move {
+        let inc = timeout(Duration::from_secs(10), server_ep.accept())
+            .await
+            .expect("server accept wait")
+            .expect("incoming");
+        timeout(Duration::from_secs(10), inc)
+            .await
+            .expect("server handshake wait")
+            .expect("server handshake ok")
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    for c in chain {
+        roots.add(c).expect("add server cert to roots");
+    }
+    let client_cfg = ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config");
+
+    let client_addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let mut client_ep = Endpoint::client(client_addr).expect("client endpoint");
+    client_ep.set_default_client_config(client_cfg);
+
+    let mut connecting = client_ep
+        .connect(listen_addr, "localhost")
+        .expect("start connect");
+
+    timeout(Duration::from_secs(10), connecting.first_peer_response())
+        .await
+        .expect("first peer response wait")
+        .expect("first peer response");
+
+    let conn = timeout(Duration::from_secs(10), connecting)
+        .await
+        .expect("client connect wait")
+        .expect("client connected");
+
+    let _server_conn = accept_task.await.expect("accept task join");
+    assert_eq!(conn.remote_address(), listen_addr);
+}
+
 // PQC capability + connection smoke: ensure PQC primitives work and a classical QUIC
 // handshake still succeeds on the same runtime. This validates local readiness for
 // enabling hybrid KEX in CI or dockerized envs.

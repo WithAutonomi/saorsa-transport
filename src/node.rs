@@ -359,6 +359,7 @@ impl Node {
             | P2pEvent::BootstrapStatus { .. }
             | P2pEvent::PeerAuthenticated { .. }
             | P2pEvent::PeerAddressUpdated { .. }
+            | P2pEvent::PeerObservedExternal { .. }
             | P2pEvent::RelayEstablished { .. }
             | P2pEvent::RelayLost { .. } => None,
         }

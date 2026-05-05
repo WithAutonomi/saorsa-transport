@@ -273,6 +273,37 @@ pub fn dual_stack_alternate(addr: &SocketAddr) -> Option<SocketAddr> {
     }
 }
 
+/// Maximum number of address forms produced by [`socket_addr_variants`]:
+/// the normalized form, the original (if it differs from normalized), and
+/// the dual-stack alternate (if any).
+pub const MAX_ADDR_VARIANTS: usize = 3;
+
+/// Return every address form that may key a connection lookup for `addr`.
+///
+/// On dual-stack sockets the same peer can show up under multiple
+/// representations (plain IPv4 vs. IPv4-mapped IPv6), and connections may
+/// be inserted under either. Lookups must therefore probe all live forms:
+///
+/// 1. The normalized address (IPv4-mapped IPv6 collapsed to IPv4).
+/// 2. The original `addr` if it differs from the normalized form.
+/// 3. The dual-stack alternate, if one exists.
+///
+/// The result has at most [`MAX_ADDR_VARIANTS`] entries with no duplicates.
+pub fn socket_addr_variants(addr: SocketAddr) -> Vec<SocketAddr> {
+    let normalized = normalize_socket_addr(addr);
+    let mut variants = Vec::with_capacity(MAX_ADDR_VARIANTS);
+    variants.push(normalized);
+    if addr != normalized {
+        variants.push(addr);
+    }
+    if let Some(alt) = dual_stack_alternate(&normalized)
+        && !variants.contains(&alt)
+    {
+        variants.push(alt);
+    }
+    variants
+}
+
 /// Deterministic 32-byte wire identifier from a `SocketAddr`.
 ///
 /// Used to correlate PUNCH_ME_NOW relay targets across connections.

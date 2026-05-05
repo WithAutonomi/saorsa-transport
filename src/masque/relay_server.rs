@@ -41,9 +41,13 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+use std::os::unix::io::AsRawFd;
+
 use crate::VarInt;
 use crate::high_level::Connection as QuicConnection;
 use crate::masque::ip_policy::IpPolicy;
+use crate::masque::tunnel_control::{CONTROL_FRAME_MARKER, TunnelControlFrame};
 use crate::masque::{
     Capsule, ConnectUdpRequest, ConnectUdpResponse, Datagram, RelaySession, RelaySessionConfig,
     RelaySessionState, UncompressedDatagram,
@@ -64,6 +68,141 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// userspace buffer that replaces the tiny kernel UDP receive buffer
 /// (208 KB default on Linux, which holds only ~170 packets).
 const RELAY_FORWARD_CHANNEL_CAPACITY: usize = 8192;
+
+/// Suggested PMTU sent to the relay-client when the egress UDP send
+/// fails with `EMSGSIZE`.  Picked to be QUIC's mandatory minimum
+/// datagram size (1200 bytes), which any conformant path must carry.
+/// Real path MTUs are usually higher; the relay-client's Quinn DPLPMTUD
+/// can probe upward from there once it lowers to this floor.
+const PMTU_FALLBACK_HINT: u16 = 1200;
+
+/// Set the local "don't fragment" bit on a freshly-bound UDP socket so
+/// that oversized [`UdpSocket::send_to`] calls fail with `EMSGSIZE`
+/// instead of being silently fragmented at the IP layer.  Without this
+/// the kernel happily fragments the egress datagram, the user-side
+/// path then drops the fragments (most home NATs / routers refuse
+/// fragmented UDP), and the relay-server cannot tell that the path
+/// rejected the packet — which is exactly the false-success that lets
+/// Quinn's PMTU estimate stay too high.
+///
+/// Returns the underlying I/O error so the caller can decide whether
+/// to bail or proceed with default fragmentation behaviour.
+#[cfg(target_os = "linux")]
+fn set_dont_fragment(socket: &UdpSocket) -> std::io::Result<()> {
+    let fd = socket.as_raw_fd();
+
+    // Linux: opt into kernel-level PMTU discovery.  IP_PMTUDISC_DO
+    // forces DF=1 on every outbound IPv4 datagram and surfaces
+    // EMSGSIZE on the send_to that exceeds the path MTU.
+    let v4_val: libc::c_int = libc::IP_PMTUDISC_DO;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            std::ptr::from_ref(&v4_val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&v4_val) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Same for IPv6 — best effort: the socket may be v4-only, in
+    // which case the setsockopt fails with ENOPROTOOPT and that's
+    // fine.  We deliberately ignore the result to keep the v4 path
+    // working on dual-stack-incapable kernels.
+    let v6_val: libc::c_int = libc::IPV6_PMTUDISC_DO;
+    let _ = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            std::ptr::from_ref(&v6_val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&v6_val) as libc::socklen_t,
+        )
+    };
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn set_dont_fragment(socket: &UdpSocket) -> std::io::Result<()> {
+    // BSD-derived kernels expose a simple boolean IP_DONTFRAG /
+    // IPV6_DONTFRAG.  Behaviour matches Linux's IP_PMTUDISC_DO: DF=1
+    // on outbound, EMSGSIZE on too-big.
+    let fd = socket.as_raw_fd();
+    let on: libc::c_int = 1;
+
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_DONTFRAG,
+            std::ptr::from_ref(&on).cast::<libc::c_void>(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let _ = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_DONTFRAG,
+            std::ptr::from_ref(&on).cast::<libc::c_void>(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+fn set_dont_fragment(_socket: &UdpSocket) -> std::io::Result<()> {
+    // Other platforms: best-effort no-op.  PMTU discovery falls back
+    // to default kernel behaviour (silent fragmentation) and the
+    // tunnel-level PMTU control frame loop never fires.
+    Ok(())
+}
+
+/// Did this `send_to` failure mean "datagram too large for path"?
+/// Linux returns `EMSGSIZE` (errno 90); BSD returns `EMSGSIZE` as well.
+/// Treated as the only signal that warrants emitting a PMTU control
+/// frame back through the tunnel.
+#[cfg(unix)]
+fn is_message_too_large(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EMSGSIZE)
+}
+
+/// Non-Unix targets do not link `libc`, and the corresponding
+/// `set_dont_fragment` is a best-effort no-op there. Mirror that
+/// behaviour: never claim a send error is PMTU-related, so the
+/// tunnel-level PMTU control frame loop simply does not fire and we
+/// fall back to the kernel's default fragmentation behaviour.
+#[cfg(not(unix))]
+fn is_message_too_large(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// Item carried over the bounded channel between the UDP reader task
+/// and the QUIC stream writer task in [`MasqueRelayServer::run_stream_forwarding_loop`].
+///
+/// Both data frames (UDP arriving on the bound socket) and control
+/// frames (out-of-band tunnel-level signals such as PMTU updates)
+/// share the writer task so frame ordering is preserved and the
+/// keepalive timer treats both equally.
+enum WriterItem {
+    /// A length-prefixed [`UncompressedDatagram`]-encoded payload
+    /// that originated from a Direction-1 UDP recv.
+    Data(Bytes),
+    /// A control frame body (everything after the
+    /// `[CONTROL_FRAME_MARKER][body_len]` header).  The writer
+    /// prepends the header before sending.
+    Control(Bytes),
+}
 
 /// Configuration for the MASQUE relay server
 #[derive(Debug, Clone)]
@@ -575,6 +714,22 @@ impl MasqueRelayServer {
                     },
                 })?;
 
+        // Force DF=1 on the bound socket so oversized egress send_to
+        // fails with EMSGSIZE rather than getting silently fragmented.
+        // The error then drives a PmtuUpdate control frame back to the
+        // relay-client (see [`run_stream_forwarding_loop`]).  If the
+        // setsockopt itself fails (very old kernel, exotic platform),
+        // we log and proceed: PMTU control frames will simply never
+        // fire and the relay falls back to the legacy lossy behaviour.
+        if let Err(e) = set_dont_fragment(&udp_socket) {
+            tracing::warn!(
+                error = %e,
+                "Failed to enable IP_DONTFRAG on relay-allocated socket — \
+                 oversized egress will silently fragment instead of \
+                 surfacing PMTU feedback"
+            );
+        }
+
         let bound_port = udp_socket
             .local_addr()
             .map_err(|e| RelayError::SessionError {
@@ -888,11 +1043,11 @@ impl MasqueRelayServer {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, source)) => {
                             let payload = Bytes::copy_from_slice(&buf[..len]);
-                            tracing::trace!(
+                            tracing::debug!(
                                 session_id,
                                 source = %source,
                                 len,
-                                "Relay: received UDP from target"
+                                "RELAY_TUNNEL[srv]: dgram-loop dir1 recv UDP → forwarding to relay-client"
                             );
 
                             // Encode as uncompressed datagram (includes source address
@@ -961,21 +1116,32 @@ impl MasqueRelayServer {
                             };
                             match resolved {
                                 Some((target, payload)) => {
-                                    tracing::trace!(
+                                    tracing::debug!(
                                         session_id,
                                         target = %target,
                                         len = payload.len(),
-                                        "Relay: forwarding to target via UDP"
+                                        "RELAY_TUNNEL[srv]: dgram-loop dir2 recv from relay-client → sendto target"
                                     );
                                     server2.stats.record_bytes(payload.len() as u64);
                                     server2.stats.record_datagram();
-                                    if let Err(e) = socket2.send_to(&payload, target).await {
-                                        tracing::warn!(
-                                            session_id,
-                                            target = %target,
-                                            error = %e,
-                                            "Failed to send UDP to target"
-                                        );
+                                    match socket2.send_to(&payload, target).await {
+                                        Ok(n) => {
+                                            tracing::debug!(
+                                                session_id,
+                                                target = %target,
+                                                len = payload.len(),
+                                                sent = n,
+                                                "RELAY_TUNNEL[srv]: dgram-loop dir2 sendto OK"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                session_id,
+                                                target = %target,
+                                                error = %e,
+                                                "Failed to send UDP to target"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
@@ -1062,8 +1228,14 @@ impl MasqueRelayServer {
         // acts as a userspace buffer (~10 MB at capacity) that absorbs
         // full max-message-size bursts that would otherwise overflow the
         // kernel's tiny 208 KB UDP receive buffer.
+        //
+        // The channel carries a tagged item rather than raw bytes so
+        // the same writer can interleave normal data frames (Direction
+        // 1's forwarded UDP) with out-of-band control frames emitted
+        // by Direction 2 when its egress send_to fails with EMSGSIZE.
         let (fwd_tx, mut fwd_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(RELAY_FORWARD_CHANNEL_CAPACITY);
+            tokio::sync::mpsc::channel::<WriterItem>(RELAY_FORWARD_CHANNEL_CAPACITY);
+        let ctrl_tx = fwd_tx.clone();
 
         // Reader: UDP socket → channel (never blocked by stream writes)
         let reader_handle = tokio::spawn(async move {
@@ -1072,16 +1244,16 @@ impl MasqueRelayServer {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
                         let payload = Bytes::copy_from_slice(&buf[..len]);
-                        tracing::trace!(
+                        tracing::debug!(
                             session_id, source = %source, len,
-                            "Stream relay: received UDP from target"
+                            "RELAY_TUNNEL[srv]: stream-loop dir1 recv UDP → forwarding to relay-client"
                         );
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
                         let encoded = datagram.encode();
                         stats.record_bytes(encoded.len() as u64);
                         stats.record_datagram();
-                        if fwd_tx.send(encoded).await.is_err() {
+                        if fwd_tx.send(WriterItem::Data(encoded)).await.is_err() {
                             break; // writer closed
                         }
                     }
@@ -1101,15 +1273,38 @@ impl MasqueRelayServer {
             loop {
                 tokio::select! {
                     item = fwd_rx.recv() => {
-                        let Some(encoded) = item else { break };
-                        let frame_len = encoded.len() as u32;
-                        if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
-                            tracing::debug!(session_id, error = %e, "Stream write error (length)");
-                            break;
-                        }
-                        if let Err(e) = send_stream.write_all(&encoded).await {
-                            tracing::debug!(session_id, error = %e, "Stream write error (data)");
-                            break;
+                        let Some(item) = item else { break };
+                        match item {
+                            WriterItem::Data(encoded) => {
+                                let frame_len = encoded.len() as u32;
+                                if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (length)");
+                                    break;
+                                }
+                                if let Err(e) = send_stream.write_all(&encoded).await {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (data)");
+                                    break;
+                                }
+                            }
+                            WriterItem::Control(body) => {
+                                // Wire format: [4-byte BE marker][4-byte BE body_len][body]
+                                let body_len = body.len() as u32;
+                                if let Err(e) = send_stream
+                                    .write_all(&CONTROL_FRAME_MARKER.to_be_bytes())
+                                    .await
+                                {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (control marker)");
+                                    break;
+                                }
+                                if let Err(e) = send_stream.write_all(&body_len.to_be_bytes()).await {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (control len)");
+                                    break;
+                                }
+                                if let Err(e) = send_stream.write_all(&body).await {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (control body)");
+                                    break;
+                                }
+                            }
                         }
                     }
                     _ = keepalive.tick() => {
@@ -1167,18 +1362,62 @@ impl MasqueRelayServer {
                     let mut cursor = Bytes::from(frame_buf);
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
-                            tracing::trace!(
+                            tracing::debug!(
                                 session_id, target = %datagram.target,
                                 len = datagram.payload.len(),
-                                "Stream relay: forwarding to target via UDP"
+                                "RELAY_TUNNEL[srv]: stream-loop dir2 recv from relay-client → sendto target"
                             );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
-                            if let Err(e) = socket2.send_to(&datagram.payload, datagram.target).await {
-                                tracing::warn!(
-                                    session_id, target = %datagram.target, error = %e,
-                                    "Failed to send UDP to target"
-                                );
+                            let target = datagram.target;
+                            let payload_len = datagram.payload.len();
+                            match socket2.send_to(&datagram.payload, target).await {
+                                Ok(n) => {
+                                    tracing::debug!(
+                                        session_id,
+                                        target = %target,
+                                        len = payload_len,
+                                        sent = n,
+                                        "RELAY_TUNNEL[srv]: stream-loop dir2 sendto OK"
+                                    );
+                                }
+                                Err(e) if is_message_too_large(&e) => {
+                                    // Path-MTU exceeded.  Emit a PmtuUpdate
+                                    // control frame back through the tunnel
+                                    // so the relay-client's MasqueRelaySocket
+                                    // can clamp future sends to this target —
+                                    // effectively forcing Quinn's DPLPMTUD
+                                    // to lower the connection's MTU estimate.
+                                    tracing::debug!(
+                                        session_id,
+                                        target = %target,
+                                        len = payload_len,
+                                        suggested_mtu = PMTU_FALLBACK_HINT,
+                                        "RELAY_TUNNEL[srv]: stream-loop dir2 EMSGSIZE → emitting PmtuUpdate"
+                                    );
+                                    let body = TunnelControlFrame::PmtuUpdate {
+                                        target,
+                                        mtu: PMTU_FALLBACK_HINT,
+                                    }
+                                    .encode_body();
+                                    // Best-effort: if the writer is gone or
+                                    // its bounded queue is full, avoid
+                                    // stalling the client-to-target path.
+                                    if let Err(e) = ctrl_tx.try_send(WriterItem::Control(body)) {
+                                        tracing::debug!(
+                                            session_id,
+                                            target = %target,
+                                            error = %e,
+                                            "RELAY_TUNNEL[srv]: dropped PmtuUpdate control frame"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        session_id, target = %target, error = %e,
+                                        "Failed to send UDP to target"
+                                    );
+                                }
                             }
                         }
                         Err(_) => {

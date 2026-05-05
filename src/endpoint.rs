@@ -256,23 +256,17 @@ impl Endpoint {
     pub fn peer_connection_addr(&self, peer_id: &PeerId) -> Option<SocketAddr> {
         let handle = self.peer_connections.get(peer_id)?;
         let meta = self.connections.get(handle.0)?;
-        Some(meta.addresses.remote)
+        Some(crate::shared::normalize_socket_addr(meta.addresses.remote))
     }
 
     /// Find the connection handle for a given remote address.
     pub fn connection_handle_for_addr(&self, addr: &SocketAddr) -> Option<ConnectionHandle> {
         let normalized = crate::shared::normalize_socket_addr(*addr);
-        let alt = crate::shared::dual_stack_alternate(addr);
 
         for (idx, meta) in self.connections.iter() {
-            let remote = meta.addresses.remote;
+            let remote = crate::shared::normalize_socket_addr(meta.addresses.remote);
             if remote == normalized {
                 return Some(ConnectionHandle(idx));
-            }
-            if let Some(ref a) = alt {
-                if remote == *a {
-                    return Some(ConnectionHandle(idx));
-                }
             }
         }
         None

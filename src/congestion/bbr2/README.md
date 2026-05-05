@@ -20,7 +20,7 @@ Or via the raw factory:
 
 ```rust
 let mut cc = crate::congestion::Bbr2Config::default();
-cc.initial_window(200 * 1200);
+cc.initial_window(10 * 1200);
 let factory: Arc<dyn ControllerFactory + Send + Sync> = Arc::new(cc);
 ```
 
@@ -62,45 +62,18 @@ The vendored BBRv2 wants a single batched call:
 
 The adapter buffers `Acked`/`Lost` entries and flushes at the two natural
 batch boundaries in saorsa's flow:
-1. `on_end_acks` → flush the ack batch (lost list is usually empty here;
-   saorsa's `detect_lost_packets` runs afterwards).
-2. `on_congestion_event` → append to the loss list, then flush.
-
-Because saorsa's ack-then-loss split spans two flushes within the same
-ack-processing round, the adapter issues up to two `BBRv2::on_congestion_event`
-calls per RTT instead of one batched call. BBRv2 handles this — the minor
-fidelity cost is that the sampler can't correlate same-round acks and
-losses in a single event.
+1. `on_congestion_event` → flushes ack/loss batches when loss detection has
+   just produced a congestion event.
+2. `on_end_acks` → flushes any remaining ack batch and resyncs the adapter's
+   shadow bytes-in-flight value with the connection's authoritative counter.
 
 ## Known fidelity gaps vs upstream quiche
 
-These are the places where the adapter trades accuracy for interface
-compatibility with saorsa's existing `Controller` trait. Fixing them
-requires extending saorsa's trait (cross-cutting changes in
-`src/congestion.rs` + `src/connection/mod.rs`):
-
-1. **No packet number on ack.** saorsa's `Controller::on_ack` doesn't carry
-   `pn: u64`. The adapter falls back to using `max_sent_packet_number`
-   as a proxy key when pushing `Acked { pkt_num, time_sent }`. The
-   sampler is robust to unknown pkt_nums (it just skips them) but loses
-   per-packet delivery-rate precision as a result.
-
-2. **No per-packet loss info.** saorsa's `on_congestion_event` gives a
-   single aggregate `lost_bytes`. The adapter wraps this in a single
-   synthetic `Lost` entry keyed on `max_sent_packet_number`. BBRv2's
-   `inflight_hi_on_loss` reduction still fires correctly from the
-   aggregate byte count; only the sampler's per-packet loss-rate
-   tracking is degraded.
-
-3. **No `bytes_in_flight` passed through.** saorsa's `on_sent` and
-   `on_ack` don't include the connection's in-flight counter. The
-   adapter tracks its own `bytes_in_flight` by summing sent/acked/lost
-   bytes and resyncs to the authoritative value in `on_end_acks`.
-
-Both (1) and (2) are blocked on a single trait change — add `pn: u64` to
-`Controller::on_ack` and take `&[(u64, u64)]` (pn, bytes) in
-`on_congestion_event` — which would be a small cross-cutting refactor in
-`src/congestion.rs` and `src/connection/mod.rs`.
+The adapter mirrors bytes-in-flight by summing packet sends, acks, losses,
+and abandoned packets, then resyncs from the connection's authoritative
+counter in `on_end_acks`. The controller trait still does not pass
+bytes-in-flight directly into `on_sent`, so this shadow counter is the main
+remaining fidelity compromise versus quiche's native recovery manager.
 
 ## What this gets you over saorsa's BBRv1
 
@@ -119,8 +92,9 @@ Both (1) and (2) are blocked on a single trait change — add `pn: u64` to
 
 ## Default
 
-BBRv2 is the default as of this port (`CongestionAlgorithm::Bbr2`). To
-opt back into BBRv1, set `congestion_algorithm: CongestionAlgorithm::Bbr`
-in the `P2pConfig`; CUBIC is available as
-`CongestionAlgorithm::Cubic` for comparison or when probing an unknown
-path.
+BBRv2 is the default as of this port (`CongestionAlgorithm::Bbr2`). Its
+default initial congestion window is 10 packets, matching RFC 9002/quiche
+style startup behavior. To opt back into BBRv1, set
+`congestion_algorithm: CongestionAlgorithm::Bbr` in the `P2pConfig`; CUBIC is
+available as `CongestionAlgorithm::Cubic` for comparison or when probing an
+unknown path.
