@@ -655,6 +655,13 @@ async fn write_stream_with_progress_timeout(
     data: &[u8],
 ) -> Result<usize, EndpointError> {
     let mut bytes_written = 0usize;
+    let write_started = Instant::now();
+
+    debug!(
+        "send({}): starting QUIC stream write ({} bytes)",
+        addr,
+        data.len()
+    );
 
     while bytes_written < data.len() {
         let end = bytes_written
@@ -706,6 +713,13 @@ async fn write_stream_with_progress_timeout(
             }
         }
     }
+
+    debug!(
+        "send({}): QUIC stream write completed ({} bytes in {:?})",
+        addr,
+        bytes_written,
+        write_started.elapsed()
+    );
 
     Ok(bytes_written)
 }
@@ -2710,6 +2724,8 @@ impl P2pEndpoint {
                     return Err(EndpointError::PeerNotFound(*addr));
                 }
 
+                let send_started = Instant::now();
+
                 let _large_send_permit = if data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD {
                     let permit_key = match transport_addr {
                         TransportAddr::Quic(addr) => normalize_socket_addr(addr),
@@ -2720,21 +2736,31 @@ impl P2pEndpoint {
                         .entry(permit_key)
                         .or_insert_with(|| Arc::new(Semaphore::new(LARGE_SEND_PER_ADDR_PERMITS)))
                         .clone();
+                    let permit_wait_started = Instant::now();
                     debug!(
-                        "send({}): waiting for large-send permit ({} bytes)",
+                        "send({}): waiting for large-send permit ({} bytes, available_permits={}, max_per_addr={})",
                         permit_key,
+                        data.len(),
+                        semaphore.available_permits(),
+                        LARGE_SEND_PER_ADDR_PERMITS
+                    );
+                    let permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| EndpointError::ShuttingDown)?;
+                    debug!(
+                        "send({}): acquired large-send permit after {:?} ({} bytes)",
+                        permit_key,
+                        permit_wait_started.elapsed(),
                         data.len()
                     );
-                    Some(
-                        semaphore
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| EndpointError::ShuttingDown)?,
-                    )
+                    Some(permit)
                 } else {
                     None
                 };
 
+                let open_uni_started = Instant::now();
+                debug!("send({}): opening QUIC uni stream", addr);
                 let mut send_stream =
                     match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, connection.open_uni()).await {
                         Ok(Ok(stream)) => stream,
@@ -2761,6 +2787,11 @@ impl P2pEndpoint {
                             ));
                         }
                     };
+                debug!(
+                    "send({}): opened QUIC uni stream in {:?}",
+                    addr,
+                    open_uni_started.elapsed()
+                );
 
                 let bytes_written =
                     match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
@@ -2772,12 +2803,27 @@ impl P2pEndpoint {
                         }
                     };
 
+                let finish_started = Instant::now();
+                debug!(
+                    "send({}): finishing QUIC uni stream after writing {} bytes",
+                    addr, bytes_written
+                );
                 send_stream.finish().map_err(|e| {
                     warn!("send({}): finish failed: {}", addr, e);
                     send_failed(SendFailureStage::Finish, bytes_written, e.to_string())
                 })?;
+                debug!(
+                    "send({}): finished QUIC uni stream in {:?}",
+                    addr,
+                    finish_started.elapsed()
+                );
 
-                debug!("Sent {} bytes to {} via QUIC", data.len(), addr);
+                debug!(
+                    "Sent {} bytes to {} via QUIC (send path took {:?})",
+                    data.len(),
+                    addr,
+                    send_started.elapsed()
+                );
             }
             crate::transport::ProtocolEngine::Constrained => {
                 // Check if we have an established constrained connection for this address
