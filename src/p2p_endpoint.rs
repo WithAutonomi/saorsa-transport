@@ -90,10 +90,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// event-driven reader-exit detection.
 const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Payload size above which QUIC sends are serialized per remote address.
+/// Payload size above which QUIC sends are serialized per remote address and
+/// wait for the peer to acknowledge receipt after the stream is finished.
 const LARGE_SEND_BACKPRESSURE_THRESHOLD: usize = 1024 * 1024;
 
-/// Number of large sends allowed in flight per remote address.
+/// Number of delivery-ack sends allowed in flight per remote address.
 const LARGE_SEND_PER_ADDR_PERMITS: usize = 1;
 
 /// Per-write chunk size used for stream write progress accounting.
@@ -101,6 +102,10 @@ const STREAM_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Maximum time a QUIC stream write may make no forward progress.
 const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time a delivery-ack QUIC send may wait for the peer to acknowledge
+/// receipt of all stream data after the local stream is finished.
+const STREAM_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Application error code used when aborting a stuck/failed send stream.
 /// `0` is the conventional "generic abort, no specific application error"
@@ -567,6 +572,10 @@ pub enum SendFailureStage {
     Write,
     /// The stream could not be finished after all bytes were queued.
     Finish,
+    /// The peer stopped the stream or the connection failed before delivery was acknowledged.
+    DeliveryAck,
+    /// The peer did not acknowledge delivery of the finished stream in time.
+    DeliveryAckTimeout,
 }
 
 impl std::fmt::Display for SendFailureStage {
@@ -577,6 +586,8 @@ impl std::fmt::Display for SendFailureStage {
             Self::WriteProgressTimeout => "write_progress_timeout",
             Self::Write => "write",
             Self::Finish => "finish",
+            Self::DeliveryAck => "delivery_ack",
+            Self::DeliveryAckTimeout => "delivery_ack_timeout",
         };
         f.write_str(label)
     }
@@ -722,6 +733,70 @@ async fn write_stream_with_progress_timeout(
     );
 
     Ok(bytes_written)
+}
+
+async fn wait_for_stream_delivery_ack(
+    send_stream: &crate::high_level::SendStream,
+    addr: SocketAddr,
+    bytes_written: usize,
+) -> Result<(), EndpointError> {
+    let ack_started = Instant::now();
+
+    debug!(
+        "send({}): waiting for peer to acknowledge QUIC stream delivery ({} bytes, timeout {:?})",
+        addr, bytes_written, STREAM_DELIVERY_ACK_TIMEOUT
+    );
+
+    match timeout(STREAM_DELIVERY_ACK_TIMEOUT, send_stream.stopped()).await {
+        Ok(Ok(None)) => {
+            debug!(
+                "send({}): peer acknowledged QUIC stream delivery in {:?}",
+                addr,
+                ack_started.elapsed()
+            );
+            Ok(())
+        }
+        Ok(Ok(Some(error_code))) => {
+            warn!(
+                "send({}): peer stopped QUIC stream before delivery was acknowledged after {:?} (error_code={:?})",
+                addr,
+                ack_started.elapsed(),
+                error_code
+            );
+            Err(send_failed(
+                SendFailureStage::DeliveryAck,
+                bytes_written,
+                format!("peer stopped QUIC stream with error code {error_code:?}"),
+            ))
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "send({}): failed while waiting for QUIC stream delivery ack after {:?}: {}",
+                addr,
+                ack_started.elapsed(),
+                e
+            );
+            Err(send_failed(
+                SendFailureStage::DeliveryAck,
+                bytes_written,
+                e.to_string(),
+            ))
+        }
+        Err(_elapsed) => {
+            warn!(
+                "send({}): timed out after {:?} waiting for peer to acknowledge QUIC stream delivery ({} bytes)",
+                addr, STREAM_DELIVERY_ACK_TIMEOUT, bytes_written
+            );
+            Err(send_failed(
+                SendFailureStage::DeliveryAckTimeout,
+                bytes_written,
+                format!(
+                    "peer did not acknowledge receipt of stream data within {:?}",
+                    STREAM_DELIVERY_ACK_TIMEOUT
+                ),
+            ))
+        }
+    }
 }
 
 /// Broadcast `P2pEvent::PeerConnected` for `addr` exactly once per
@@ -2628,6 +2703,25 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
+        self.send_inner(addr, data, false).await
+    }
+
+    /// Send data to a peer by address and wait for QUIC to confirm that the
+    /// peer received the full stream before returning.
+    pub async fn send_with_delivery_ack(
+        &self,
+        addr: &SocketAddr,
+        data: &[u8],
+    ) -> Result<(), EndpointError> {
+        self.send_inner(addr, data, true).await
+    }
+
+    async fn send_inner(
+        &self,
+        addr: &SocketAddr,
+        data: &[u8],
+        force_delivery_ack: bool,
+    ) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -2726,7 +2820,9 @@ impl P2pEndpoint {
 
                 let send_started = Instant::now();
 
-                let _large_send_permit = if data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD {
+                let wait_for_delivery_ack =
+                    force_delivery_ack || data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD;
+                let _delivery_ack_send_permit = if wait_for_delivery_ack {
                     let permit_key = match transport_addr {
                         TransportAddr::Quic(addr) => normalize_socket_addr(addr),
                         _ => normalize_socket_addr(*addr),
@@ -2738,21 +2834,23 @@ impl P2pEndpoint {
                         .clone();
                     let permit_wait_started = Instant::now();
                     debug!(
-                        "send({}): waiting for large-send permit ({} bytes, available_permits={}, max_per_addr={})",
+                        "send({}): waiting for delivery-ack send permit ({} bytes, available_permits={}, max_per_addr={}, forced_delivery_ack={})",
                         permit_key,
                         data.len(),
                         semaphore.available_permits(),
-                        LARGE_SEND_PER_ADDR_PERMITS
+                        LARGE_SEND_PER_ADDR_PERMITS,
+                        force_delivery_ack
                     );
                     let permit = semaphore
                         .acquire_owned()
                         .await
                         .map_err(|_| EndpointError::ShuttingDown)?;
                     debug!(
-                        "send({}): acquired large-send permit after {:?} ({} bytes)",
+                        "send({}): acquired delivery-ack send permit after {:?} ({} bytes, forced_delivery_ack={})",
                         permit_key,
                         permit_wait_started.elapsed(),
-                        data.len()
+                        data.len(),
+                        force_delivery_ack
                     );
                     Some(permit)
                 } else {
@@ -2817,6 +2915,10 @@ impl P2pEndpoint {
                     addr,
                     finish_started.elapsed()
                 );
+
+                if wait_for_delivery_ack {
+                    wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
+                }
 
                 debug!(
                     "Sent {} bytes to {} via QUIC (send path took {:?})",
