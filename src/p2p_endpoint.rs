@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -90,22 +90,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// event-driven reader-exit detection.
 const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Payload size above which QUIC sends are serialized per remote address and
-/// wait for the peer to acknowledge receipt after the stream is finished.
-const LARGE_SEND_BACKPRESSURE_THRESHOLD: usize = 1024 * 1024;
-
-/// Number of delivery-ack sends allowed in flight per remote address.
-const LARGE_SEND_PER_ADDR_PERMITS: usize = 1;
-
-/// Per-write chunk size used for stream write progress accounting.
-const STREAM_WRITE_CHUNK_SIZE: usize = 64 * 1024;
-
 /// Maximum time a QUIC stream write may make no forward progress.
 const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum time a delivery-ack QUIC send may wait for the peer to acknowledge
-/// receipt of all stream data after the local stream is finished.
-const STREAM_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum time a QUIC stream read may make no forward progress.
+const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Application error code used when aborting a stuck/failed send stream.
 /// `0` is the conventional "generic abort, no specific application error"
@@ -254,9 +243,6 @@ pub struct P2pEndpoint {
     pending_dials: Arc<
         tokio::sync::Mutex<HashMap<SocketAddr, broadcast::Sender<Result<PeerConnection, String>>>>,
     >,
-
-    /// Per-address semaphore used to serialize large QUIC stream messages.
-    large_send_permits: Arc<dashmap::DashMap<SocketAddr, Arc<Semaphore>>>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -574,8 +560,6 @@ pub enum SendFailureStage {
     Finish,
     /// The peer stopped the stream or the connection failed before delivery was acknowledged.
     DeliveryAck,
-    /// The peer did not acknowledge delivery of the finished stream in time.
-    DeliveryAckTimeout,
 }
 
 impl std::fmt::Display for SendFailureStage {
@@ -587,7 +571,6 @@ impl std::fmt::Display for SendFailureStage {
             Self::Write => "write",
             Self::Finish => "finish",
             Self::DeliveryAck => "delivery_ack",
-            Self::DeliveryAckTimeout => "delivery_ack_timeout",
         };
         f.write_str(label)
     }
@@ -675,12 +658,12 @@ async fn write_stream_with_progress_timeout(
     );
 
     while bytes_written < data.len() {
-        let end = bytes_written
-            .saturating_add(STREAM_WRITE_CHUNK_SIZE)
-            .min(data.len());
-        let slice = &data[bytes_written..end];
-
-        match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, send_stream.write(slice)).await {
+        match timeout(
+            STREAM_WRITE_PROGRESS_TIMEOUT,
+            send_stream.write(&data[bytes_written..]),
+        )
+        .await
+        {
             Ok(Ok(0)) => {
                 return Err(send_failed(
                     SendFailureStage::Write,
@@ -735,6 +718,79 @@ async fn write_stream_with_progress_timeout(
     Ok(bytes_written)
 }
 
+async fn read_stream_with_progress_timeout(
+    recv_stream: &mut crate::high_level::RecvStream,
+    addr: SocketAddr,
+    size_limit: usize,
+) -> Result<Vec<u8>, EndpointError> {
+    let mut read = Vec::new();
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    let read_started = Instant::now();
+
+    debug!(
+        "recv({}): starting QUIC stream read (limit {} bytes)",
+        addr, size_limit
+    );
+
+    loop {
+        match timeout(
+            STREAM_READ_PROGRESS_TIMEOUT,
+            recv_stream.read_chunk(usize::MAX, false),
+        )
+        .await
+        {
+            Ok(Ok(Some(chunk))) => {
+                start = start.min(chunk.offset);
+                let chunk_end = chunk.offset.saturating_add(chunk.bytes.len() as u64);
+                if chunk_end.saturating_sub(start) > size_limit as u64 {
+                    warn!(
+                        "recv({}): stream exceeded read limit (limit {} bytes)",
+                        addr, size_limit
+                    );
+                    return Err(EndpointError::Connection(format!(
+                        "incoming stream exceeded read limit of {size_limit} bytes"
+                    )));
+                }
+                end = end.max(chunk_end);
+                read.push((chunk.bytes, chunk.offset));
+            }
+            Ok(Ok(None)) => {
+                if end == 0 {
+                    debug!("recv({}): QUIC stream read completed empty", addr);
+                    return Ok(Vec::new());
+                }
+
+                let mut buffer = vec![0; end.saturating_sub(start) as usize];
+                for (data, offset) in read {
+                    let offset = offset.saturating_sub(start) as usize;
+                    buffer[offset..offset + data.len()].copy_from_slice(&data);
+                }
+                debug!(
+                    "recv({}): QUIC stream read completed ({} bytes in {:?})",
+                    addr,
+                    buffer.len(),
+                    read_started.elapsed()
+                );
+                return Ok(buffer);
+            }
+            Ok(Err(e)) => {
+                warn!("recv({}): stream read failed: {}", addr, e);
+                return Err(EndpointError::Connection(format!(
+                    "stream read failed: {e}"
+                )));
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "recv({}): stream read made no progress for {:?}",
+                    addr, STREAM_READ_PROGRESS_TIMEOUT
+                );
+                return Err(EndpointError::Timeout);
+            }
+        }
+    }
+}
+
 async fn wait_for_stream_delivery_ack(
     send_stream: &crate::high_level::SendStream,
     addr: SocketAddr,
@@ -743,12 +799,12 @@ async fn wait_for_stream_delivery_ack(
     let ack_started = Instant::now();
 
     debug!(
-        "send({}): waiting for peer to acknowledge QUIC stream delivery ({} bytes, timeout {:?})",
-        addr, bytes_written, STREAM_DELIVERY_ACK_TIMEOUT
+        "send({}): waiting for peer to acknowledge QUIC stream delivery ({} bytes)",
+        addr, bytes_written
     );
 
-    match timeout(STREAM_DELIVERY_ACK_TIMEOUT, send_stream.stopped()).await {
-        Ok(Ok(None)) => {
+    match send_stream.stopped().await {
+        Ok(None) => {
             debug!(
                 "send({}): peer acknowledged QUIC stream delivery in {:?}",
                 addr,
@@ -756,7 +812,7 @@ async fn wait_for_stream_delivery_ack(
             );
             Ok(())
         }
-        Ok(Ok(Some(error_code))) => {
+        Ok(Some(error_code)) => {
             warn!(
                 "send({}): peer stopped QUIC stream before delivery was acknowledged after {:?} (error_code={:?})",
                 addr,
@@ -769,7 +825,7 @@ async fn wait_for_stream_delivery_ack(
                 format!("peer stopped QUIC stream with error code {error_code:?}"),
             ))
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             warn!(
                 "send({}): failed while waiting for QUIC stream delivery ack after {:?}: {}",
                 addr,
@@ -780,20 +836,6 @@ async fn wait_for_stream_delivery_ack(
                 SendFailureStage::DeliveryAck,
                 bytes_written,
                 e.to_string(),
-            ))
-        }
-        Err(_elapsed) => {
-            warn!(
-                "send({}): timed out after {:?} waiting for peer to acknowledge QUIC stream delivery ({} bytes)",
-                addr, STREAM_DELIVERY_ACK_TIMEOUT, bytes_written
-            );
-            Err(send_failed(
-                SendFailureStage::DeliveryAckTimeout,
-                bytes_written,
-                format!(
-                    "peer did not acknowledge receipt of stream data within {:?}",
-                    STREAM_DELIVERY_ACK_TIMEOUT
-                ),
             ))
         }
     }
@@ -865,7 +907,6 @@ async fn do_cleanup_connection(
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
     emitted_peer_connected: &dashmap::DashSet<SocketAddr>,
-    large_send_permits: &dashmap::DashMap<SocketAddr, Arc<Semaphore>>,
     addr: &SocketAddr,
     reason: DisconnectReason,
     expected_stable_id: Option<usize>,
@@ -921,7 +962,6 @@ async fn do_cleanup_connection(
     // Allow a future reconnect to broadcast a fresh PeerConnected event.
     for candidate in &variants {
         emitted_peer_connected.remove(candidate);
-        large_send_permits.remove(candidate);
     }
 
     // Step 3: Remove and abort reader task (canonical lock #2)
@@ -1171,7 +1211,6 @@ impl P2pEndpoint {
             reader_handles,
             reader_exit_tx,
             pending_dials: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            large_send_permits: Arc::new(dashmap::DashMap::new()),
         };
 
         // Spawn background constrained poller task
@@ -2637,7 +2676,6 @@ impl P2pEndpoint {
             &*self.stats,
             &self.event_tx,
             &self.emitted_peer_connected,
-            &self.large_send_permits,
             addr,
             reason,
             None,
@@ -2666,6 +2704,9 @@ impl P2pEndpoint {
     // === Messaging ===
 
     /// Send data to a peer
+    ///
+    /// For QUIC connections, this waits for the peer to acknowledge receipt of
+    /// the full stream before returning.
     ///
     /// # Transport Selection
     ///
@@ -2703,25 +2744,10 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
-        self.send_inner(addr, data, false).await
+        self.send_inner(addr, data).await
     }
 
-    /// Send data to a peer by address and wait for QUIC to confirm that the
-    /// peer received the full stream before returning.
-    pub async fn send_with_delivery_ack(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-    ) -> Result<(), EndpointError> {
-        self.send_inner(addr, data, true).await
-    }
-
-    async fn send_inner(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-        force_delivery_ack: bool,
-    ) -> Result<(), EndpointError> {
+    async fn send_inner(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -2820,43 +2846,6 @@ impl P2pEndpoint {
 
                 let send_started = Instant::now();
 
-                let wait_for_delivery_ack =
-                    force_delivery_ack || data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD;
-                let _delivery_ack_send_permit = if wait_for_delivery_ack {
-                    let permit_key = match transport_addr {
-                        TransportAddr::Quic(addr) => normalize_socket_addr(addr),
-                        _ => normalize_socket_addr(*addr),
-                    };
-                    let semaphore = self
-                        .large_send_permits
-                        .entry(permit_key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(LARGE_SEND_PER_ADDR_PERMITS)))
-                        .clone();
-                    let permit_wait_started = Instant::now();
-                    debug!(
-                        "send({}): waiting for delivery-ack send permit ({} bytes, available_permits={}, max_per_addr={}, forced_delivery_ack={})",
-                        permit_key,
-                        data.len(),
-                        semaphore.available_permits(),
-                        LARGE_SEND_PER_ADDR_PERMITS,
-                        force_delivery_ack
-                    );
-                    let permit = semaphore
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| EndpointError::ShuttingDown)?;
-                    debug!(
-                        "send({}): acquired delivery-ack send permit after {:?} ({} bytes, forced_delivery_ack={})",
-                        permit_key,
-                        permit_wait_started.elapsed(),
-                        data.len(),
-                        force_delivery_ack
-                    );
-                    Some(permit)
-                } else {
-                    None
-                };
-
                 let open_uni_started = Instant::now();
                 debug!("send({}): opening QUIC uni stream", addr);
                 let mut send_stream =
@@ -2916,9 +2905,7 @@ impl P2pEndpoint {
                     finish_started.elapsed()
                 );
 
-                if wait_for_delivery_ack {
-                    wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
-                }
+                wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
 
                 debug!(
                     "Sent {} bytes to {} via QUIC (send path took {:?})",
@@ -3241,7 +3228,6 @@ impl P2pEndpoint {
         // Abort all background reader tasks
         self.reader_tasks.lock().await.abort_all();
         self.reader_handles.write().await.clear();
-        self.large_send_permits.clear();
 
         // Disconnect all peers
         let addrs: Vec<SocketAddr> = self.connected_peers.read().await.keys().copied().collect();
@@ -3292,11 +3278,14 @@ impl P2pEndpoint {
                     }
                 };
 
-                let data = match recv_stream.read_to_end(max_read_bytes).await {
+                let data =
+                    match read_stream_with_progress_timeout(&mut recv_stream, addr, max_read_bytes)
+                        .await
+                    {
                     Ok(data) if data.is_empty() => continue,
                     Ok(data) => data,
                     Err(e) => {
-                        info!("Reader task for {}: read_to_end error: {}", addr, e);
+                        info!("Reader task for {}: stream read error: {}", addr, e);
                         break;
                     }
                 };
@@ -3550,7 +3539,6 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
-        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3580,7 +3568,6 @@ impl P2pEndpoint {
                     &stats,
                     &event_tx,
                     &emitted_peer_connected,
-                    &large_send_permits,
                     &addr,
                     DisconnectReason::Timeout,
                     Some(stable_id),
@@ -3611,7 +3598,6 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
-        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3653,7 +3639,6 @@ impl P2pEndpoint {
                         &stats,
                         &event_tx,
                         &emitted_peer_connected,
-                        &large_send_permits,
                         addr,
                         DisconnectReason::Timeout,
                         None,
@@ -3834,11 +3819,17 @@ impl P2pEndpoint {
                                 }
                             };
 
-                            let data = match recv_stream.read_to_end(max_read_bytes).await {
+                            let data = match read_stream_with_progress_timeout(
+                                &mut recv_stream,
+                                addr,
+                                max_read_bytes,
+                            )
+                            .await
+                            {
                                 Ok(data) if data.is_empty() => continue,
                                 Ok(data) => data,
                                 Err(e) => {
-                                    info!("Reader task for {} (forwarder): read_to_end error: {}", addr, e);
+                                    info!("Reader task for {} (forwarder): stream read error: {}", addr, e);
                                     break;
                                 }
                             };
@@ -3917,7 +3908,6 @@ impl Clone for P2pEndpoint {
             reader_handles: Arc::clone(&self.reader_handles),
             reader_exit_tx: self.reader_exit_tx.clone(),
             pending_dials: Arc::clone(&self.pending_dials),
-            large_send_permits: Arc::clone(&self.large_send_permits),
         }
     }
 }
