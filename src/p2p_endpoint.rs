@@ -96,6 +96,12 @@ const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time a QUIC stream read may make no forward progress.
 const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Payload size at or above which QUIC sends wait for the peer to acknowledge
+/// receipt of the full stream after `finish()`. Smaller payloads return as
+/// soon as the local stack has accepted the data, avoiding an extra RTT for
+/// small request/response traffic.
+const LARGE_SEND_DELIVERY_ACK_THRESHOLD: usize = 64 * 1024;
+
 /// Maximum number of inbound uni streams read concurrently per QUIC connection.
 const MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION: usize = 32;
 
@@ -2867,8 +2873,10 @@ impl P2pEndpoint {
 
     /// Send data to a peer
     ///
-    /// For QUIC connections, this waits for the peer to acknowledge receipt of
-    /// the full stream before returning.
+    /// For QUIC connections with payloads at or above
+    /// `LARGE_SEND_DELIVERY_ACK_THRESHOLD` bytes, this waits for the peer to
+    /// acknowledge receipt of the full stream before returning. Smaller
+    /// payloads return as soon as the local stack has accepted the data.
     ///
     /// # Transport Selection
     ///
@@ -3067,7 +3075,9 @@ impl P2pEndpoint {
                     finish_started.elapsed()
                 );
 
-                wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
+                if data.len() >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
+                    wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
+                }
 
                 debug!(
                     "Sent {} bytes to {} via QUIC (send path took {:?})",
