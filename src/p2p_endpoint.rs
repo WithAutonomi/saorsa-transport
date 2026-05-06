@@ -94,7 +94,10 @@ const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum time a QUIC stream read may make no forward progress.
-const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of inbound uni streams read concurrently per QUIC connection.
+const MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION: usize = 32;
 
 /// Application error code used when aborting a stuck/failed send stream.
 /// `0` is the conventional "generic abort, no specific application error"
@@ -839,6 +842,165 @@ async fn wait_for_stream_delivery_ack(
             ))
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum InboundDataSendMode {
+    TrySendWithTimeout,
+    AwaitSend,
+}
+
+async fn dispatch_inbound_stream(
+    mut recv_stream: crate::high_level::RecvStream,
+    addr: SocketAddr,
+    data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    event_tx: broadcast::Sender<P2pEvent>,
+    max_read_bytes: usize,
+    reader_label: &'static str,
+    send_mode: InboundDataSendMode,
+) {
+    let data = match read_stream_with_progress_timeout(&mut recv_stream, addr, max_read_bytes).await
+    {
+        Ok(data) if data.is_empty() => return,
+        Ok(data) => data,
+        Err(e) => {
+            info!(
+                "Reader task for {}{}: stream read error: {}",
+                addr, reader_label, e
+            );
+            let _ = recv_stream.stop(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+            return;
+        }
+    };
+
+    let data_len = data.len();
+    debug!(
+        "Reader task{}: {} bytes from {}",
+        reader_label, data_len, addr
+    );
+
+    // Note: last_activity update moved out of the hot path to avoid
+    // RwLock write contention. With N reader tasks all acquiring
+    // write locks on every message, the lock becomes a bottleneck
+    // that can starve other tasks and deadlock the runtime.
+    // The DataReceived event below serves as a liveness signal.
+    let _ = event_tx.send(P2pEvent::DataReceived {
+        addr,
+        bytes: data_len,
+    });
+
+    match send_mode {
+        InboundDataSendMode::TrySendWithTimeout => {
+            // Send through channel without blocking the reader task's event loop.
+            // If the channel is full, wait briefly in this per-stream task. This
+            // keeps the accept loop free to keep accepting other QUIC uni streams.
+            match data_tx.try_send((addr, data)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full((addr, data))) => {
+                    let data_len = data.len();
+                    if tokio::time::timeout(Duration::from_secs(5), data_tx.send((addr, data)))
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            "Reader task for {}{}: data channel send timed out, dropping {} bytes",
+                            addr, reader_label, data_len
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(
+                        "Reader task for {}{}: channel closed, dropping {} bytes",
+                        addr, reader_label, data_len
+                    );
+                }
+            }
+        }
+        InboundDataSendMode::AwaitSend => {
+            if data_tx.send((addr, data)).await.is_err() {
+                debug!(
+                    "Reader task for {}{}: channel closed, dropping {} bytes",
+                    addr, reader_label, data_len
+                );
+            }
+        }
+    }
+}
+
+async fn run_quic_reader_task(
+    addr: SocketAddr,
+    connection: crate::high_level::Connection,
+    data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    event_tx: broadcast::Sender<P2pEvent>,
+    exit_tx: mpsc::UnboundedSender<(SocketAddr, usize)>,
+    max_read_bytes: usize,
+    reader_label: &'static str,
+    send_mode: InboundDataSendMode,
+) -> SocketAddr {
+    info!("Reader task STARTED for {}{}", addr, reader_label);
+
+    let stable_id = connection.stable_id();
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION,
+    ));
+    let mut stream_tasks = tokio::task::JoinSet::new();
+
+    loop {
+        while let Some(result) = stream_tasks.try_join_next() {
+            if let Err(e) = result {
+                warn!(
+                    "Reader task for {}{}: stream worker failed: {}",
+                    addr, reader_label, e
+                );
+            }
+        }
+
+        if data_tx.is_closed() {
+            debug!(
+                "Reader task for {}{}: channel closed, exiting",
+                addr, reader_label
+            );
+            break;
+        }
+
+        let permit = match Arc::clone(&stream_permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+
+        let recv_stream = match connection.accept_uni().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                info!(
+                    "Reader task for {}{} ending: accept_uni error: {}",
+                    addr, reader_label, e
+                );
+                break;
+            }
+        };
+
+        let data_tx = data_tx.clone();
+        let event_tx = event_tx.clone();
+        stream_tasks.spawn(async move {
+            let _permit = permit;
+            dispatch_inbound_stream(
+                recv_stream,
+                addr,
+                data_tx,
+                event_tx,
+                max_read_bytes,
+                reader_label,
+                send_mode,
+            )
+            .await;
+        });
+    }
+
+    stream_tasks.abort_all();
+
+    // Notify the reader-exit handler for immediate cleanup.
+    let _ = exit_tx.send((addr, stable_id));
+    addr
 }
 
 /// Broadcast `P2pEvent::PeerConnected` for `addr` exactly once per
@@ -3265,82 +3427,16 @@ impl P2pEndpoint {
         let max_read_bytes = self.config.max_message_size;
         let exit_tx = self.reader_exit_tx.clone();
 
-        let abort_handle = self.reader_tasks.lock().await.spawn(async move {
-            info!("Reader task STARTED for {}", addr);
-
-            loop {
-                // Accept the next unidirectional stream
-                let mut recv_stream = match connection.accept_uni().await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        info!("Reader task for {} ending: accept_uni error: {}", addr, e);
-                        break;
-                    }
-                };
-
-                let data =
-                    match read_stream_with_progress_timeout(&mut recv_stream, addr, max_read_bytes)
-                        .await
-                    {
-                    Ok(data) if data.is_empty() => continue,
-                    Ok(data) => data,
-                    Err(e) => {
-                        info!("Reader task for {}: stream read error: {}", addr, e);
-                        break;
-                    }
-                };
-
-                let data_len = data.len();
-                debug!("Reader task: {} bytes from {}", data_len, addr);
-
-                // Note: last_activity update moved out of the hot path to avoid
-                // RwLock write contention. With N reader tasks all acquiring
-                // write locks on every message, the lock becomes a bottleneck
-                // that can starve other tasks and deadlock the runtime.
-                // The DataReceived event below serves as a liveness signal.
-
-                // Emit DataReceived event
-                let _ = event_tx.send(P2pEvent::DataReceived {
-                    addr,
-                    bytes: data_len,
-                });
-
-                // Send through channel without blocking the reader task's
-                // event loop. Using try_send avoids holding a tokio worker
-                // thread when the channel is full. If the channel is full,
-                // spawn a short-lived task that retries with a timeout instead
-                // of dropping data immediately.
-                match data_tx.try_send((addr, data)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full((addr, data))) => {
-                        let tx = data_tx.clone();
-                        let data_len = data.len();
-                        tokio::spawn(async move {
-                            if tokio::time::timeout(
-                                Duration::from_secs(5),
-                                tx.send((addr, data)),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                warn!(
-                                    "Reader task for {}: data channel send timed out, dropping {} bytes",
-                                    addr, data_len
-                                );
-                            }
-                        });
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!("Reader task for {}: channel closed, exiting", addr);
-                        break;
-                    }
-                }
-            }
-
-            // Notify the reader-exit handler for immediate cleanup.
-            let _ = exit_tx.send((addr, connection.stable_id()));
-            addr
-        });
+        let abort_handle = self.reader_tasks.lock().await.spawn(run_quic_reader_task(
+            addr,
+            connection,
+            data_tx,
+            event_tx,
+            exit_tx,
+            max_read_bytes,
+            "",
+            InboundDataSendMode::TrySendWithTimeout,
+        ));
 
         let key = normalize_socket_addr(addr);
         if let Some(old) = self.reader_handles.write().await.insert(key, abort_handle) {
@@ -3807,50 +3903,16 @@ impl P2pEndpoint {
                     let event_tx = event_tx.clone();
                     let exit_tx = reader_exit_tx.clone();
 
-                    let abort_handle = reader_tasks.lock().await.spawn(async move {
-                        info!("Reader task STARTED for {} (via forwarder)", addr);
-
-                        loop {
-                            let mut recv_stream = match conn.accept_uni().await {
-                                Ok(stream) => stream,
-                                Err(e) => {
-                                    info!("Reader task for {} (forwarder) ending: accept_uni error: {}", addr, e);
-                                    break;
-                                }
-                            };
-
-                            let data = match read_stream_with_progress_timeout(
-                                &mut recv_stream,
-                                addr,
-                                max_read_bytes,
-                            )
-                            .await
-                            {
-                                Ok(data) if data.is_empty() => continue,
-                                Ok(data) => data,
-                                Err(e) => {
-                                    info!("Reader task for {} (forwarder): stream read error: {}", addr, e);
-                                    break;
-                                }
-                            };
-
-                            let data_len = data.len();
-                            debug!("Reader task (forwarder): {} bytes from {}", data_len, addr);
-
-                            let _ = event_tx.send(P2pEvent::DataReceived {
-                                addr,
-                                bytes: data_len,
-                            });
-
-                            if data_tx.send((addr, data)).await.is_err() {
-                                debug!("Reader task for {} (forwarder): channel closed, exiting", addr);
-                                break;
-                            }
-                        }
-
-                        let _ = exit_tx.send((addr, conn.stable_id()));
-                        addr
-                    });
+                    let abort_handle = reader_tasks.lock().await.spawn(run_quic_reader_task(
+                        addr,
+                        conn,
+                        data_tx,
+                        event_tx,
+                        exit_tx,
+                        max_read_bytes,
+                        " (forwarder)",
+                        InboundDataSendMode::AwaitSend,
+                    ));
 
                     let key = normalize_socket_addr(addr);
                     if let Some(old) = reader_handles.write().await.insert(key, abort_handle) {
