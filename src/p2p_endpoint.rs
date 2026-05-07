@@ -101,7 +101,7 @@ const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// receipt of the full stream after `finish()`. Smaller payloads return as
 /// soon as the local stack has accepted the data, avoiding an extra RTT for
 /// small request/response traffic.
-const LARGE_SEND_DELIVERY_ACK_THRESHOLD: usize = 64 * 1024;
+const LARGE_SEND_DELIVERY_ACK_THRESHOLD: usize = 16 * 1024;
 
 /// Maximum number of inbound uni streams read concurrently per QUIC connection.
 const MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION: usize = 32;
