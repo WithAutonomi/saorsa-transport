@@ -397,6 +397,14 @@ pub struct NatTraversalEndpoint {
     /// Active connections keyed by remote SocketAddr
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+    /// Owning QUIC endpoint for each tracked connection.
+    ///
+    /// Most connections are owned by `inner_endpoint`, but inbound
+    /// connections to a proactive MASQUE relay land on a separate relay
+    /// endpoint. Peer-id registration must update the endpoint that actually
+    /// owns the QUIC connection rather than assuming every connection belongs
+    /// to the main endpoint.
+    connection_endpoints: Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
     /// Timeout configuration
     timeout_config: crate::config::nat_timeouts::TimeoutConfig,
     /// Track remote addresses for which ConnectionEstablished has already been emitted
@@ -1397,6 +1405,40 @@ impl NatTraversalEndpoint {
 
         config
     }
+
+    fn track_connection_endpoint(
+        connection_endpoints: &Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
+        addr: SocketAddr,
+        endpoint: &InnerEndpoint,
+    ) {
+        for candidate in socket_addr_variants(addr) {
+            connection_endpoints.insert(candidate, endpoint.clone());
+        }
+    }
+
+    fn untrack_connection_endpoint(
+        connection_endpoints: &Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
+        addr: SocketAddr,
+    ) {
+        for candidate in socket_addr_variants(addr) {
+            connection_endpoints.remove(&candidate);
+        }
+    }
+
+    fn register_peer_id_on_endpoint(
+        endpoint: &InnerEndpoint,
+        addr: SocketAddr,
+        peer_id: PeerId,
+    ) -> bool {
+        for candidate in socket_addr_variants(addr) {
+            if endpoint.connection_stable_id_for_addr(&candidate).is_some() {
+                endpoint.register_connection_peer_id(candidate, peer_id);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create a new NAT traversal endpoint with proper UDP socket sharing
     ///
     /// This is the recommended constructor for most use cases. It:
@@ -1635,6 +1677,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -2073,6 +2116,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -2315,9 +2359,31 @@ impl NatTraversalEndpoint {
 
     /// Register a peer ID at the low-level endpoint for PUNCH_ME_NOW routing.
     pub fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: PeerId) {
-        if let Some(ep) = &self.inner_endpoint {
-            ep.register_connection_peer_id(addr, peer_id);
+        for candidate in socket_addr_variants(addr) {
+            let Some(owner) = self.connection_endpoints.get(&candidate) else {
+                continue;
+            };
+            let endpoint = owner.value().clone();
+            drop(owner);
+
+            if Self::register_peer_id_on_endpoint(&endpoint, candidate, peer_id) {
+                return;
+            }
+
+            Self::untrack_connection_endpoint(&self.connection_endpoints, candidate);
         }
+
+        if let Some(ep) = &self.inner_endpoint
+            && Self::register_peer_id_on_endpoint(ep, addr, peer_id)
+        {
+            Self::track_connection_endpoint(&self.connection_endpoints, addr, ep);
+            return;
+        }
+
+        debug!(
+            "No connection owner found while registering peer ID {} for {}",
+            peer_id, addr
+        );
     }
 
     /// Get the event callback
@@ -3113,6 +3179,7 @@ impl NatTraversalEndpoint {
             }
         };
         let connections_clone = self.connections.clone();
+        let connection_endpoints_clone = self.connection_endpoints.clone();
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
         let relay_handler_connections_clone = self.relay_handler_connections.clone();
@@ -3125,6 +3192,7 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx,
                 connections_clone,
+                connection_endpoints_clone,
                 emitted_events_clone,
                 relay_server_clone,
                 relay_handler_connections_clone,
@@ -3143,6 +3211,7 @@ impl NatTraversalEndpoint {
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+        connection_endpoints: Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
         emitted_events: Arc<dashmap::DashSet<SocketAddr>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         relay_handler_connections: Arc<dashmap::DashSet<usize>>,
@@ -3152,8 +3221,10 @@ impl NatTraversalEndpoint {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
                 Some(connecting) => {
+                    let owner_endpoint = endpoint.clone();
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
+                    let connection_endpoints = connection_endpoints.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
                     let relay_handler_connections = relay_handler_connections.clone();
@@ -3175,6 +3246,11 @@ impl NatTraversalEndpoint {
                                 // dead duplicate from simultaneous-open.
                                 let connection_key = normalize_socket_addr(remote_address);
                                 connections.insert(connection_key, connection.clone());
+                                Self::track_connection_endpoint(
+                                    &connection_endpoints,
+                                    connection_key,
+                                    &owner_endpoint,
+                                );
 
                                 // Notify the P2pEndpoint's forwarder about the new connection
                                 match accepted_addrs_tx.send(connection_key) {
@@ -4206,6 +4282,7 @@ impl NatTraversalEndpoint {
         };
         let tx = self.handshake_tx.clone();
         let connections = self.connections.clone();
+        let connection_endpoints = self.connection_endpoints.clone();
         let emitted = self.emitted_established_events.clone();
         let relay_server = self.relay_server.clone();
         let relay_handler_connections = self.relay_handler_connections.clone();
@@ -4253,10 +4330,12 @@ impl NatTraversalEndpoint {
                 // to accept the next incoming connection.
                 let tx2 = tx.clone();
                 let connections2 = connections.clone();
+                let connection_endpoints2 = connection_endpoints.clone();
                 let emitted2 = emitted.clone();
                 let relay_server2 = relay_server.clone();
                 let relay_handler_connections2 = relay_handler_connections.clone();
                 let event_tx2 = event_tx_opt.clone();
+                let owner_endpoint = endpoint.clone();
                 tokio::spawn(async move {
                     let connection = match connecting.await {
                         Ok(conn) => conn,
@@ -4322,6 +4401,11 @@ impl NatTraversalEndpoint {
                     }
                     let connection_key = normalize_socket_addr(remote_address);
                     connections2.insert(connection_key, connection.clone());
+                    Self::track_connection_endpoint(
+                        &connection_endpoints2,
+                        connection_key,
+                        &owner_endpoint,
+                    );
 
                     // Only forward to handshake_tx if this is the first time
                     // we've seen this address. Without this guard, a
@@ -4383,6 +4467,14 @@ impl NatTraversalEndpoint {
     /// for symmetric NAT where the peer's address in the DHT differs
     /// from the connection's actual address.
     pub fn find_connection_by_peer_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        for owner in self.connection_endpoints.iter() {
+            let endpoint = owner.value().clone();
+            drop(owner);
+            if let Some(addr) = endpoint.peer_connection_addr_by_id(peer_id) {
+                return Some(addr);
+            }
+        }
+
         if let Some(ep) = &self.inner_endpoint {
             return ep.peer_connection_addr_by_id(peer_id);
         }
@@ -4402,6 +4494,7 @@ impl NatTraversalEndpoint {
                 );
                 drop(entry); // release the DashMap ref before removing
                 self.connections.remove(&candidate);
+                Self::untrack_connection_endpoint(&self.connection_endpoints, candidate);
                 return false;
             }
             return true;
@@ -4478,6 +4571,9 @@ impl NatTraversalEndpoint {
             &connection,
         );
         self.connections.insert(key, connection);
+        if let Some(endpoint) = &self.inner_endpoint {
+            Self::track_connection_endpoint(&self.connection_endpoints, key, endpoint);
+        }
         info!(
             "add_connection: now have {} connections",
             self.connections.len()
@@ -4610,6 +4706,7 @@ impl NatTraversalEndpoint {
             self.active_sessions.remove(candidate);
             self.closed_at.remove(candidate);
             self.transport_candidates.remove(candidate);
+            Self::untrack_connection_endpoint(&self.connection_endpoints, *candidate);
             remove_keys.push(*candidate);
         }
 
@@ -4899,6 +4996,7 @@ impl NatTraversalEndpoint {
     ) {
         let tx = self.handshake_tx.clone();
         let connections = self.connections.clone();
+        let connection_endpoints = self.connection_endpoints.clone();
         let emitted = self.emitted_established_events.clone();
         let relay_server = self.relay_server.clone();
         let relay_handler_connections = self.relay_handler_connections.clone();
@@ -4928,10 +5026,12 @@ impl NatTraversalEndpoint {
 
                 let tx2 = tx.clone();
                 let connections2 = connections.clone();
+                let connection_endpoints2 = connection_endpoints.clone();
                 let emitted2 = emitted.clone();
                 let relay_server2 = relay_server.clone();
                 let relay_handler_connections2 = relay_handler_connections.clone();
                 let event_tx2 = event_tx_opt.clone();
+                let owner_endpoint = Arc::clone(&endpoint);
                 tokio::spawn(async move {
                     let connection = match connecting.await {
                         Ok(conn) => conn,
@@ -4974,6 +5074,11 @@ impl NatTraversalEndpoint {
                         return;
                     }
                     connections2.insert(remote_address, connection.clone());
+                    Self::track_connection_endpoint(
+                        &connection_endpoints2,
+                        remote_address,
+                        owner_endpoint.as_ref(),
+                    );
 
                     if emitted2.insert(remote_address) {
                         if let Some(ref server) = relay_server2 {
@@ -5433,6 +5538,7 @@ impl NatTraversalEndpoint {
         let addrs: Vec<SocketAddr> = self.connections.iter().map(|e| *e.key()).collect();
         for addr in addrs {
             if let Some((_, connection)) = self.connections.remove(&addr) {
+                Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 info!("Closing connection to {}", addr);
                 connection.close(crate::VarInt::from_u32(0), b"Shutdown");
             }
@@ -5684,11 +5790,13 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let connection_endpoints = self.connection_endpoints.clone();
                         let incoming_notify = self.incoming_notify.clone();
                         let accepted_addrs_tx = self.accepted_addrs_tx.clone();
                         let relay_server = self.relay_server.clone();
                         let relay_handler_connections = self.relay_handler_connections.clone();
                         let address = candidate.address;
+                        let owner_endpoint = endpoint.clone();
 
                         tokio::spawn(async move {
                             match connecting.await {
@@ -5733,6 +5841,11 @@ impl NatTraversalEndpoint {
                                         inserted = true;
                                     }
                                     if inserted {
+                                        Self::track_connection_endpoint(
+                                            &connection_endpoints,
+                                            key,
+                                            &owner_endpoint,
+                                        );
                                         // Symmetric P2P: spawn the relay handler on this
                                         // outbound hole-punch connection so the remote (which
                                         // was the accept-side) can open CONNECT-UDP bidi
@@ -5827,6 +5940,7 @@ impl NatTraversalEndpoint {
             if now.duration_since(first_seen_closed) >= grace_period {
                 // Grace period elapsed — remove the dead connection.
                 self.connections.remove(&addr);
+                Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 self.closed_at.remove(&addr);
                 debug!(
                     "Connection to {} closed: {}, removed after grace period",
@@ -6426,6 +6540,10 @@ impl NatTraversalEndpoint {
             if is_stale {
                 drop(entry);
                 self.connections.remove(&normalized_coordinator);
+                Self::untrack_connection_endpoint(
+                    &self.connection_endpoints,
+                    normalized_coordinator,
+                );
                 // Fall through to "establish new connection" below
             } else {
                 info!(
@@ -6473,9 +6591,11 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let connection_endpoints = self.connection_endpoints.clone();
                     let relay_server = self.relay_server.clone();
                     let relay_handler_connections = self.relay_handler_connections.clone();
                     let external_addr = our_external_address;
+                    let owner_endpoint = endpoint.clone();
 
                     tokio::spawn(async move {
                         // Use 10-second timeout to prevent indefinite waiting if coordinator is frozen
@@ -6499,6 +6619,11 @@ impl NatTraversalEndpoint {
                                 // Store the connection keyed by SocketAddr
                                 // DashMap provides lock-free .insert()
                                 connections.insert(coordinator_key, connection.clone());
+                                Self::track_connection_endpoint(
+                                    &connection_endpoints,
+                                    coordinator_key,
+                                    &owner_endpoint,
+                                );
                                 // Symmetric P2P: ensure the coordinator (which accepted)
                                 // can open CONNECT-UDP bidi streams toward us too.
                                 Self::spawn_relay_handler_task(
@@ -7212,6 +7337,7 @@ impl NatTraversalEndpoint {
         let remote_address = connection.remote_address();
         let connection_key = normalize_socket_addr(remote_address);
         self.connections.insert(connection_key, connection.clone());
+        Self::track_connection_endpoint(&self.connection_endpoints, connection_key, endpoint);
         // Symmetric P2P: this is a dial-side insert (we initiated via
         // `endpoint.connect`), so spawn the relay handler to mirror what
         // the accept-side does. Without this, a later
