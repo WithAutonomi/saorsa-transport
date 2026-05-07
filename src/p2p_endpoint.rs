@@ -52,6 +52,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -115,7 +116,148 @@ const STREAM_RESET_ABORT_CODE: u32 = 0;
 /// through the pinhole needs only 1-2 RTTs (~600ms at 300ms worst-case RTT).
 const POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Extra time subscribers wait beyond the normal fallback strategy budget
+/// before treating an in-flight dial entry as stale.
+const PENDING_DIAL_WAIT_SLACK: Duration = Duration::from_secs(5);
+
+/// Capacity of the broadcast channel that fans an in-flight dial's outcome
+/// out to subscribers waiting on the same target. Sized for the small
+/// number of concurrent waiters we observe in practice; the channel only
+/// needs to hold the single result message the owner sends on completion.
+const PENDING_DIAL_BROADCAST_CAPACITY: usize = 4;
+
+static NEXT_PENDING_DIAL_ID: AtomicU64 = AtomicU64::new(1);
+
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
+
+type PendingDialResult = Result<(PeerConnection, ConnectionMethod), String>;
+type PendingDialMap = HashMap<SocketAddr, PendingDial>;
+
+struct PendingDial {
+    id: u64,
+    tx: broadcast::Sender<PendingDialResult>,
+    started_at: Instant,
+}
+
+/// Remove the pending-dial entry for `target` only if it is still the entry
+/// with the matching `id` (i.e. the caller still owns that slot). Returns the
+/// removed entry, or `None` if the slot was already gone or had been claimed
+/// by a newer dial.
+async fn remove_pending_dial_if_owned(
+    pending_dials: &tokio::sync::Mutex<PendingDialMap>,
+    target: SocketAddr,
+    id: u64,
+) -> Option<PendingDial> {
+    let mut pending = pending_dials.lock().await;
+    match pending.get(&target) {
+        Some(entry) if entry.id == id => pending.remove(&target),
+        _ => None,
+    }
+}
+
+struct PendingDialGuard {
+    pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
+    target: SocketAddr,
+    id: u64,
+    active: bool,
+}
+
+impl PendingDialGuard {
+    fn new(
+        pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
+        target: SocketAddr,
+        id: u64,
+    ) -> Self {
+        Self {
+            pending_dials,
+            target,
+            id,
+            active: true,
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        result: &Result<(PeerConnection, ConnectionMethod), EndpointError>,
+    ) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+
+        let Some(entry) =
+            remove_pending_dial_if_owned(&self.pending_dials, self.target, self.id).await
+        else {
+            return;
+        };
+
+        match result {
+            Ok((conn, method)) => {
+                let _ = entry.tx.send(Ok((conn.clone(), method.clone())));
+            }
+            Err(e) => {
+                let _ = entry.tx.send(Err(e.to_string()));
+            }
+        }
+    }
+}
+
+impl Drop for PendingDialGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let pending_dials = Arc::clone(&self.pending_dials);
+        let target = self.target;
+        let id = self.id;
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if remove_pending_dial_if_owned(&pending_dials, target, id)
+                    .await
+                    .is_some()
+                {
+                    debug!(
+                        "connect_with_fallback: cleared cancelled in-flight dial to {}",
+                        target
+                    );
+                }
+            });
+        }
+    }
+}
+
+fn pending_dial_wait_timeout(strategy_config: Option<&StrategyConfig>) -> Duration {
+    let strategy = strategy_config.cloned().unwrap_or_default();
+    let direct_budget = strategy
+        .direct_connect_timeout
+        .saturating_add(strategy.direct_handshake_timeout);
+    let holepunch_round_budget = strategy
+        .holepunch_timeout
+        .saturating_add(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT);
+    let holepunch_budget = if strategy.holepunch_enabled {
+        holepunch_round_budget.saturating_mul(strategy.max_holepunch_rounds)
+    } else {
+        Duration::ZERO
+    };
+    let relay_budget = if strategy.relay_enabled {
+        strategy.relay_timeout
+    } else {
+        Duration::ZERO
+    };
+
+    direct_budget
+        .saturating_add(holepunch_budget)
+        .saturating_add(relay_budget)
+        .saturating_add(PENDING_DIAL_WAIT_SLACK)
+}
+
+fn pending_dial_remaining_wait(wait_timeout: Duration, age: Duration) -> Option<Duration> {
+    wait_timeout
+        .checked_sub(age)
+        .filter(|remaining| !remaining.is_zero())
+}
 
 /// Extract the raw SPKI (SubjectPublicKeyInfo) bytes from a QUIC connection's
 /// peer identity, if TLS-based authentication was used.
@@ -249,9 +391,7 @@ pub struct P2pEndpoint {
     /// call does the actual connection work. Subsequent callers subscribe to a
     /// broadcast channel and wait for the result instead of starting parallel
     /// hole-punch attempts that deadlock the runtime.
-    pending_dials: Arc<
-        tokio::sync::Mutex<HashMap<SocketAddr, broadcast::Sender<Result<PeerConnection, String>>>>,
-    >,
+    pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -1862,37 +2002,89 @@ impl P2pEndpoint {
         }
 
         // Dedup: if another task is already connecting to this target, wait for
-        // its result instead of starting a parallel attempt. This prevents
-        // multiple concurrent hole-punch sessions that deadlock the runtime.
+        // its result instead of starting a parallel attempt. The wait is
+        // bounded and the owner installs a cancellation guard, so a dropped
+        // owner future cannot leave a permanent in-flight entry behind.
         let target = target_ipv4.or(target_ipv6);
+        let mut pending_guard = None;
         if let Some(target_addr) = target {
-            let mut pending = self.pending_dials.lock().await;
-            if let Some(tx) = pending.get(&target_addr) {
-                // Another task is already connecting — subscribe and wait
-                let mut rx = tx.subscribe();
-                drop(pending);
-                info!(
-                    "connect_with_fallback: waiting for in-flight dial to {}",
-                    target_addr
-                );
-                match rx.recv().await {
-                    Ok(Ok(conn)) => {
-                        return Ok((
-                            conn,
-                            ConnectionMethod::HolePunched {
-                                coordinator: target_addr,
-                            },
-                        ));
+            let wait_timeout = pending_dial_wait_timeout(strategy_config.as_ref());
+
+            loop {
+                let mut pending = self.pending_dials.lock().await;
+                if let Some(entry) = pending.get(&target_addr) {
+                    let pending_id = entry.id;
+                    let started_at = entry.started_at;
+                    let age = started_at.elapsed();
+                    let Some(remaining_wait) = pending_dial_remaining_wait(wait_timeout, age)
+                    else {
+                        pending.remove(&target_addr);
+                        drop(pending);
+                        warn!(
+                            "connect_with_fallback: in-flight dial to {} already stale (age {:?}, timeout {:?}); retrying locally",
+                            target_addr, age, wait_timeout
+                        );
+                        continue;
+                    };
+                    let mut rx = entry.tx.subscribe();
+                    drop(pending);
+
+                    info!(
+                        "connect_with_fallback: waiting for in-flight dial to {} (age {:?}, remaining {:?}, timeout {:?})",
+                        target_addr, age, remaining_wait, wait_timeout
+                    );
+
+                    match timeout(remaining_wait, rx.recv()).await {
+                        Ok(Ok(Ok(result))) => return Ok(result),
+                        Ok(Ok(Err(err))) => {
+                            debug!(
+                                "connect_with_fallback: in-flight dial to {} failed: {}; retrying locally",
+                                target_addr, err
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            debug!(
+                                "connect_with_fallback: in-flight dial to {} ended without a result: {}; retrying locally",
+                                target_addr, err
+                            );
+                        }
+                        Err(_) => {
+                            let total_age = started_at.elapsed();
+                            warn!(
+                                "connect_with_fallback: in-flight dial to {} stale after {:?} (timeout {:?}); retrying locally",
+                                target_addr, total_age, wait_timeout
+                            );
+                            remove_pending_dial_if_owned(
+                                &self.pending_dials,
+                                target_addr,
+                                pending_id,
+                            )
+                            .await;
+                        }
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        // Primary dial failed — fall through and try ourselves
-                    }
+
+                    continue;
                 }
-            } else {
-                // We're the first — register ourselves
-                let (tx, _) = broadcast::channel(4);
-                pending.insert(target_addr, tx);
+
+                // We're the first — register ourselves.
+                let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+                let id = NEXT_PENDING_DIAL_ID.fetch_add(1, Ordering::Relaxed);
+                pending.insert(
+                    target_addr,
+                    PendingDial {
+                        id,
+                        tx,
+                        started_at: Instant::now(),
+                    },
+                );
                 drop(pending);
+
+                pending_guard = Some(PendingDialGuard::new(
+                    Arc::clone(&self.pending_dials),
+                    target_addr,
+                    id,
+                ));
+                break;
             }
         }
 
@@ -1902,18 +2094,8 @@ impl P2pEndpoint {
             .await;
 
         // Broadcast result to any waiters and clean up pending entry
-        if let Some(target_addr) = target {
-            let mut pending = self.pending_dials.lock().await;
-            if let Some(tx) = pending.remove(&target_addr) {
-                match &result {
-                    Ok((conn, _)) => {
-                        let _ = tx.send(Ok(conn.clone()));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e.to_string()));
-                    }
-                }
-            }
+        if let Some(guard) = pending_guard.as_mut() {
+            guard.complete(&result).await;
         }
 
         result
@@ -3987,6 +4169,132 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pending_dial_wait_timeout_covers_default_strategy_budget() {
+        let strategy = StrategyConfig::default();
+        let wait = pending_dial_wait_timeout(Some(&strategy));
+
+        let direct = strategy.direct_connect_timeout + strategy.direct_handshake_timeout;
+        let holepunch_round = strategy.holepunch_timeout + POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT;
+        let holepunch = holepunch_round * strategy.max_holepunch_rounds;
+        let expected = direct + holepunch + strategy.relay_timeout + PENDING_DIAL_WAIT_SLACK;
+        assert_eq!(wait, expected);
+    }
+
+    #[test]
+    fn test_pending_dial_wait_timeout_excludes_disabled_stages() {
+        let strategy = StrategyConfig {
+            holepunch_enabled: false,
+            relay_enabled: false,
+            ..StrategyConfig::default()
+        };
+        let wait = pending_dial_wait_timeout(Some(&strategy));
+
+        let direct = strategy.direct_connect_timeout + strategy.direct_handshake_timeout;
+        assert_eq!(wait, direct + PENDING_DIAL_WAIT_SLACK);
+    }
+
+    #[test]
+    fn test_pending_dial_remaining_wait_subtracts_age() {
+        let wait_timeout = Duration::from_secs(30);
+        let age = Duration::from_secs(12);
+
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, age),
+            Some(Duration::from_secs(18))
+        );
+    }
+
+    #[test]
+    fn test_pending_dial_remaining_wait_expires_stale_entries() {
+        let wait_timeout = Duration::from_secs(30);
+
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, wait_timeout),
+            None
+        );
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, wait_timeout + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_complete_broadcasts_and_clears_entry() {
+        let target: SocketAddr = "127.0.0.1:12345".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let mut rx = tx.subscribe();
+        let id = 42;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut guard = PendingDialGuard::new(Arc::clone(&pending_dials), target, id);
+        let conn = PeerConnection {
+            public_key: None,
+            remote_addr: TransportAddr::Quic(target),
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        let result = Ok((conn.clone(), ConnectionMethod::DirectIPv4));
+
+        guard.complete(&result).await;
+
+        assert!(pending_dials.lock().await.is_empty());
+        let (received_conn, received_method) = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("pending dial result sent")
+            .expect("pending dial broadcast open")
+            .expect("pending dial succeeded");
+        assert_eq!(received_conn.remote_addr, conn.remote_addr);
+        assert_eq!(received_method, ConnectionMethod::DirectIPv4);
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_drop_clears_owned_entry() {
+        let target: SocketAddr = "127.0.0.1:12346".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let id = 43;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let guard = PendingDialGuard::new(Arc::clone(&pending_dials), target, id);
+        drop(guard);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_dials.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending dial guard cleared entry");
+    }
 
     #[test]
     fn test_endpoint_stats_default() {
