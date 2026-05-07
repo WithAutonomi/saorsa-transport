@@ -2903,6 +2903,8 @@ impl NatTraversalEndpoint {
     > {
         use std::sync::Arc;
 
+        const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
+
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
         let server_config = {
             info!("Creating server config using Raw Public Keys (RFC 7250) for symmetric P2P node");
@@ -2967,7 +2969,6 @@ impl NatTraversalEndpoint {
             // (208 KB on Linux).  1 MB balances fast starts (4 MB chunk
             // completes in ~2 RTTs through slow-start) with pacing that
             // receivers can absorb.
-            const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
                 INITIAL_CONGESTION_WINDOW,
@@ -3045,13 +3046,13 @@ impl NatTraversalEndpoint {
             transport_config.stream_receive_window(window);
             transport_config.send_window(config.max_message_size as u64);
 
-            // Set the initial congestion window to max_message_size so
-            // relay-tunnelled connections can push a full chunk without
-            // waiting for slow-start.  See the server config comment for
-            // the full rationale.
+            // Keep client and server sends on the same bounded startup
+            // window. Uploads originate from client configs, so using
+            // max_message_size here recreates the burst/loss problem that
+            // the server config above avoids.
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
-                config.max_message_size as u64,
+                INITIAL_CONGESTION_WINDOW,
                 transport_config.initial_rtt,
             ));
 
