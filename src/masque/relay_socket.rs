@@ -70,6 +70,8 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// docs), which matches UDP's lossy semantics.  8192 × ~1200 B ≈ 10 MB
 /// of worst-case buffering before drops begin.
 const SEND_QUEUE_CAPACITY: usize = 8192;
+const RELAY_STREAM_BATCH_MAX_FRAMES: usize = 64;
+const RELAY_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 /// Upper bound on decoded inbound packets queued for `poll_recv`.
 /// The reader task awaits on `Sender::send`, so when this fills up the
@@ -80,6 +82,12 @@ const RECV_QUEUE_CAPACITY: usize = 8192;
 /// Legitimate QUIC packets are ≤65535 bytes; anything above this is a
 /// framing error or corruption and closes the session.
 const MAX_RELAY_FRAME: usize = 512 * 1024;
+
+fn append_relay_frame(out: &mut Vec<u8>, encoded: &Bytes) {
+    let frame_len = encoded.len() as u32;
+    out.extend_from_slice(&frame_len.to_be_bytes());
+    out.extend_from_slice(encoded);
+}
 
 /// Raw QUIC streams from a relay session, before socket construction.
 ///
@@ -274,7 +282,7 @@ impl MasqueRelaySocket {
                         // the original frame buffer — no clone needed.
                         let inbound_source = datagram.target;
                         let inbound_len = datagram.payload.len();
-                        tracing::debug!(
+                        tracing::trace!(
                             relay = %relay_public_addr,
                             source = %inbound_source,
                             len = inbound_len,
@@ -315,20 +323,29 @@ impl MasqueRelaySocket {
                 // slow) stream write — so the Quinn endpoint can start
                 // assembling the next packet concurrently with this
                 // frame going out on the wire.
+                let mut batch =
+                    Vec::with_capacity(encoded.len().saturating_add(std::mem::size_of::<u32>()));
+                append_relay_frame(&mut batch, &encoded);
                 writer_capacity.notify_one();
 
-                let frame_len = encoded.len() as u32;
-                if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
-                    tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (length)");
-                    break;
-                }
-                // Zero-length frames (keepalives) need only the length
-                // prefix — skip the empty write_all.
-                if !encoded.is_empty() {
-                    if let Err(e) = send_stream.write_all(&encoded).await {
-                        tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (data)");
-                        break;
+                let mut frames = 1usize;
+                while frames < RELAY_STREAM_BATCH_MAX_FRAMES
+                    && batch.len() < RELAY_STREAM_BATCH_MAX_BYTES
+                {
+                    match send_rx.try_recv() {
+                        Ok(next) => {
+                            append_relay_frame(&mut batch, &next);
+                            writer_capacity.notify_one();
+                            frames += 1;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
+                }
+
+                if let Err(e) = send_stream.write_all(&batch).await {
+                    tracing::debug!(error = %e, frames, bytes = batch.len(), "MasqueRelaySocket: stream batch write error");
+                    break;
                 }
             }
             // Writer exited (stream error or receiver dropped). Dropping
@@ -410,7 +427,7 @@ impl AsyncUdpSocket for MasqueRelaySocket {
         // of `segment_size` bytes.  Each segment must be sent as its
         // own tunnel frame — the relay server has a per-frame size
         // limit and cannot handle the entire batch as one.
-        tracing::debug!(
+        tracing::trace!(
             relay = %self.relay_public_addr,
             destination = %transmit.destination,
             len = transmit.contents.len(),
