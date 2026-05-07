@@ -110,18 +110,34 @@ const LARGE_SEND_DELIVERY_ACK_THRESHOLD: usize = 64 * 1024;
 /// Maximum number of inbound uni streams read concurrently per QUIC connection.
 const MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION: usize = 32;
 
-/// Magic prefix for large-payload streams opened via `P2pEndpoint::send_stream`.
+/// Magic prefix for every P2P QUIC unidirectional stream opened via
+/// [`P2pEndpoint::send`] or [`P2pEndpoint::send_stream`].
 ///
-/// Legacy `send()` messages are still raw stream payloads. Reader tasks inspect
-/// this fixed prefix before deciding whether to hand the live stream to
-/// `recv_stream()` or continue buffering it for `recv()`.
-const STREAM_PAYLOAD_MAGIC: [u8; 16] = *b"SAORSA-STREAM-v1";
+/// The public small-message API is a convenience wrapper over this framed
+/// stream format. Reader tasks inspect the fixed header and then either buffer
+/// a bounded message for `recv()` or hand the live payload body to
+/// `recv_stream()`.
+const STREAM_FRAME_MAGIC: [u8; 16] = *b"SAORSA-STREAM-v1";
 
-/// Streaming header: magic + big-endian payload length (`u64::MAX` means unknown).
-const STREAM_PAYLOAD_HEADER_LEN: usize = STREAM_PAYLOAD_MAGIC.len() + std::mem::size_of::<u64>();
+/// Stream frame header:
+/// magic (16) + kind (1) + flags (1) + reserved (2) + big-endian body length (8).
+const STREAM_FRAME_HEADER_LEN: usize = STREAM_FRAME_MAGIC.len()
+    + std::mem::size_of::<u8>()
+    + std::mem::size_of::<u8>()
+    + std::mem::size_of::<u16>()
+    + std::mem::size_of::<u64>();
+
+/// Frame kind for the small-message wrapper returned by [`P2pEndpoint::recv`].
+const STREAM_FRAME_KIND_MESSAGE: u8 = 0;
+
+/// Frame kind for bulk payloads returned by [`P2pEndpoint::recv_stream`].
+const STREAM_FRAME_KIND_BULK: u8 = 1;
+
+/// Reserved for future per-stream options. v1 requires zero flags.
+const STREAM_FRAME_FLAGS_NONE: u8 = 0;
 
 /// Payload length sentinel for streaming sends where the caller does not know the length upfront.
-const STREAM_PAYLOAD_UNKNOWN_LEN: u64 = u64::MAX;
+const STREAM_FRAME_UNKNOWN_LEN: u64 = u64::MAX;
 
 /// Per-iteration buffer size for streaming I/O between the application reader/writer
 /// and the QUIC stream. 64 KiB matches typical OS socket buffer increments and bounds
@@ -1022,64 +1038,60 @@ async fn read_stream_prefix_with_progress_timeout(
     Ok(prefix)
 }
 
-async fn read_stream_message_with_progress_timeout(
+async fn read_framed_message_body_with_progress_timeout(
     recv_stream: &mut crate::high_level::RecvStream,
     addr: SocketAddr,
+    body_len: u64,
     size_limit: usize,
-    mut data: Vec<u8>,
 ) -> Result<Vec<u8>, EndpointError> {
     let read_started = Instant::now();
-    let mut scratch = vec![0; STREAM_IO_CHUNK_SIZE];
+    let expected_len = usize::try_from(body_len).map_err(|_| {
+        EndpointError::Connection(format!(
+            "incoming message body length {body_len} exceeds platform capacity"
+        ))
+    })?;
 
-    debug!(
-        "recv({}): starting QUIC message read (limit {} bytes, prefix {} bytes)",
-        addr,
-        size_limit,
-        data.len()
-    );
-
-    if data.len() > size_limit {
+    if expected_len > size_limit {
         warn!(
-            "recv({}): stream exceeded read limit (limit {} bytes)",
-            addr, size_limit
+            "recv({}): stream frame body exceeded read limit (body {} bytes, limit {} bytes)",
+            addr, expected_len, size_limit
         );
         return Err(EndpointError::Connection(format!(
-            "incoming stream exceeded read limit of {size_limit} bytes"
+            "incoming message body exceeded read limit of {size_limit} bytes"
         )));
     }
 
-    loop {
-        match timeout(STREAM_READ_PROGRESS_TIMEOUT, recv_stream.read(&mut scratch)).await {
+    let mut data = Vec::with_capacity(expected_len);
+    let mut scratch = vec![0; STREAM_IO_CHUNK_SIZE];
+
+    debug!(
+        "recv({}): starting framed QUIC message read (body {} bytes, limit {} bytes)",
+        addr, expected_len, size_limit
+    );
+
+    while data.len() < expected_len {
+        let remaining = expected_len - data.len();
+        let read_limit = remaining.min(scratch.len());
+        match timeout(
+            STREAM_READ_PROGRESS_TIMEOUT,
+            recv_stream.read(&mut scratch[..read_limit]),
+        )
+        .await
+        {
             Ok(Ok(Some(0))) => {
                 return Err(EndpointError::Connection(
                     "stream read returned zero bytes".to_string(),
                 ));
             }
             Ok(Ok(Some(n))) => {
-                if data.len().saturating_add(n) > size_limit {
-                    warn!(
-                        "recv({}): stream exceeded read limit (limit {} bytes)",
-                        addr, size_limit
-                    );
-                    return Err(EndpointError::Connection(format!(
-                        "incoming stream exceeded read limit of {size_limit} bytes"
-                    )));
-                }
                 data.extend_from_slice(&scratch[..n]);
             }
             Ok(Ok(None)) => {
-                if data.is_empty() {
-                    debug!("recv({}): QUIC stream read completed empty", addr);
-                    return Ok(Vec::new());
-                }
-
-                debug!(
-                    "recv({}): QUIC stream read completed ({} bytes in {:?})",
-                    addr,
+                return Err(EndpointError::Connection(format!(
+                    "stream ended after {} of {} declared message bytes",
                     data.len(),
-                    read_started.elapsed()
-                );
-                return Ok(data);
+                    expected_len
+                )));
             }
             Ok(Err(e)) => {
                 warn!("recv({}): stream read failed: {}", addr, e);
@@ -1096,30 +1108,131 @@ async fn read_stream_message_with_progress_timeout(
             }
         }
     }
+
+    match timeout(
+        STREAM_READ_PROGRESS_TIMEOUT,
+        recv_stream.read(&mut scratch[..1]),
+    )
+    .await
+    {
+        Ok(Ok(None)) => {
+            debug!(
+                "recv({}): framed QUIC message read completed ({} bytes in {:?})",
+                addr,
+                data.len(),
+                read_started.elapsed()
+            );
+            Ok(data)
+        }
+        Ok(Ok(Some(0))) => Err(EndpointError::Connection(
+            "stream EOF check returned zero bytes".to_string(),
+        )),
+        Ok(Ok(Some(_))) => Err(EndpointError::Connection(
+            "stream frame body exceeded declared message length".to_string(),
+        )),
+        Ok(Err(e)) => {
+            warn!("recv({}): stream EOF check failed: {}", addr, e);
+            Err(EndpointError::Connection(format!(
+                "stream EOF check failed: {e}"
+            )))
+        }
+        Err(_elapsed) => {
+            warn!(
+                "recv({}): stream EOF check made no progress for {:?}",
+                addr, STREAM_READ_PROGRESS_TIMEOUT
+            );
+            Err(EndpointError::Timeout)
+        }
+    }
 }
 
-fn parse_stream_payload_header(prefix: &[u8]) -> Option<Option<u64>> {
-    if prefix.len() != STREAM_PAYLOAD_HEADER_LEN {
-        return None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamFrameKind {
+    Message,
+    Bulk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamFrameHeader {
+    kind: StreamFrameKind,
+    length: Option<u64>,
+}
+
+fn parse_stream_frame_header(prefix: &[u8]) -> Result<StreamFrameHeader, EndpointError> {
+    if prefix.len() != STREAM_FRAME_HEADER_LEN {
+        return Err(EndpointError::Connection(format!(
+            "incomplete stream frame header: {} of {} bytes",
+            prefix.len(),
+            STREAM_FRAME_HEADER_LEN
+        )));
     }
-    if prefix[..STREAM_PAYLOAD_MAGIC.len()] != STREAM_PAYLOAD_MAGIC[..] {
-        return None;
+    if prefix[..STREAM_FRAME_MAGIC.len()] != STREAM_FRAME_MAGIC[..] {
+        return Err(EndpointError::Connection(
+            "missing saorsa stream frame header".to_string(),
+        ));
     }
 
-    let len_offset = STREAM_PAYLOAD_MAGIC.len();
+    let kind_offset = STREAM_FRAME_MAGIC.len();
+    let flags_offset = kind_offset + std::mem::size_of::<u8>();
+    let reserved_offset = flags_offset + std::mem::size_of::<u8>();
+    let len_offset = reserved_offset + std::mem::size_of::<u16>();
+
+    if prefix[flags_offset] != STREAM_FRAME_FLAGS_NONE {
+        return Err(EndpointError::Connection(format!(
+            "unsupported stream frame flags: {}",
+            prefix[flags_offset]
+        )));
+    }
+    if prefix[reserved_offset..len_offset] != [0u8, 0u8] {
+        return Err(EndpointError::Connection(
+            "non-zero reserved stream frame bytes".to_string(),
+        ));
+    }
+
+    let kind = match prefix[kind_offset] {
+        STREAM_FRAME_KIND_MESSAGE => StreamFrameKind::Message,
+        STREAM_FRAME_KIND_BULK => StreamFrameKind::Bulk,
+        other => {
+            return Err(EndpointError::Connection(format!(
+                "unknown stream frame kind: {other}"
+            )));
+        }
+    };
+
     let mut encoded_len = [0; std::mem::size_of::<u64>()];
     encoded_len.copy_from_slice(&prefix[len_offset..]);
-    match u64::from_be_bytes(encoded_len) {
-        STREAM_PAYLOAD_UNKNOWN_LEN => Some(None),
-        len => Some(Some(len)),
+    let length = match u64::from_be_bytes(encoded_len) {
+        STREAM_FRAME_UNKNOWN_LEN => None,
+        len => Some(len),
+    };
+
+    if kind == StreamFrameKind::Message && length.is_none() {
+        return Err(EndpointError::Connection(
+            "message stream frame length must be known".to_string(),
+        ));
     }
+
+    Ok(StreamFrameHeader { kind, length })
 }
 
-fn stream_payload_header(length: Option<u64>) -> [u8; STREAM_PAYLOAD_HEADER_LEN] {
-    let mut header = [0; STREAM_PAYLOAD_HEADER_LEN];
-    header[..STREAM_PAYLOAD_MAGIC.len()].copy_from_slice(&STREAM_PAYLOAD_MAGIC);
-    let encoded_len = length.unwrap_or(STREAM_PAYLOAD_UNKNOWN_LEN).to_be_bytes();
-    header[STREAM_PAYLOAD_MAGIC.len()..].copy_from_slice(&encoded_len);
+fn stream_frame_header(
+    kind: StreamFrameKind,
+    length: Option<u64>,
+) -> [u8; STREAM_FRAME_HEADER_LEN] {
+    let mut header = [0; STREAM_FRAME_HEADER_LEN];
+    header[..STREAM_FRAME_MAGIC.len()].copy_from_slice(&STREAM_FRAME_MAGIC);
+    let kind_offset = STREAM_FRAME_MAGIC.len();
+    let flags_offset = kind_offset + std::mem::size_of::<u8>();
+    let reserved_offset = flags_offset + std::mem::size_of::<u8>();
+    let len_offset = reserved_offset + std::mem::size_of::<u16>();
+
+    header[kind_offset] = match kind {
+        StreamFrameKind::Message => STREAM_FRAME_KIND_MESSAGE,
+        StreamFrameKind::Bulk => STREAM_FRAME_KIND_BULK,
+    };
+    header[flags_offset] = STREAM_FRAME_FLAGS_NONE;
+    let encoded_len = length.unwrap_or(STREAM_FRAME_UNKNOWN_LEN).to_be_bytes();
+    header[len_offset..].copy_from_slice(&encoded_len);
     header
 }
 
@@ -1193,7 +1306,7 @@ async fn dispatch_inbound_stream(
     let prefix = match read_stream_prefix_with_progress_timeout(
         &mut recv_stream,
         addr,
-        STREAM_PAYLOAD_HEADER_LEN,
+        STREAM_FRAME_HEADER_LEN,
     )
     .await
     {
@@ -1209,12 +1322,24 @@ async fn dispatch_inbound_stream(
         }
     };
 
-    if let Some(length) = parse_stream_payload_header(&prefix) {
+    let frame = match parse_stream_frame_header(&prefix) {
+        Ok(frame) => frame,
+        Err(e) => {
+            info!(
+                "Reader task for {}{}: invalid stream frame: {}",
+                addr, reader_label, e
+            );
+            let _ = recv_stream.stop(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+            return;
+        }
+    };
+
+    if frame.kind == StreamFrameKind::Bulk {
         debug!(
             "Reader task{}: accepted streaming payload from {} (declared length {:?})",
-            reader_label, addr, length
+            reader_label, addr, frame.length
         );
-        let inbound = InboundStream::new(addr, length, recv_stream, permit);
+        let inbound = InboundStream::new(addr, frame.length, recv_stream, permit);
         if stream_tx.send(inbound).await.is_err() {
             debug!(
                 "Reader task for {}{}: stream channel closed, dropping inbound stream",
@@ -1224,12 +1349,21 @@ async fn dispatch_inbound_stream(
         return;
     }
 
+    let Some(body_len) = frame.length else {
+        info!(
+            "Reader task for {}{}: message stream frame had no declared length",
+            addr, reader_label
+        );
+        let _ = recv_stream.stop(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+        return;
+    };
+
     let _permit = permit;
-    let data = match read_stream_message_with_progress_timeout(
+    let data = match read_framed_message_body_with_progress_timeout(
         &mut recv_stream,
         addr,
+        body_len,
         max_read_bytes,
-        prefix,
     )
     .await
     {
@@ -3375,8 +3509,9 @@ impl P2pEndpoint {
     ///
     /// ## Current Behavior (Phase 2.1)
     ///
-    /// All connections currently use UDP/QUIC via the existing `connection.open_uni()`
-    /// path. This ensures backward compatibility with existing peers.
+    /// All QUIC small-message sends use the same framed unidirectional stream
+    /// format as bulk streams, with a bounded message body delivered by
+    /// [`Self::recv`].
     ///
     /// ## Future Behavior (Phase 2.3)
     ///
@@ -3457,7 +3592,7 @@ impl P2pEndpoint {
             open_uni_started.elapsed()
         );
 
-        let header = stream_payload_header(length);
+        let header = stream_frame_header(StreamFrameKind::Bulk, length);
         if let Err(e) = write_stream_with_progress_timeout(&mut send_stream, *addr, &header).await {
             let _ = send_stream.reset(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
             return Err(e);
@@ -3659,7 +3794,15 @@ impl P2pEndpoint {
                     open_uni_started.elapsed()
                 );
 
-                let bytes_written =
+                let header = stream_frame_header(StreamFrameKind::Message, Some(data.len() as u64));
+                if let Err(e) =
+                    write_stream_with_progress_timeout(&mut send_stream, *addr, &header).await
+                {
+                    let _ = send_stream.reset(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+                    return Err(e);
+                }
+
+                let payload_bytes_written =
                     match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
                         Ok(bytes_written) => bytes_written,
                         Err(e) => {
@@ -3672,11 +3815,15 @@ impl P2pEndpoint {
                 let finish_started = Instant::now();
                 debug!(
                     "send({}): finishing QUIC uni stream after writing {} bytes",
-                    addr, bytes_written
+                    addr, payload_bytes_written
                 );
                 send_stream.finish().map_err(|e| {
                     warn!("send({}): finish failed: {}", addr, e);
-                    send_failed(SendFailureStage::Finish, bytes_written, e.to_string())
+                    send_failed(
+                        SendFailureStage::Finish,
+                        payload_bytes_written,
+                        e.to_string(),
+                    )
                 })?;
                 debug!(
                     "send({}): finished QUIC uni stream in {:?}",
@@ -3685,7 +3832,8 @@ impl P2pEndpoint {
                 );
 
                 if data.len() >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
-                    wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
+                    wait_for_stream_delivery_ack(&send_stream, *addr, payload_bytes_written)
+                        .await?;
                 }
 
                 debug!(
@@ -4625,25 +4773,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stream_payload_header_roundtrip_known_length() {
-        let header = stream_payload_header(Some(5 * 1024 * 1024));
+    fn test_stream_frame_header_roundtrip_message() {
+        let header = stream_frame_header(StreamFrameKind::Message, Some(5 * 1024 * 1024));
         assert_eq!(
-            parse_stream_payload_header(&header),
-            Some(Some(5 * 1024 * 1024))
+            parse_stream_frame_header(&header).unwrap(),
+            StreamFrameHeader {
+                kind: StreamFrameKind::Message,
+                length: Some(5 * 1024 * 1024),
+            }
         );
     }
 
     #[test]
-    fn test_stream_payload_header_roundtrip_unknown_length() {
-        let header = stream_payload_header(None);
-        assert_eq!(parse_stream_payload_header(&header), Some(None));
+    fn test_stream_frame_header_roundtrip_bulk_unknown_length() {
+        let header = stream_frame_header(StreamFrameKind::Bulk, None);
+        assert_eq!(
+            parse_stream_frame_header(&header).unwrap(),
+            StreamFrameHeader {
+                kind: StreamFrameKind::Bulk,
+                length: None,
+            }
+        );
     }
 
     #[test]
-    fn test_stream_payload_header_rejects_legacy_message_prefix() {
-        let mut prefix = [0; STREAM_PAYLOAD_HEADER_LEN];
+    fn test_stream_frame_header_rejects_legacy_message_prefix() {
+        let mut prefix = [0; STREAM_FRAME_HEADER_LEN];
         prefix[..5].copy_from_slice(b"hello");
-        assert_eq!(parse_stream_payload_header(&prefix), None);
+        assert!(parse_stream_frame_header(&prefix).is_err());
+    }
+
+    #[test]
+    fn test_stream_frame_header_rejects_unknown_message_length() {
+        let header = stream_frame_header(StreamFrameKind::Message, None);
+        assert!(parse_stream_frame_header(&header).is_err());
+    }
+
+    #[test]
+    fn test_stream_frame_header_rejects_unknown_kind() {
+        let mut header = stream_frame_header(StreamFrameKind::Bulk, Some(1));
+        header[STREAM_FRAME_MAGIC.len()] = 99;
+        assert!(parse_stream_frame_header(&header).is_err());
     }
 
     #[test]
