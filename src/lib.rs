@@ -353,8 +353,8 @@ pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent, Traver
 
 /// P2P endpoint - for advanced use, prefer Node for most applications
 pub use p2p_endpoint::{
-    ConnectionMetrics, DisconnectReason, EndpointError, EndpointStats, P2pEndpoint, P2pEvent,
-    PeerConnection, SendFailureStage, TraversalPhase,
+    ConnectionMetrics, DisconnectReason, EndpointError, EndpointStats, InboundStream, P2pEndpoint,
+    P2pEvent, PeerConnection, SendFailureStage, TraversalPhase,
 };
 
 /// P2P configuration with builder pattern

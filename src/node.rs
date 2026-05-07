@@ -55,9 +55,10 @@ use crate::host_identity::HostIdentity;
 use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
-use crate::p2p_endpoint::{EndpointError, P2pEndpoint, P2pEvent, PeerConnection};
+use crate::p2p_endpoint::{EndpointError, InboundStream, P2pEndpoint, P2pEvent, PeerConnection};
 use crate::unified_config::P2pConfig;
 use crate::unified_config::load_or_generate_endpoint_keypair;
+use tokio::io::AsyncRead;
 
 /// Error type for Node operations
 #[derive(Debug, thiserror::Error)]
@@ -480,11 +481,32 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
+    /// Stream a large payload to a peer by address without buffering it in memory.
+    pub async fn send_stream<R>(
+        &self,
+        addr: &SocketAddr,
+        reader: R,
+        length: Option<u64>,
+    ) -> Result<u64, NodeError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.inner
+            .send_stream(addr, reader, length)
+            .await
+            .map_err(NodeError::Endpoint)
+    }
+
     /// Receive data from any peer
     ///
     /// Returns the sender's address and the received data.
     pub async fn recv(&self) -> Result<(SocketAddr, Vec<u8>), NodeError> {
         self.inner.recv().await.map_err(NodeError::Endpoint)
+    }
+
+    /// Receive the next large inbound payload stream.
+    pub async fn recv_stream(&self) -> Result<InboundStream, NodeError> {
+        self.inner.recv_stream().await.map_err(NodeError::Endpoint)
     }
 
     // === Observability ===

@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 /// Short timeout for quick operations
@@ -1066,6 +1067,80 @@ mod channel_recv_and_shutdown_tests {
                 panic!("recv() timed out — channel-based delivery is not working");
             }
         }
+
+        shutdown_with_timeout(client).await;
+        shutdown_with_timeout(server).await;
+    }
+
+    /// Proves: large payloads can be received as live streams without being
+    /// materialized into the `recv()` message channel.
+    #[tokio::test]
+    async fn test_recv_stream_delivers_large_payload_as_stream() {
+        let server = create_test_node(vec![]).await;
+        let server_addr = server.local_addr().expect("Server needs address");
+
+        let server_for_accept = server.clone();
+        let accept_handle =
+            tokio::spawn(async move { timeout(SHORT_TIMEOUT, server_for_accept.accept()).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = create_test_node(vec![server_addr]).await;
+        let connect_result = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;
+        let peer_conn = match connect_result {
+            Ok(Ok(pc)) => pc,
+            other => {
+                println!(
+                    "Connection not established ({:?}), skipping stream recv test",
+                    other.err()
+                );
+                accept_handle.abort();
+                shutdown_with_timeout(client).await;
+                shutdown_with_timeout(server).await;
+                return;
+            }
+        };
+
+        let _ = accept_handle.await;
+
+        let payload: Vec<u8> = (0..(256 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let expected_len = expected.len() as u64;
+
+        let server_for_recv = server.clone();
+        let recv_handle = tokio::spawn(async move {
+            let mut inbound = timeout(SHORT_TIMEOUT, server_for_recv.recv_stream())
+                .await
+                .expect("recv_stream timed out")
+                .expect("recv_stream failed");
+            assert_eq!(inbound.length(), Some(expected_len));
+
+            let mut received = Vec::new();
+            inbound
+                .read_to_end(&mut received)
+                .await
+                .expect("read inbound stream");
+            (inbound.addr(), received)
+        });
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let writer_handle = tokio::spawn(async move {
+            writer.write_all(&payload).await.expect("write payload");
+        });
+
+        let remote_addr = peer_conn.remote_addr.as_socket_addr().expect("UDP addr");
+        let sent = timeout(
+            SHORT_TIMEOUT,
+            client.send_stream(&remote_addr, reader, Some(expected_len)),
+        )
+        .await
+        .expect("send_stream timed out")
+        .expect("send_stream failed");
+        assert_eq!(sent, expected_len);
+
+        writer_handle.await.expect("writer task");
+        let (_addr, received) = recv_handle.await.expect("recv task");
+        assert_eq!(received, expected);
 
         shutdown_with_timeout(client).await;
         shutdown_with_timeout(server).await;

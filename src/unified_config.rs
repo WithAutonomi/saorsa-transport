@@ -96,6 +96,14 @@ pub struct P2pConfig {
     /// Default: [`Self::DEFAULT_DATA_CHANNEL_CAPACITY`].
     pub data_channel_capacity: usize,
 
+    /// Capacity of the streaming receive channel shared between reader tasks and `recv_stream()`.
+    ///
+    /// This channel carries live QUIC receive streams rather than fully buffered payloads.
+    /// Keeping it bounded ensures unconsumed large transfers apply back-pressure to the
+    /// QUIC reader tasks instead of allowing unlimited active application streams.
+    /// Default: [`Self::DEFAULT_STREAM_CHANNEL_CAPACITY`].
+    pub stream_channel_capacity: usize,
+
     /// Maximum application-layer message size in bytes.
     ///
     /// Internally tunes QUIC stream flow control (`stream_receive_window`) and
@@ -299,6 +307,7 @@ impl Default for P2pConfig {
             bootstrap_cache: BootstrapCacheConfig::default(),
             transport_registry: TransportRegistry::new(),
             data_channel_capacity: Self::DEFAULT_DATA_CHANNEL_CAPACITY,
+            stream_channel_capacity: Self::DEFAULT_STREAM_CHANNEL_CAPACITY,
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
@@ -307,6 +316,9 @@ impl Default for P2pConfig {
 impl P2pConfig {
     /// Default capacity of the data channel between reader tasks and `recv()`.
     pub const DEFAULT_DATA_CHANNEL_CAPACITY: usize = 256;
+
+    /// Default capacity of the streaming receive channel between reader tasks and `recv_stream()`.
+    pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 16;
 
     /// Default maximum message size (1 MiB).
     pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -380,6 +392,7 @@ pub struct P2pConfigBuilder {
     bootstrap_cache: Option<BootstrapCacheConfig>,
     transport_registry: Option<TransportRegistry>,
     data_channel_capacity: Option<usize>,
+    stream_channel_capacity: Option<usize>,
     max_message_size: Option<usize>,
 }
 
@@ -397,6 +410,14 @@ pub enum ConfigError {
     /// Invalid max message size
     #[error("max_message_size must be at least 1")]
     InvalidMaxMessageSize,
+
+    /// Invalid data channel capacity
+    #[error("data_channel_capacity must be at least 1")]
+    InvalidDataChannelCapacity,
+
+    /// Invalid streaming channel capacity
+    #[error("stream_channel_capacity must be at least 1")]
+    InvalidStreamChannelCapacity,
 
     /// PQC configuration error
     #[error("PQC configuration error: {0}")]
@@ -698,6 +719,16 @@ impl P2pConfigBuilder {
         self
     }
 
+    /// Set the capacity of the streaming receive channel between reader tasks and `recv_stream()`.
+    ///
+    /// This channel carries live streams, not buffered payload bytes. If it fills, reader tasks
+    /// stop accepting additional large-payload streams and QUIC flow control applies back-pressure.
+    /// Default: [`P2pConfig::DEFAULT_STREAM_CHANNEL_CAPACITY`] (16).
+    pub fn stream_channel_capacity(mut self, capacity: usize) -> Self {
+        self.stream_channel_capacity = Some(capacity);
+        self
+    }
+
     /// Set the maximum application-layer message size in bytes.
     ///
     /// Internally tunes QUIC stream flow control and read buffers.
@@ -722,6 +753,20 @@ impl P2pConfigBuilder {
             return Err(ConfigError::InvalidMaxMessageSize);
         }
 
+        let data_channel_capacity = self
+            .data_channel_capacity
+            .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
+        if data_channel_capacity == 0 {
+            return Err(ConfigError::InvalidDataChannelCapacity);
+        }
+
+        let stream_channel_capacity = self
+            .stream_channel_capacity
+            .unwrap_or(P2pConfig::DEFAULT_STREAM_CHANNEL_CAPACITY);
+        if stream_channel_capacity == 0 {
+            return Err(ConfigError::InvalidStreamChannelCapacity);
+        }
+
         // v0.13.0+: No role validation - all nodes are symmetric
         // Nodes can operate without known peers (they can be connected to by others)
 
@@ -738,9 +783,8 @@ impl P2pConfigBuilder {
             keypair: self.keypair,
             bootstrap_cache: self.bootstrap_cache.unwrap_or_default(),
             transport_registry: self.transport_registry.unwrap_or_default(),
-            data_channel_capacity: self
-                .data_channel_capacity
-                .unwrap_or(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY),
+            data_channel_capacity,
+            stream_channel_capacity,
             max_message_size,
         })
     }
@@ -953,9 +997,38 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_data_channel_capacity() {
+        let result = P2pConfig::builder().data_channel_capacity(0).build();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidDataChannelCapacity)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_stream_channel_capacity() {
+        let result = P2pConfig::builder().stream_channel_capacity(0).build();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidStreamChannelCapacity)
+        ));
+    }
+
+    #[test]
     fn test_max_message_size_default() {
         let config = P2pConfig::default();
         assert_eq!(config.max_message_size, P2pConfig::DEFAULT_MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_stream_channel_capacity_default() {
+        let config = P2pConfig::default();
+        assert_eq!(
+            config.stream_channel_capacity,
+            P2pConfig::DEFAULT_STREAM_CHANNEL_CAPACITY
+        );
     }
 
     #[test]
