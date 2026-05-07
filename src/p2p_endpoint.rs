@@ -94,9 +94,6 @@ const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum time a QUIC stream write may make no forward progress.
 const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum time a QUIC stream read may make no forward progress.
-const STREAM_READ_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Payload size at or above which QUIC sends wait for the peer to acknowledge
 /// receipt of the full stream after `finish()`. Smaller payloads return as
 /// soon as the local stack has accepted the data, avoiding an extra RTT for
@@ -867,7 +864,7 @@ async fn write_stream_with_progress_timeout(
     Ok(bytes_written)
 }
 
-async fn read_stream_with_progress_timeout(
+async fn read_stream(
     recv_stream: &mut crate::high_level::RecvStream,
     addr: SocketAddr,
     size_limit: usize,
@@ -883,13 +880,8 @@ async fn read_stream_with_progress_timeout(
     );
 
     loop {
-        match timeout(
-            STREAM_READ_PROGRESS_TIMEOUT,
-            recv_stream.read_chunk(usize::MAX, false),
-        )
-        .await
-        {
-            Ok(Ok(Some(chunk))) => {
+        match recv_stream.read_chunk(usize::MAX, false).await {
+            Ok(Some(chunk)) => {
                 start = start.min(chunk.offset);
                 let chunk_end = chunk.offset.saturating_add(chunk.bytes.len() as u64);
                 if chunk_end.saturating_sub(start) > size_limit as u64 {
@@ -904,7 +896,7 @@ async fn read_stream_with_progress_timeout(
                 end = end.max(chunk_end);
                 read.push((chunk.bytes, chunk.offset));
             }
-            Ok(Ok(None)) => {
+            Ok(None) => {
                 if end == 0 {
                     debug!("recv({}): QUIC stream read completed empty", addr);
                     return Ok(Vec::new());
@@ -923,18 +915,11 @@ async fn read_stream_with_progress_timeout(
                 );
                 return Ok(buffer);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!("recv({}): stream read failed: {}", addr, e);
                 return Err(EndpointError::Connection(format!(
                     "stream read failed: {e}"
                 )));
-            }
-            Err(_elapsed) => {
-                warn!(
-                    "recv({}): stream read made no progress for {:?}",
-                    addr, STREAM_READ_PROGRESS_TIMEOUT
-                );
-                return Err(EndpointError::Timeout);
             }
         }
     }
@@ -1005,8 +990,7 @@ async fn dispatch_inbound_stream(
     reader_label: &'static str,
     send_mode: InboundDataSendMode,
 ) {
-    let data = match read_stream_with_progress_timeout(&mut recv_stream, addr, max_read_bytes).await
-    {
+    let data = match read_stream(&mut recv_stream, addr, max_read_bytes).await {
         Ok(data) if data.is_empty() => return,
         Ok(data) => data,
         Err(e) => {
