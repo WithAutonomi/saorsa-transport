@@ -1269,12 +1269,12 @@ impl MasqueRelayServer {
                         stats.record_bytes(encoded.len() as u64);
                         stats.record_datagram();
                         if fwd_tx.send(WriterItem::Data(encoded)).await.is_err() {
-                            break; // writer closed
+                            return "writer_channel_closed";
                         }
                     }
                     Err(e) => {
                         tracing::debug!(session_id, error = %e, "UDP recv error");
-                        break;
+                        return "udp_recv_error";
                     }
                 }
             }
@@ -1288,7 +1288,9 @@ impl MasqueRelayServer {
             loop {
                 tokio::select! {
                     item = fwd_rx.recv() => {
-                        let Some(item) = item else { break };
+                        let Some(item) = item else {
+                            return "forward_channel_closed";
+                        };
                         match item {
                             WriterItem::Data(encoded) => {
                                 let mut batch = Vec::with_capacity(
@@ -1318,7 +1320,7 @@ impl MasqueRelayServer {
 
                                 if let Err(e) = send_stream.write_all(&batch).await {
                                     tracing::debug!(session_id, error = %e, frames, bytes = batch.len(), "Stream batch write error");
-                                    break;
+                                    return "stream_batch_write_error";
                                 }
                             }
                             WriterItem::Control(body) => {
@@ -1329,7 +1331,7 @@ impl MasqueRelayServer {
                                 append_control_frame(&mut frame, &body);
                                 if let Err(e) = send_stream.write_all(&frame).await {
                                     tracing::debug!(session_id, error = %e, "Stream write error (control frame)");
-                                    break;
+                                    return "stream_control_write_error";
                                 }
                             }
                         }
@@ -1337,25 +1339,41 @@ impl MasqueRelayServer {
                     _ = keepalive.tick() => {
                         if let Err(e) = send_stream.write_all(&keepalive_bytes).await {
                             tracing::debug!(session_id, error = %e, "Keepalive write error");
-                            break;
+                            return "keepalive_write_error";
                         }
                     }
                 }
             }
         });
 
-        tokio::select! {
-            _ = reader_handle => {},
-            _ = writer_handle => {},
+        let close_reason = tokio::select! {
+            result = reader_handle => {
+                match result {
+                    Ok(reason) => reason,
+                    Err(e) => {
+                        tracing::debug!(session_id, error = %e, "Relay UDP reader task join error");
+                        "reader_task_join_error"
+                    }
+                }
+            },
+            result = writer_handle => {
+                match result {
+                    Ok(reason) => reason,
+                    Err(e) => {
+                        tracing::debug!(session_id, error = %e, "Relay stream writer task join error");
+                        "writer_task_join_error"
+                    }
+                }
+            },
 
             // Direction 2: Stream → UDP (client → relay → target)
-            _ = async {
+            reason = async {
                 loop {
                     // Read 4-byte length prefix
                     let mut len_buf = [0u8; 4];
                     if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
                         tracing::debug!(session_id, error = %e, "Stream read error (length)");
-                        break;
+                        return "stream_read_length_error";
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
 
@@ -1375,14 +1393,14 @@ impl MasqueRelayServer {
                             frame_len,
                             "Corrupt stream frame length, closing session"
                         );
-                        break;
+                        return "corrupt_frame_length";
                     }
 
                     // Read frame data
                     let mut frame_buf = vec![0u8; frame_len];
                     if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
                         tracing::debug!(session_id, error = %e, "Stream read error (data)");
-                        break;
+                        return "stream_read_data_error";
                     }
 
                     // Decode and forward
@@ -1452,10 +1470,14 @@ impl MasqueRelayServer {
                         }
                     }
                 }
-            } => {},
-        }
+            } => reason,
+        };
 
-        tracing::info!(session_id, "Stream-based relay forwarding loop ended");
+        tracing::info!(
+            session_id,
+            close_reason,
+            "Stream-based relay forwarding loop ended"
+        );
         if let Err(e) = self.close_session(session_id).await {
             tracing::debug!(session_id, error = %e, "Error closing session");
         }

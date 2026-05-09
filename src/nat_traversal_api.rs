@@ -450,6 +450,12 @@ pub struct NatTraversalEndpoint {
     bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Relay address to re-advertise to new peers (set after proactive relay setup)
     relay_public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// Monotonic generation for proactive relay state.
+    ///
+    /// Incremented whenever relay state is established or reset. Any
+    /// advertise/re-advertise path that snapshots a relay address also carries
+    /// this generation and drops work if a newer relay state superseded it.
+    relay_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Peers already advertised the relay address to
     relay_advertised_peers: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
     /// Task handles for transport listener tasks
@@ -1691,6 +1697,7 @@ impl NatTraversalEndpoint {
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
+            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -2130,6 +2137,7 @@ impl NatTraversalEndpoint {
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
+            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -3887,6 +3895,22 @@ impl NatTraversalEndpoint {
         self.relay_public_addr.lock().ok().and_then(|g| *g)
     }
 
+    fn current_relay_generation(&self) -> u64 {
+        self.relay_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn next_relay_generation(&self) -> u64 {
+        self.relay_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn relay_generation_matches(&self, generation: u64, relay_addr: SocketAddr) -> bool {
+        self.current_relay_generation() == generation
+            && self.relay_public_addr.lock().ok().and_then(|g| *g) == Some(relay_addr)
+    }
+
     /// Check if the proactive relay session is still alive. Returns true if
     /// no relay was established (nothing to monitor) or the relay is healthy.
     /// Returns false if a relay was established but the underlying QUIC
@@ -3917,6 +3941,7 @@ impl NatTraversalEndpoint {
     /// Reset relay state so the next poll cycle can re-establish. Called when
     /// the relay session is detected as dead.
     pub fn reset_relay_state(&self) {
+        let generation = self.next_relay_generation();
         self.relay_setup_attempted
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
@@ -3927,7 +3952,10 @@ impl NatTraversalEndpoint {
         }
         // Remove dead sessions
         self.relay_sessions.retain(|_, session| session.is_active());
-        info!("Relay state reset — will re-establish on next poll cycle");
+        info!(
+            generation,
+            "Relay state reset — will re-establish on next poll cycle"
+        );
     }
 
     /// Check if relay fallback is available
@@ -4916,6 +4944,21 @@ impl NatTraversalEndpoint {
 
         info!("Relay endpoint created (relay addr: {})", relay_public_addr);
 
+        let relay_generation = self.next_relay_generation();
+        self.relay_setup_attempted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut addr) = self.relay_public_addr.lock() {
+            *addr = Some(relay_public_addr);
+        }
+        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.clear();
+        }
+        info!(
+            relay_generation,
+            relay_addr = %relay_public_addr,
+            "Proactive relay generation established"
+        );
+
         // Share the relay endpoint between the accept loop and the
         // graceful-close watcher.
         let relay_endpoint = Arc::new(relay_endpoint);
@@ -4951,9 +4994,22 @@ impl NatTraversalEndpoint {
         // Step 5: Advertise the relay address to all connected peers
         let mut advertised = 0;
         for entry in self.connections.iter() {
+            if !self.relay_generation_matches(relay_generation, relay_public_addr) {
+                debug!(
+                    relay_generation,
+                    relay_addr = %relay_public_addr,
+                    "Skipping stale relay advertisement after relay generation changed"
+                );
+                break;
+            }
             let conn = entry.value().clone();
             match conn.send_nat_address_advertisement(relay_public_addr, 100) {
-                Ok(_) => advertised += 1,
+                Ok(_) => {
+                    advertised += 1;
+                    if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                        peers.insert(*entry.key());
+                    }
+                }
                 Err(e) => {
                     debug!(
                         "Failed to advertise relay address to {}: {}",
@@ -4968,14 +5024,6 @@ impl NatTraversalEndpoint {
             "Advertised relay address {} to {} peers",
             relay_public_addr, advertised
         );
-
-        // Record the session as active so the rest of the endpoint
-        // suppresses conflicting broadcasts.
-        self.relay_setup_attempted
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut addr) = self.relay_public_addr.lock() {
-            *addr = Some(relay_public_addr);
-        }
 
         Ok(relay_public_addr)
     }
@@ -6339,6 +6387,7 @@ impl NatTraversalEndpoint {
         {
             let relay_addr = self.relay_public_addr.lock().ok().and_then(|g| *g);
             if let Some(relay_addr) = relay_addr {
+                let relay_generation = self.current_relay_generation();
                 let unadvertised: Vec<SocketAddr> = {
                     let advertised = self
                         .relay_advertised_peers
@@ -6360,6 +6409,14 @@ impl NatTraversalEndpoint {
                     );
                 }
                 for peer_addr in unadvertised {
+                    if !self.relay_generation_matches(relay_generation, relay_addr) {
+                        debug!(
+                            relay_generation,
+                            relay_addr = %relay_addr,
+                            "Relay re-advertise: dropping stale generation"
+                        );
+                        break;
+                    }
                     if let Some(mut entry) = self.connections.get_mut(&peer_addr) {
                         match entry
                             .value_mut()
