@@ -3903,7 +3903,7 @@ impl NatTraversalEndpoint {
     fn next_relay_generation(&self) -> u64 {
         self.relay_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(1)
+            .wrapping_add(1)
     }
 
     fn relay_generation_matches(&self, generation: u64, relay_addr: SocketAddr) -> bool {
