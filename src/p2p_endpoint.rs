@@ -882,9 +882,10 @@ async fn read_stream(
     loop {
         match recv_stream.read_chunk(usize::MAX, false).await {
             Ok(Some(chunk)) => {
-                start = start.min(chunk.offset);
+                let new_start = start.min(chunk.offset);
                 let chunk_end = chunk.offset.saturating_add(chunk.bytes.len() as u64);
-                if chunk_end.saturating_sub(start) > size_limit as u64 {
+                let new_end = end.max(chunk_end);
+                if new_end.saturating_sub(new_start) > size_limit as u64 {
                     warn!(
                         "recv({}): stream exceeded read limit (limit {} bytes)",
                         addr, size_limit
@@ -893,7 +894,8 @@ async fn read_stream(
                         "incoming stream exceeded read limit of {size_limit} bytes"
                     )));
                 }
-                end = end.max(chunk_end);
+                start = new_start;
+                end = new_end;
                 read.push((chunk.bytes, chunk.offset));
             }
             Ok(None) => {
