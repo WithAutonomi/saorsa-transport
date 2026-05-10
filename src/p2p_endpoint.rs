@@ -180,11 +180,11 @@ impl PendingDialGuard {
         if !self.active {
             return;
         }
+
+        let entry = remove_pending_dial_if_owned(&self.pending_dials, self.target, self.id).await;
         self.active = false;
 
-        let Some(entry) =
-            remove_pending_dial_if_owned(&self.pending_dials, self.target, self.id).await
-        else {
+        let Some(entry) = entry else {
             return;
         };
 
@@ -4280,6 +4280,50 @@ mod tests {
         })
         .await
         .expect("pending dial guard cleared entry");
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_abort_during_complete_clears_owned_entry() {
+        let target: SocketAddr = "127.0.0.1:12347".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let id = 44;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let pending_lock = pending_dials.lock().await;
+        let pending_dials_for_task = Arc::clone(&pending_dials);
+        let handle = tokio::spawn(async move {
+            let mut guard = PendingDialGuard::new(pending_dials_for_task, target, id);
+            let result: Result<(PeerConnection, ConnectionMethod), EndpointError> =
+                Err(EndpointError::Timeout);
+            guard.complete(&result).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        drop(pending_lock);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_dials.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted pending dial guard cleared entry");
     }
 
     #[test]
