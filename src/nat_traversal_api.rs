@@ -397,6 +397,14 @@ pub struct NatTraversalEndpoint {
     /// Active connections keyed by remote SocketAddr
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+    /// Owning QUIC endpoint for each tracked connection.
+    ///
+    /// Most connections are owned by `inner_endpoint`, but inbound
+    /// connections to a proactive MASQUE relay land on a separate relay
+    /// endpoint. Peer-id registration must update the endpoint that actually
+    /// owns the QUIC connection rather than assuming every connection belongs
+    /// to the main endpoint.
+    connection_endpoints: Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
     /// Timeout configuration
     timeout_config: crate::config::nat_timeouts::TimeoutConfig,
     /// Track remote addresses for which ConnectionEstablished has already been emitted
@@ -442,6 +450,12 @@ pub struct NatTraversalEndpoint {
     bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Relay address to re-advertise to new peers (set after proactive relay setup)
     relay_public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// Monotonic generation for proactive relay state.
+    ///
+    /// Incremented whenever relay state is established or reset. Any
+    /// advertise/re-advertise path that snapshots a relay address also carries
+    /// this generation and drops work if a newer relay state superseded it.
+    relay_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Peers already advertised the relay address to
     relay_advertised_peers: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
     /// Task handles for transport listener tasks
@@ -1397,6 +1411,40 @@ impl NatTraversalEndpoint {
 
         config
     }
+
+    fn track_connection_endpoint(
+        connection_endpoints: &Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
+        addr: SocketAddr,
+        endpoint: &InnerEndpoint,
+    ) {
+        for candidate in socket_addr_variants(addr) {
+            connection_endpoints.insert(candidate, endpoint.clone());
+        }
+    }
+
+    fn untrack_connection_endpoint(
+        connection_endpoints: &Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
+        addr: SocketAddr,
+    ) {
+        for candidate in socket_addr_variants(addr) {
+            connection_endpoints.remove(&candidate);
+        }
+    }
+
+    fn register_peer_id_on_endpoint(
+        endpoint: &InnerEndpoint,
+        addr: SocketAddr,
+        peer_id: PeerId,
+    ) -> bool {
+        for candidate in socket_addr_variants(addr) {
+            if endpoint.connection_stable_id_for_addr(&candidate).is_some() {
+                endpoint.register_connection_peer_id(candidate, peer_id);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create a new NAT traversal endpoint with proper UDP socket sharing
     ///
     /// This is the recommended constructor for most use cases. It:
@@ -1635,6 +1683,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -1648,6 +1697,7 @@ impl NatTraversalEndpoint {
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
+            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -2073,6 +2123,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
@@ -2086,6 +2137,7 @@ impl NatTraversalEndpoint {
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
+            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -2315,9 +2367,31 @@ impl NatTraversalEndpoint {
 
     /// Register a peer ID at the low-level endpoint for PUNCH_ME_NOW routing.
     pub fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: PeerId) {
-        if let Some(ep) = &self.inner_endpoint {
-            ep.register_connection_peer_id(addr, peer_id);
+        for candidate in socket_addr_variants(addr) {
+            let Some(owner) = self.connection_endpoints.get(&candidate) else {
+                continue;
+            };
+            let endpoint = owner.value().clone();
+            drop(owner);
+
+            if Self::register_peer_id_on_endpoint(&endpoint, candidate, peer_id) {
+                return;
+            }
+
+            Self::untrack_connection_endpoint(&self.connection_endpoints, candidate);
         }
+
+        if let Some(ep) = &self.inner_endpoint
+            && Self::register_peer_id_on_endpoint(ep, addr, peer_id)
+        {
+            Self::track_connection_endpoint(&self.connection_endpoints, addr, ep);
+            return;
+        }
+
+        debug!(
+            "No connection owner found while registering peer ID {} for {}",
+            peer_id, addr
+        );
     }
 
     /// Get the event callback
@@ -2837,6 +2911,8 @@ impl NatTraversalEndpoint {
     > {
         use std::sync::Arc;
 
+        const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
+
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
         let server_config = {
             info!("Creating server config using Raw Public Keys (RFC 7250) for symmetric P2P node");
@@ -2901,7 +2977,6 @@ impl NatTraversalEndpoint {
             // (208 KB on Linux).  1 MB balances fast starts (4 MB chunk
             // completes in ~2 RTTs through slow-start) with pacing that
             // receivers can absorb.
-            const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
                 INITIAL_CONGESTION_WINDOW,
@@ -2979,13 +3054,13 @@ impl NatTraversalEndpoint {
             transport_config.stream_receive_window(window);
             transport_config.send_window(config.max_message_size as u64);
 
-            // Set the initial congestion window to max_message_size so
-            // relay-tunnelled connections can push a full chunk without
-            // waiting for slow-start.  See the server config comment for
-            // the full rationale.
+            // Keep client and server sends on the same bounded startup
+            // window. Uploads originate from client configs, so using
+            // max_message_size here recreates the burst/loss problem that
+            // the server config above avoids.
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
-                config.max_message_size as u64,
+                INITIAL_CONGESTION_WINDOW,
                 transport_config.initial_rtt,
             ));
 
@@ -3113,6 +3188,7 @@ impl NatTraversalEndpoint {
             }
         };
         let connections_clone = self.connections.clone();
+        let connection_endpoints_clone = self.connection_endpoints.clone();
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
         let relay_handler_connections_clone = self.relay_handler_connections.clone();
@@ -3125,6 +3201,7 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx,
                 connections_clone,
+                connection_endpoints_clone,
                 emitted_events_clone,
                 relay_server_clone,
                 relay_handler_connections_clone,
@@ -3143,6 +3220,7 @@ impl NatTraversalEndpoint {
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+        connection_endpoints: Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
         emitted_events: Arc<dashmap::DashSet<SocketAddr>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         relay_handler_connections: Arc<dashmap::DashSet<usize>>,
@@ -3152,8 +3230,10 @@ impl NatTraversalEndpoint {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
                 Some(connecting) => {
+                    let owner_endpoint = endpoint.clone();
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
+                    let connection_endpoints = connection_endpoints.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
                     let relay_handler_connections = relay_handler_connections.clone();
@@ -3175,6 +3255,11 @@ impl NatTraversalEndpoint {
                                 // dead duplicate from simultaneous-open.
                                 let connection_key = normalize_socket_addr(remote_address);
                                 connections.insert(connection_key, connection.clone());
+                                Self::track_connection_endpoint(
+                                    &connection_endpoints,
+                                    connection_key,
+                                    &owner_endpoint,
+                                );
 
                                 // Notify the P2pEndpoint's forwarder about the new connection
                                 match accepted_addrs_tx.send(connection_key) {
@@ -3810,6 +3895,22 @@ impl NatTraversalEndpoint {
         self.relay_public_addr.lock().ok().and_then(|g| *g)
     }
 
+    fn current_relay_generation(&self) -> u64 {
+        self.relay_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn next_relay_generation(&self) -> u64 {
+        self.relay_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn relay_generation_matches(&self, generation: u64, relay_addr: SocketAddr) -> bool {
+        self.current_relay_generation() == generation
+            && self.relay_public_addr.lock().ok().and_then(|g| *g) == Some(relay_addr)
+    }
+
     /// Check if the proactive relay session is still alive. Returns true if
     /// no relay was established (nothing to monitor) or the relay is healthy.
     /// Returns false if a relay was established but the underlying QUIC
@@ -3840,6 +3941,7 @@ impl NatTraversalEndpoint {
     /// Reset relay state so the next poll cycle can re-establish. Called when
     /// the relay session is detected as dead.
     pub fn reset_relay_state(&self) {
+        let generation = self.next_relay_generation();
         self.relay_setup_attempted
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut addr) = self.relay_public_addr.lock() {
@@ -3850,7 +3952,10 @@ impl NatTraversalEndpoint {
         }
         // Remove dead sessions
         self.relay_sessions.retain(|_, session| session.is_active());
-        info!("Relay state reset — will re-establish on next poll cycle");
+        info!(
+            generation,
+            "Relay state reset — will re-establish on next poll cycle"
+        );
     }
 
     /// Check if relay fallback is available
@@ -4206,6 +4311,7 @@ impl NatTraversalEndpoint {
         };
         let tx = self.handshake_tx.clone();
         let connections = self.connections.clone();
+        let connection_endpoints = self.connection_endpoints.clone();
         let emitted = self.emitted_established_events.clone();
         let relay_server = self.relay_server.clone();
         let relay_handler_connections = self.relay_handler_connections.clone();
@@ -4253,10 +4359,12 @@ impl NatTraversalEndpoint {
                 // to accept the next incoming connection.
                 let tx2 = tx.clone();
                 let connections2 = connections.clone();
+                let connection_endpoints2 = connection_endpoints.clone();
                 let emitted2 = emitted.clone();
                 let relay_server2 = relay_server.clone();
                 let relay_handler_connections2 = relay_handler_connections.clone();
                 let event_tx2 = event_tx_opt.clone();
+                let owner_endpoint = endpoint.clone();
                 tokio::spawn(async move {
                     let connection = match connecting.await {
                         Ok(conn) => conn,
@@ -4322,6 +4430,11 @@ impl NatTraversalEndpoint {
                     }
                     let connection_key = normalize_socket_addr(remote_address);
                     connections2.insert(connection_key, connection.clone());
+                    Self::track_connection_endpoint(
+                        &connection_endpoints2,
+                        connection_key,
+                        &owner_endpoint,
+                    );
 
                     // Only forward to handshake_tx if this is the first time
                     // we've seen this address. Without this guard, a
@@ -4383,6 +4496,14 @@ impl NatTraversalEndpoint {
     /// for symmetric NAT where the peer's address in the DHT differs
     /// from the connection's actual address.
     pub fn find_connection_by_peer_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        for owner in self.connection_endpoints.iter() {
+            let endpoint = owner.value().clone();
+            drop(owner);
+            if let Some(addr) = endpoint.peer_connection_addr_by_id(peer_id) {
+                return Some(addr);
+            }
+        }
+
         if let Some(ep) = &self.inner_endpoint {
             return ep.peer_connection_addr_by_id(peer_id);
         }
@@ -4402,6 +4523,7 @@ impl NatTraversalEndpoint {
                 );
                 drop(entry); // release the DashMap ref before removing
                 self.connections.remove(&candidate);
+                Self::untrack_connection_endpoint(&self.connection_endpoints, candidate);
                 return false;
             }
             return true;
@@ -4478,6 +4600,9 @@ impl NatTraversalEndpoint {
             &connection,
         );
         self.connections.insert(key, connection);
+        if let Some(endpoint) = &self.inner_endpoint {
+            Self::track_connection_endpoint(&self.connection_endpoints, key, endpoint);
+        }
         info!(
             "add_connection: now have {} connections",
             self.connections.len()
@@ -4610,6 +4735,7 @@ impl NatTraversalEndpoint {
             self.active_sessions.remove(candidate);
             self.closed_at.remove(candidate);
             self.transport_candidates.remove(candidate);
+            Self::untrack_connection_endpoint(&self.connection_endpoints, *candidate);
             remove_keys.push(*candidate);
         }
 
@@ -4818,6 +4944,21 @@ impl NatTraversalEndpoint {
 
         info!("Relay endpoint created (relay addr: {})", relay_public_addr);
 
+        let relay_generation = self.next_relay_generation();
+        self.relay_setup_attempted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut addr) = self.relay_public_addr.lock() {
+            *addr = Some(relay_public_addr);
+        }
+        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.clear();
+        }
+        info!(
+            relay_generation,
+            relay_addr = %relay_public_addr,
+            "Proactive relay generation established"
+        );
+
         // Share the relay endpoint between the accept loop and the
         // graceful-close watcher.
         let relay_endpoint = Arc::new(relay_endpoint);
@@ -4853,9 +4994,22 @@ impl NatTraversalEndpoint {
         // Step 5: Advertise the relay address to all connected peers
         let mut advertised = 0;
         for entry in self.connections.iter() {
+            if !self.relay_generation_matches(relay_generation, relay_public_addr) {
+                debug!(
+                    relay_generation,
+                    relay_addr = %relay_public_addr,
+                    "Skipping stale relay advertisement after relay generation changed"
+                );
+                break;
+            }
             let conn = entry.value().clone();
             match conn.send_nat_address_advertisement(relay_public_addr, 100) {
-                Ok(_) => advertised += 1,
+                Ok(_) => {
+                    advertised += 1;
+                    if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+                        peers.insert(*entry.key());
+                    }
+                }
                 Err(e) => {
                     debug!(
                         "Failed to advertise relay address to {}: {}",
@@ -4870,14 +5024,6 @@ impl NatTraversalEndpoint {
             "Advertised relay address {} to {} peers",
             relay_public_addr, advertised
         );
-
-        // Record the session as active so the rest of the endpoint
-        // suppresses conflicting broadcasts.
-        self.relay_setup_attempted
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut addr) = self.relay_public_addr.lock() {
-            *addr = Some(relay_public_addr);
-        }
 
         Ok(relay_public_addr)
     }
@@ -4899,6 +5045,7 @@ impl NatTraversalEndpoint {
     ) {
         let tx = self.handshake_tx.clone();
         let connections = self.connections.clone();
+        let connection_endpoints = self.connection_endpoints.clone();
         let emitted = self.emitted_established_events.clone();
         let relay_server = self.relay_server.clone();
         let relay_handler_connections = self.relay_handler_connections.clone();
@@ -4928,10 +5075,12 @@ impl NatTraversalEndpoint {
 
                 let tx2 = tx.clone();
                 let connections2 = connections.clone();
+                let connection_endpoints2 = connection_endpoints.clone();
                 let emitted2 = emitted.clone();
                 let relay_server2 = relay_server.clone();
                 let relay_handler_connections2 = relay_handler_connections.clone();
                 let event_tx2 = event_tx_opt.clone();
+                let owner_endpoint = Arc::clone(&endpoint);
                 tokio::spawn(async move {
                     let connection = match connecting.await {
                         Ok(conn) => conn,
@@ -4974,6 +5123,11 @@ impl NatTraversalEndpoint {
                         return;
                     }
                     connections2.insert(remote_address, connection.clone());
+                    Self::track_connection_endpoint(
+                        &connection_endpoints2,
+                        remote_address,
+                        owner_endpoint.as_ref(),
+                    );
 
                     if emitted2.insert(remote_address) {
                         if let Some(ref server) = relay_server2 {
@@ -5433,6 +5587,7 @@ impl NatTraversalEndpoint {
         let addrs: Vec<SocketAddr> = self.connections.iter().map(|e| *e.key()).collect();
         for addr in addrs {
             if let Some((_, connection)) = self.connections.remove(&addr) {
+                Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 info!("Closing connection to {}", addr);
                 connection.close(crate::VarInt::from_u32(0), b"Shutdown");
             }
@@ -5684,11 +5839,13 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let connection_endpoints = self.connection_endpoints.clone();
                         let incoming_notify = self.incoming_notify.clone();
                         let accepted_addrs_tx = self.accepted_addrs_tx.clone();
                         let relay_server = self.relay_server.clone();
                         let relay_handler_connections = self.relay_handler_connections.clone();
                         let address = candidate.address;
+                        let owner_endpoint = endpoint.clone();
 
                         tokio::spawn(async move {
                             match connecting.await {
@@ -5733,6 +5890,11 @@ impl NatTraversalEndpoint {
                                         inserted = true;
                                     }
                                     if inserted {
+                                        Self::track_connection_endpoint(
+                                            &connection_endpoints,
+                                            key,
+                                            &owner_endpoint,
+                                        );
                                         // Symmetric P2P: spawn the relay handler on this
                                         // outbound hole-punch connection so the remote (which
                                         // was the accept-side) can open CONNECT-UDP bidi
@@ -5827,6 +5989,7 @@ impl NatTraversalEndpoint {
             if now.duration_since(first_seen_closed) >= grace_period {
                 // Grace period elapsed — remove the dead connection.
                 self.connections.remove(&addr);
+                Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 self.closed_at.remove(&addr);
                 debug!(
                     "Connection to {} closed: {}, removed after grace period",
@@ -6224,6 +6387,7 @@ impl NatTraversalEndpoint {
         {
             let relay_addr = self.relay_public_addr.lock().ok().and_then(|g| *g);
             if let Some(relay_addr) = relay_addr {
+                let relay_generation = self.current_relay_generation();
                 let unadvertised: Vec<SocketAddr> = {
                     let advertised = self
                         .relay_advertised_peers
@@ -6245,6 +6409,14 @@ impl NatTraversalEndpoint {
                     );
                 }
                 for peer_addr in unadvertised {
+                    if !self.relay_generation_matches(relay_generation, relay_addr) {
+                        debug!(
+                            relay_generation,
+                            relay_addr = %relay_addr,
+                            "Relay re-advertise: dropping stale generation"
+                        );
+                        break;
+                    }
                     if let Some(mut entry) = self.connections.get_mut(&peer_addr) {
                         match entry
                             .value_mut()
@@ -6426,6 +6598,10 @@ impl NatTraversalEndpoint {
             if is_stale {
                 drop(entry);
                 self.connections.remove(&normalized_coordinator);
+                Self::untrack_connection_endpoint(
+                    &self.connection_endpoints,
+                    normalized_coordinator,
+                );
                 // Fall through to "establish new connection" below
             } else {
                 info!(
@@ -6473,9 +6649,11 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let connection_endpoints = self.connection_endpoints.clone();
                     let relay_server = self.relay_server.clone();
                     let relay_handler_connections = self.relay_handler_connections.clone();
                     let external_addr = our_external_address;
+                    let owner_endpoint = endpoint.clone();
 
                     tokio::spawn(async move {
                         // Use 10-second timeout to prevent indefinite waiting if coordinator is frozen
@@ -6499,6 +6677,11 @@ impl NatTraversalEndpoint {
                                 // Store the connection keyed by SocketAddr
                                 // DashMap provides lock-free .insert()
                                 connections.insert(coordinator_key, connection.clone());
+                                Self::track_connection_endpoint(
+                                    &connection_endpoints,
+                                    coordinator_key,
+                                    &owner_endpoint,
+                                );
                                 // Symmetric P2P: ensure the coordinator (which accepted)
                                 // can open CONNECT-UDP bidi streams toward us too.
                                 Self::spawn_relay_handler_task(
@@ -7212,6 +7395,7 @@ impl NatTraversalEndpoint {
         let remote_address = connection.remote_address();
         let connection_key = normalize_socket_addr(remote_address);
         self.connections.insert(connection_key, connection.clone());
+        Self::track_connection_endpoint(&self.connection_endpoints, connection_key, endpoint);
         // Symmetric P2P: this is a dial-side insert (we initiated via
         // `endpoint.connect`), so spawn the relay handler to mirror what
         // the accept-side does. Without this, a later

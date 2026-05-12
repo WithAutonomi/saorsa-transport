@@ -60,6 +60,8 @@ use crate::upnp::{UpnpConfig, UpnpMappingService};
 /// `nf_conntrack_udp_timeout_stream` is 120 s on Linux) and prevents
 /// the QUIC idle timeout from firing on the underlying connection.
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const RELAY_STREAM_BATCH_MAX_FRAMES: usize = 64;
+const RELAY_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 /// Capacity of the bounded channel between the UDP reader task and the
 /// stream writer task in Direction 1 (external → NATted node).  Sized
@@ -202,6 +204,19 @@ enum WriterItem {
     /// `[CONTROL_FRAME_MARKER][body_len]` header).  The writer
     /// prepends the header before sending.
     Control(Bytes),
+}
+
+fn append_relay_frame(out: &mut Vec<u8>, encoded: &Bytes) {
+    let frame_len = encoded.len() as u32;
+    out.extend_from_slice(&frame_len.to_be_bytes());
+    out.extend_from_slice(encoded);
+}
+
+fn append_control_frame(out: &mut Vec<u8>, body: &Bytes) {
+    let body_len = body.len() as u32;
+    out.extend_from_slice(&CONTROL_FRAME_MARKER.to_be_bytes());
+    out.extend_from_slice(&body_len.to_be_bytes());
+    out.extend_from_slice(body);
 }
 
 /// Configuration for the MASQUE relay server
@@ -1043,7 +1058,7 @@ impl MasqueRelayServer {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, source)) => {
                             let payload = Bytes::copy_from_slice(&buf[..len]);
-                            tracing::debug!(
+                            tracing::trace!(
                                 session_id,
                                 source = %source,
                                 len,
@@ -1116,7 +1131,7 @@ impl MasqueRelayServer {
                             };
                             match resolved {
                                 Some((target, payload)) => {
-                                    tracing::debug!(
+                                    tracing::trace!(
                                         session_id,
                                         target = %target,
                                         len = payload.len(),
@@ -1126,7 +1141,7 @@ impl MasqueRelayServer {
                                     server2.stats.record_datagram();
                                     match socket2.send_to(&payload, target).await {
                                         Ok(n) => {
-                                            tracing::debug!(
+                                            tracing::trace!(
                                                 session_id,
                                                 target = %target,
                                                 len = payload.len(),
@@ -1244,7 +1259,7 @@ impl MasqueRelayServer {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
                         let payload = Bytes::copy_from_slice(&buf[..len]);
-                        tracing::debug!(
+                        tracing::trace!(
                             session_id, source = %source, len,
                             "RELAY_TUNNEL[srv]: stream-loop dir1 recv UDP → forwarding to relay-client"
                         );
@@ -1254,12 +1269,12 @@ impl MasqueRelayServer {
                         stats.record_bytes(encoded.len() as u64);
                         stats.record_datagram();
                         if fwd_tx.send(WriterItem::Data(encoded)).await.is_err() {
-                            break; // writer closed
+                            return "writer_channel_closed";
                         }
                     }
                     Err(e) => {
                         tracing::debug!(session_id, error = %e, "UDP recv error");
-                        break;
+                        return "udp_recv_error";
                     }
                 }
             }
@@ -1273,36 +1288,50 @@ impl MasqueRelayServer {
             loop {
                 tokio::select! {
                     item = fwd_rx.recv() => {
-                        let Some(item) = item else { break };
+                        let Some(item) = item else {
+                            return "forward_channel_closed";
+                        };
                         match item {
                             WriterItem::Data(encoded) => {
-                                let frame_len = encoded.len() as u32;
-                                if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
-                                    tracing::debug!(session_id, error = %e, "Stream write error (length)");
-                                    break;
+                                let mut batch = Vec::with_capacity(
+                                    encoded
+                                        .len()
+                                        .saturating_add(std::mem::size_of::<u32>()),
+                                );
+                                append_relay_frame(&mut batch, &encoded);
+
+                                let mut frames = 1usize;
+                                while frames < RELAY_STREAM_BATCH_MAX_FRAMES
+                                    && batch.len() < RELAY_STREAM_BATCH_MAX_BYTES
+                                {
+                                    match fwd_rx.try_recv() {
+                                        Ok(WriterItem::Data(next)) => {
+                                            append_relay_frame(&mut batch, &next);
+                                            frames += 1;
+                                        }
+                                        Ok(WriterItem::Control(body)) => {
+                                            append_control_frame(&mut batch, &body);
+                                            break;
+                                        }
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                                    }
                                 }
-                                if let Err(e) = send_stream.write_all(&encoded).await {
-                                    tracing::debug!(session_id, error = %e, "Stream write error (data)");
-                                    break;
+
+                                if let Err(e) = send_stream.write_all(&batch).await {
+                                    tracing::debug!(session_id, error = %e, frames, bytes = batch.len(), "Stream batch write error");
+                                    return "stream_batch_write_error";
                                 }
                             }
                             WriterItem::Control(body) => {
-                                // Wire format: [4-byte BE marker][4-byte BE body_len][body]
-                                let body_len = body.len() as u32;
-                                if let Err(e) = send_stream
-                                    .write_all(&CONTROL_FRAME_MARKER.to_be_bytes())
-                                    .await
-                                {
-                                    tracing::debug!(session_id, error = %e, "Stream write error (control marker)");
-                                    break;
-                                }
-                                if let Err(e) = send_stream.write_all(&body_len.to_be_bytes()).await {
-                                    tracing::debug!(session_id, error = %e, "Stream write error (control len)");
-                                    break;
-                                }
-                                if let Err(e) = send_stream.write_all(&body).await {
-                                    tracing::debug!(session_id, error = %e, "Stream write error (control body)");
-                                    break;
+                                let mut frame = Vec::with_capacity(
+                                    body.len()
+                                        .saturating_add(std::mem::size_of::<u64>()),
+                                );
+                                append_control_frame(&mut frame, &body);
+                                if let Err(e) = send_stream.write_all(&frame).await {
+                                    tracing::debug!(session_id, error = %e, "Stream write error (control frame)");
+                                    return "stream_control_write_error";
                                 }
                             }
                         }
@@ -1310,25 +1339,41 @@ impl MasqueRelayServer {
                     _ = keepalive.tick() => {
                         if let Err(e) = send_stream.write_all(&keepalive_bytes).await {
                             tracing::debug!(session_id, error = %e, "Keepalive write error");
-                            break;
+                            return "keepalive_write_error";
                         }
                     }
                 }
             }
         });
 
-        tokio::select! {
-            _ = reader_handle => {},
-            _ = writer_handle => {},
+        let close_reason = tokio::select! {
+            result = reader_handle => {
+                match result {
+                    Ok(reason) => reason,
+                    Err(e) => {
+                        tracing::debug!(session_id, error = %e, "Relay UDP reader task join error");
+                        "reader_task_join_error"
+                    }
+                }
+            },
+            result = writer_handle => {
+                match result {
+                    Ok(reason) => reason,
+                    Err(e) => {
+                        tracing::debug!(session_id, error = %e, "Relay stream writer task join error");
+                        "writer_task_join_error"
+                    }
+                }
+            },
 
             // Direction 2: Stream → UDP (client → relay → target)
-            _ = async {
+            reason = async {
                 loop {
                     // Read 4-byte length prefix
                     let mut len_buf = [0u8; 4];
                     if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
                         tracing::debug!(session_id, error = %e, "Stream read error (length)");
-                        break;
+                        return "stream_read_length_error";
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
 
@@ -1348,21 +1393,21 @@ impl MasqueRelayServer {
                             frame_len,
                             "Corrupt stream frame length, closing session"
                         );
-                        break;
+                        return "corrupt_frame_length";
                     }
 
                     // Read frame data
                     let mut frame_buf = vec![0u8; frame_len];
                     if let Err(e) = recv_stream.read_exact(&mut frame_buf).await {
                         tracing::debug!(session_id, error = %e, "Stream read error (data)");
-                        break;
+                        return "stream_read_data_error";
                     }
 
                     // Decode and forward
                     let mut cursor = Bytes::from(frame_buf);
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 session_id, target = %datagram.target,
                                 len = datagram.payload.len(),
                                 "RELAY_TUNNEL[srv]: stream-loop dir2 recv from relay-client → sendto target"
@@ -1373,7 +1418,7 @@ impl MasqueRelayServer {
                             let payload_len = datagram.payload.len();
                             match socket2.send_to(&datagram.payload, target).await {
                                 Ok(n) => {
-                                    tracing::debug!(
+                                    tracing::trace!(
                                         session_id,
                                         target = %target,
                                         len = payload_len,
@@ -1425,10 +1470,14 @@ impl MasqueRelayServer {
                         }
                     }
                 }
-            } => {},
-        }
+            } => reason,
+        };
 
-        tracing::info!(session_id, "Stream-based relay forwarding loop ended");
+        tracing::info!(
+            session_id,
+            close_reason,
+            "Stream-based relay forwarding loop ended"
+        );
         if let Err(e) = self.close_session(session_id).await {
             tracing::debug!(session_id, error = %e, "Error closing session");
         }

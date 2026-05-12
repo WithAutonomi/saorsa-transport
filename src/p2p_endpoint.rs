@@ -52,9 +52,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -90,17 +91,17 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// event-driven reader-exit detection.
 const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Payload size above which QUIC sends are serialized per remote address.
-const LARGE_SEND_BACKPRESSURE_THRESHOLD: usize = 1024 * 1024;
-
-/// Number of large sends allowed in flight per remote address.
-const LARGE_SEND_PER_ADDR_PERMITS: usize = 1;
-
-/// Per-write chunk size used for stream write progress accounting.
-const STREAM_WRITE_CHUNK_SIZE: usize = 64 * 1024;
-
 /// Maximum time a QUIC stream write may make no forward progress.
 const STREAM_WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Payload size at or above which QUIC sends wait for the peer to acknowledge
+/// receipt of the full stream after `finish()`. Smaller payloads return as
+/// soon as the local stack has accepted the data, avoiding an extra RTT for
+/// small request/response traffic.
+const LARGE_SEND_DELIVERY_ACK_THRESHOLD: usize = 16 * 1024;
+
+/// Maximum number of inbound uni streams read concurrently per QUIC connection.
+const MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION: usize = 32;
 
 /// Application error code used when aborting a stuck/failed send stream.
 /// `0` is the conventional "generic abort, no specific application error"
@@ -112,7 +113,148 @@ const STREAM_RESET_ABORT_CODE: u32 = 0;
 /// through the pinhole needs only 1-2 RTTs (~600ms at 300ms worst-case RTT).
 const POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Extra time subscribers wait beyond the normal fallback strategy budget
+/// before treating an in-flight dial entry as stale.
+const PENDING_DIAL_WAIT_SLACK: Duration = Duration::from_secs(5);
+
+/// Capacity of the broadcast channel that fans an in-flight dial's outcome
+/// out to subscribers waiting on the same target. Sized for the small
+/// number of concurrent waiters we observe in practice; the channel only
+/// needs to hold the single result message the owner sends on completion.
+const PENDING_DIAL_BROADCAST_CAPACITY: usize = 4;
+
+static NEXT_PENDING_DIAL_ID: AtomicU64 = AtomicU64::new(1);
+
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
+
+type PendingDialResult = Result<(PeerConnection, ConnectionMethod), String>;
+type PendingDialMap = HashMap<SocketAddr, PendingDial>;
+
+struct PendingDial {
+    id: u64,
+    tx: broadcast::Sender<PendingDialResult>,
+    started_at: Instant,
+}
+
+/// Remove the pending-dial entry for `target` only if it is still the entry
+/// with the matching `id` (i.e. the caller still owns that slot). Returns the
+/// removed entry, or `None` if the slot was already gone or had been claimed
+/// by a newer dial.
+async fn remove_pending_dial_if_owned(
+    pending_dials: &tokio::sync::Mutex<PendingDialMap>,
+    target: SocketAddr,
+    id: u64,
+) -> Option<PendingDial> {
+    let mut pending = pending_dials.lock().await;
+    match pending.get(&target) {
+        Some(entry) if entry.id == id => pending.remove(&target),
+        _ => None,
+    }
+}
+
+struct PendingDialGuard {
+    pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
+    target: SocketAddr,
+    id: u64,
+    active: bool,
+}
+
+impl PendingDialGuard {
+    fn new(
+        pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
+        target: SocketAddr,
+        id: u64,
+    ) -> Self {
+        Self {
+            pending_dials,
+            target,
+            id,
+            active: true,
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        result: &Result<(PeerConnection, ConnectionMethod), EndpointError>,
+    ) {
+        if !self.active {
+            return;
+        }
+
+        let entry = remove_pending_dial_if_owned(&self.pending_dials, self.target, self.id).await;
+        self.active = false;
+
+        let Some(entry) = entry else {
+            return;
+        };
+
+        match result {
+            Ok((conn, method)) => {
+                let _ = entry.tx.send(Ok((conn.clone(), method.clone())));
+            }
+            Err(e) => {
+                let _ = entry.tx.send(Err(e.to_string()));
+            }
+        }
+    }
+}
+
+impl Drop for PendingDialGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let pending_dials = Arc::clone(&self.pending_dials);
+        let target = self.target;
+        let id = self.id;
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if remove_pending_dial_if_owned(&pending_dials, target, id)
+                    .await
+                    .is_some()
+                {
+                    debug!(
+                        "connect_with_fallback: cleared cancelled in-flight dial to {}",
+                        target
+                    );
+                }
+            });
+        }
+    }
+}
+
+fn pending_dial_wait_timeout(strategy_config: Option<&StrategyConfig>) -> Duration {
+    let strategy = strategy_config.cloned().unwrap_or_default();
+    let direct_budget = strategy
+        .direct_connect_timeout
+        .saturating_add(strategy.direct_handshake_timeout);
+    let holepunch_round_budget = strategy
+        .holepunch_timeout
+        .saturating_add(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT);
+    let holepunch_budget = if strategy.holepunch_enabled {
+        holepunch_round_budget.saturating_mul(strategy.max_holepunch_rounds)
+    } else {
+        Duration::ZERO
+    };
+    let relay_budget = if strategy.relay_enabled {
+        strategy.relay_timeout
+    } else {
+        Duration::ZERO
+    };
+
+    direct_budget
+        .saturating_add(holepunch_budget)
+        .saturating_add(relay_budget)
+        .saturating_add(PENDING_DIAL_WAIT_SLACK)
+}
+
+fn pending_dial_remaining_wait(wait_timeout: Duration, age: Duration) -> Option<Duration> {
+    wait_timeout
+        .checked_sub(age)
+        .filter(|remaining| !remaining.is_zero())
+}
 
 /// Extract the raw SPKI (SubjectPublicKeyInfo) bytes from a QUIC connection's
 /// peer identity, if TLS-based authentication was used.
@@ -246,12 +388,7 @@ pub struct P2pEndpoint {
     /// call does the actual connection work. Subsequent callers subscribe to a
     /// broadcast channel and wait for the result instead of starting parallel
     /// hole-punch attempts that deadlock the runtime.
-    pending_dials: Arc<
-        tokio::sync::Mutex<HashMap<SocketAddr, broadcast::Sender<Result<PeerConnection, String>>>>,
-    >,
-
-    /// Per-address semaphore used to serialize large QUIC stream messages.
-    large_send_permits: Arc<dashmap::DashMap<SocketAddr, Arc<Semaphore>>>,
+    pending_dials: Arc<tokio::sync::Mutex<PendingDialMap>>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
@@ -567,6 +704,8 @@ pub enum SendFailureStage {
     Write,
     /// The stream could not be finished after all bytes were queued.
     Finish,
+    /// The peer stopped the stream or the connection failed before delivery was acknowledged.
+    DeliveryAck,
 }
 
 impl std::fmt::Display for SendFailureStage {
@@ -577,6 +716,7 @@ impl std::fmt::Display for SendFailureStage {
             Self::WriteProgressTimeout => "write_progress_timeout",
             Self::Write => "write",
             Self::Finish => "finish",
+            Self::DeliveryAck => "delivery_ack",
         };
         f.write_str(label)
     }
@@ -655,14 +795,21 @@ async fn write_stream_with_progress_timeout(
     data: &[u8],
 ) -> Result<usize, EndpointError> {
     let mut bytes_written = 0usize;
+    let write_started = Instant::now();
+
+    debug!(
+        "send({}): starting QUIC stream write ({} bytes)",
+        addr,
+        data.len()
+    );
 
     while bytes_written < data.len() {
-        let end = bytes_written
-            .saturating_add(STREAM_WRITE_CHUNK_SIZE)
-            .min(data.len());
-        let slice = &data[bytes_written..end];
-
-        match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, send_stream.write(slice)).await {
+        match timeout(
+            STREAM_WRITE_PROGRESS_TIMEOUT,
+            send_stream.write(&data[bytes_written..]),
+        )
+        .await
+        {
             Ok(Ok(0)) => {
                 return Err(send_failed(
                     SendFailureStage::Write,
@@ -707,7 +854,285 @@ async fn write_stream_with_progress_timeout(
         }
     }
 
+    debug!(
+        "send({}): QUIC stream write completed ({} bytes in {:?})",
+        addr,
+        bytes_written,
+        write_started.elapsed()
+    );
+
     Ok(bytes_written)
+}
+
+async fn read_stream(
+    recv_stream: &mut crate::high_level::RecvStream,
+    addr: SocketAddr,
+    size_limit: usize,
+) -> Result<Vec<u8>, EndpointError> {
+    let mut read = Vec::new();
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    let read_started = Instant::now();
+
+    debug!(
+        "recv({}): starting QUIC stream read (limit {} bytes)",
+        addr, size_limit
+    );
+
+    loop {
+        match recv_stream.read_chunk(usize::MAX, false).await {
+            Ok(Some(chunk)) => {
+                let new_start = start.min(chunk.offset);
+                let chunk_end = chunk.offset.saturating_add(chunk.bytes.len() as u64);
+                let new_end = end.max(chunk_end);
+                if new_end.saturating_sub(new_start) > size_limit as u64 {
+                    warn!(
+                        "recv({}): stream exceeded read limit (limit {} bytes)",
+                        addr, size_limit
+                    );
+                    return Err(EndpointError::Connection(format!(
+                        "incoming stream exceeded read limit of {size_limit} bytes"
+                    )));
+                }
+                start = new_start;
+                end = new_end;
+                read.push((chunk.bytes, chunk.offset));
+            }
+            Ok(None) => {
+                if end == 0 {
+                    debug!("recv({}): QUIC stream read completed empty", addr);
+                    return Ok(Vec::new());
+                }
+
+                let mut buffer = vec![0; end.saturating_sub(start) as usize];
+                for (data, offset) in read {
+                    let offset = offset.saturating_sub(start) as usize;
+                    buffer[offset..offset + data.len()].copy_from_slice(&data);
+                }
+                debug!(
+                    "recv({}): QUIC stream read completed ({} bytes in {:?})",
+                    addr,
+                    buffer.len(),
+                    read_started.elapsed()
+                );
+                return Ok(buffer);
+            }
+            Err(e) => {
+                warn!("recv({}): stream read failed: {}", addr, e);
+                return Err(EndpointError::Connection(format!(
+                    "stream read failed: {e}"
+                )));
+            }
+        }
+    }
+}
+
+async fn wait_for_stream_delivery_ack(
+    send_stream: &crate::high_level::SendStream,
+    addr: SocketAddr,
+    bytes_written: usize,
+) -> Result<(), EndpointError> {
+    let ack_started = Instant::now();
+
+    debug!(
+        "send({}): waiting for peer to acknowledge QUIC stream delivery ({} bytes)",
+        addr, bytes_written
+    );
+
+    match send_stream.stopped().await {
+        Ok(None) => {
+            debug!(
+                "send({}): peer acknowledged QUIC stream delivery in {:?}",
+                addr,
+                ack_started.elapsed()
+            );
+            Ok(())
+        }
+        Ok(Some(error_code)) => {
+            warn!(
+                "send({}): peer stopped QUIC stream before delivery was acknowledged after {:?} (error_code={:?})",
+                addr,
+                ack_started.elapsed(),
+                error_code
+            );
+            Err(send_failed(
+                SendFailureStage::DeliveryAck,
+                bytes_written,
+                format!("peer stopped QUIC stream with error code {error_code:?}"),
+            ))
+        }
+        Err(e) => {
+            warn!(
+                "send({}): failed while waiting for QUIC stream delivery ack after {:?}: {}",
+                addr,
+                ack_started.elapsed(),
+                e
+            );
+            Err(send_failed(
+                SendFailureStage::DeliveryAck,
+                bytes_written,
+                e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InboundDataSendMode {
+    TrySendWithTimeout,
+    AwaitSend,
+}
+
+async fn dispatch_inbound_stream(
+    mut recv_stream: crate::high_level::RecvStream,
+    addr: SocketAddr,
+    data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    event_tx: broadcast::Sender<P2pEvent>,
+    max_read_bytes: usize,
+    reader_label: &'static str,
+    send_mode: InboundDataSendMode,
+) {
+    let data = match read_stream(&mut recv_stream, addr, max_read_bytes).await {
+        Ok(data) if data.is_empty() => return,
+        Ok(data) => data,
+        Err(e) => {
+            info!(
+                "Reader task for {}{}: stream read error: {}",
+                addr, reader_label, e
+            );
+            let _ = recv_stream.stop(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+            return;
+        }
+    };
+
+    let data_len = data.len();
+    debug!(
+        "Reader task{}: {} bytes from {}",
+        reader_label, data_len, addr
+    );
+
+    // Note: last_activity update moved out of the hot path to avoid
+    // RwLock write contention. With N reader tasks all acquiring
+    // write locks on every message, the lock becomes a bottleneck
+    // that can starve other tasks and deadlock the runtime.
+    // The DataReceived event below serves as a liveness signal.
+    let _ = event_tx.send(P2pEvent::DataReceived {
+        addr,
+        bytes: data_len,
+    });
+
+    match send_mode {
+        InboundDataSendMode::TrySendWithTimeout => {
+            // Send through channel without blocking the reader task's event loop.
+            // If the channel is full, wait briefly in this per-stream task. This
+            // keeps the accept loop free to keep accepting other QUIC uni streams.
+            match data_tx.try_send((addr, data)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full((addr, data))) => {
+                    let data_len = data.len();
+                    if tokio::time::timeout(Duration::from_secs(5), data_tx.send((addr, data)))
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            "Reader task for {}{}: data channel send timed out, dropping {} bytes",
+                            addr, reader_label, data_len
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(
+                        "Reader task for {}{}: channel closed, dropping {} bytes",
+                        addr, reader_label, data_len
+                    );
+                }
+            }
+        }
+        InboundDataSendMode::AwaitSend => {
+            if data_tx.send((addr, data)).await.is_err() {
+                debug!(
+                    "Reader task for {}{}: channel closed, dropping {} bytes",
+                    addr, reader_label, data_len
+                );
+            }
+        }
+    }
+}
+
+async fn run_quic_reader_task(
+    addr: SocketAddr,
+    connection: crate::high_level::Connection,
+    data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    event_tx: broadcast::Sender<P2pEvent>,
+    exit_tx: mpsc::UnboundedSender<(SocketAddr, usize)>,
+    max_read_bytes: usize,
+    reader_label: &'static str,
+    send_mode: InboundDataSendMode,
+) -> SocketAddr {
+    info!("Reader task STARTED for {}{}", addr, reader_label);
+
+    let stable_id = connection.stable_id();
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_INBOUND_STREAM_READS_PER_CONNECTION,
+    ));
+    let mut stream_tasks = tokio::task::JoinSet::new();
+
+    loop {
+        while let Some(result) = stream_tasks.try_join_next() {
+            if let Err(e) = result {
+                warn!(
+                    "Reader task for {}{}: stream worker failed: {}",
+                    addr, reader_label, e
+                );
+            }
+        }
+
+        if data_tx.is_closed() {
+            debug!(
+                "Reader task for {}{}: channel closed, exiting",
+                addr, reader_label
+            );
+            break;
+        }
+
+        let permit = match Arc::clone(&stream_permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+
+        let recv_stream = match connection.accept_uni().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                info!(
+                    "Reader task for {}{} ending: accept_uni error: {}",
+                    addr, reader_label, e
+                );
+                break;
+            }
+        };
+
+        let data_tx = data_tx.clone();
+        let event_tx = event_tx.clone();
+        stream_tasks.spawn(async move {
+            let _permit = permit;
+            dispatch_inbound_stream(
+                recv_stream,
+                addr,
+                data_tx,
+                event_tx,
+                max_read_bytes,
+                reader_label,
+                send_mode,
+            )
+            .await;
+        });
+    }
+
+    stream_tasks.abort_all();
+
+    // Notify the reader-exit handler for immediate cleanup.
+    let _ = exit_tx.send((addr, stable_id));
+    addr
 }
 
 /// Broadcast `P2pEvent::PeerConnected` for `addr` exactly once per
@@ -776,7 +1201,6 @@ async fn do_cleanup_connection(
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
     emitted_peer_connected: &dashmap::DashSet<SocketAddr>,
-    large_send_permits: &dashmap::DashMap<SocketAddr, Arc<Semaphore>>,
     addr: &SocketAddr,
     reason: DisconnectReason,
     expected_stable_id: Option<usize>,
@@ -832,7 +1256,6 @@ async fn do_cleanup_connection(
     // Allow a future reconnect to broadcast a fresh PeerConnected event.
     for candidate in &variants {
         emitted_peer_connected.remove(candidate);
-        large_send_permits.remove(candidate);
     }
 
     // Step 3: Remove and abort reader task (canonical lock #2)
@@ -1082,7 +1505,6 @@ impl P2pEndpoint {
             reader_handles,
             reader_exit_tx,
             pending_dials: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            large_send_permits: Arc::new(dashmap::DashMap::new()),
         };
 
         // Spawn background constrained poller task
@@ -1566,37 +1988,89 @@ impl P2pEndpoint {
         }
 
         // Dedup: if another task is already connecting to this target, wait for
-        // its result instead of starting a parallel attempt. This prevents
-        // multiple concurrent hole-punch sessions that deadlock the runtime.
+        // its result instead of starting a parallel attempt. The wait is
+        // bounded and the owner installs a cancellation guard, so a dropped
+        // owner future cannot leave a permanent in-flight entry behind.
         let target = target_ipv4.or(target_ipv6);
+        let mut pending_guard = None;
         if let Some(target_addr) = target {
-            let mut pending = self.pending_dials.lock().await;
-            if let Some(tx) = pending.get(&target_addr) {
-                // Another task is already connecting — subscribe and wait
-                let mut rx = tx.subscribe();
-                drop(pending);
-                info!(
-                    "connect_with_fallback: waiting for in-flight dial to {}",
-                    target_addr
-                );
-                match rx.recv().await {
-                    Ok(Ok(conn)) => {
-                        return Ok((
-                            conn,
-                            ConnectionMethod::HolePunched {
-                                coordinator: target_addr,
-                            },
-                        ));
+            let wait_timeout = pending_dial_wait_timeout(strategy_config.as_ref());
+
+            loop {
+                let mut pending = self.pending_dials.lock().await;
+                if let Some(entry) = pending.get(&target_addr) {
+                    let pending_id = entry.id;
+                    let started_at = entry.started_at;
+                    let age = started_at.elapsed();
+                    let Some(remaining_wait) = pending_dial_remaining_wait(wait_timeout, age)
+                    else {
+                        pending.remove(&target_addr);
+                        drop(pending);
+                        warn!(
+                            "connect_with_fallback: in-flight dial to {} already stale (age {:?}, timeout {:?}); retrying locally",
+                            target_addr, age, wait_timeout
+                        );
+                        continue;
+                    };
+                    let mut rx = entry.tx.subscribe();
+                    drop(pending);
+
+                    info!(
+                        "connect_with_fallback: waiting for in-flight dial to {} (age {:?}, remaining {:?}, timeout {:?})",
+                        target_addr, age, remaining_wait, wait_timeout
+                    );
+
+                    match timeout(remaining_wait, rx.recv()).await {
+                        Ok(Ok(Ok(result))) => return Ok(result),
+                        Ok(Ok(Err(err))) => {
+                            debug!(
+                                "connect_with_fallback: in-flight dial to {} failed: {}; retrying locally",
+                                target_addr, err
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            debug!(
+                                "connect_with_fallback: in-flight dial to {} ended without a result: {}; retrying locally",
+                                target_addr, err
+                            );
+                        }
+                        Err(_) => {
+                            let total_age = started_at.elapsed();
+                            warn!(
+                                "connect_with_fallback: in-flight dial to {} stale after {:?} (timeout {:?}); retrying locally",
+                                target_addr, total_age, wait_timeout
+                            );
+                            remove_pending_dial_if_owned(
+                                &self.pending_dials,
+                                target_addr,
+                                pending_id,
+                            )
+                            .await;
+                        }
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        // Primary dial failed — fall through and try ourselves
-                    }
+
+                    continue;
                 }
-            } else {
-                // We're the first — register ourselves
-                let (tx, _) = broadcast::channel(4);
-                pending.insert(target_addr, tx);
+
+                // We're the first — register ourselves.
+                let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+                let id = NEXT_PENDING_DIAL_ID.fetch_add(1, Ordering::Relaxed);
+                pending.insert(
+                    target_addr,
+                    PendingDial {
+                        id,
+                        tx,
+                        started_at: Instant::now(),
+                    },
+                );
                 drop(pending);
+
+                pending_guard = Some(PendingDialGuard::new(
+                    Arc::clone(&self.pending_dials),
+                    target_addr,
+                    id,
+                ));
+                break;
             }
         }
 
@@ -1606,18 +2080,8 @@ impl P2pEndpoint {
             .await;
 
         // Broadcast result to any waiters and clean up pending entry
-        if let Some(target_addr) = target {
-            let mut pending = self.pending_dials.lock().await;
-            if let Some(tx) = pending.remove(&target_addr) {
-                match &result {
-                    Ok((conn, _)) => {
-                        let _ = tx.send(Ok(conn.clone()));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e.to_string()));
-                    }
-                }
-            }
+        if let Some(guard) = pending_guard.as_mut() {
+            guard.complete(&result).await;
         }
 
         result
@@ -2548,7 +3012,6 @@ impl P2pEndpoint {
             &*self.stats,
             &self.event_tx,
             &self.emitted_peer_connected,
-            &self.large_send_permits,
             addr,
             reason,
             None,
@@ -2577,6 +3040,11 @@ impl P2pEndpoint {
     // === Messaging ===
 
     /// Send data to a peer
+    ///
+    /// For QUIC connections with payloads at or above
+    /// `LARGE_SEND_DELIVERY_ACK_THRESHOLD` bytes, this waits for the peer to
+    /// acknowledge receipt of the full stream before returning. Smaller
+    /// payloads return as soon as the local stack has accepted the data.
     ///
     /// # Transport Selection
     ///
@@ -2614,6 +3082,10 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
+        self.send_inner(addr, data).await
+    }
+
+    async fn send_inner(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -2710,31 +3182,10 @@ impl P2pEndpoint {
                     return Err(EndpointError::PeerNotFound(*addr));
                 }
 
-                let _large_send_permit = if data.len() >= LARGE_SEND_BACKPRESSURE_THRESHOLD {
-                    let permit_key = match transport_addr {
-                        TransportAddr::Quic(addr) => normalize_socket_addr(addr),
-                        _ => normalize_socket_addr(*addr),
-                    };
-                    let semaphore = self
-                        .large_send_permits
-                        .entry(permit_key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(LARGE_SEND_PER_ADDR_PERMITS)))
-                        .clone();
-                    debug!(
-                        "send({}): waiting for large-send permit ({} bytes)",
-                        permit_key,
-                        data.len()
-                    );
-                    Some(
-                        semaphore
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| EndpointError::ShuttingDown)?,
-                    )
-                } else {
-                    None
-                };
+                let send_started = Instant::now();
 
+                let open_uni_started = Instant::now();
+                debug!("send({}): opening QUIC uni stream", addr);
                 let mut send_stream =
                     match timeout(STREAM_WRITE_PROGRESS_TIMEOUT, connection.open_uni()).await {
                         Ok(Ok(stream)) => stream,
@@ -2761,6 +3212,11 @@ impl P2pEndpoint {
                             ));
                         }
                     };
+                debug!(
+                    "send({}): opened QUIC uni stream in {:?}",
+                    addr,
+                    open_uni_started.elapsed()
+                );
 
                 let bytes_written =
                     match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
@@ -2772,12 +3228,31 @@ impl P2pEndpoint {
                         }
                     };
 
+                let finish_started = Instant::now();
+                debug!(
+                    "send({}): finishing QUIC uni stream after writing {} bytes",
+                    addr, bytes_written
+                );
                 send_stream.finish().map_err(|e| {
                     warn!("send({}): finish failed: {}", addr, e);
                     send_failed(SendFailureStage::Finish, bytes_written, e.to_string())
                 })?;
+                debug!(
+                    "send({}): finished QUIC uni stream in {:?}",
+                    addr,
+                    finish_started.elapsed()
+                );
 
-                debug!("Sent {} bytes to {} via QUIC", data.len(), addr);
+                if data.len() >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
+                    wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
+                }
+
+                debug!(
+                    "Sent {} bytes to {} via QUIC (send path took {:?})",
+                    data.len(),
+                    addr,
+                    send_started.elapsed()
+                );
             }
             crate::transport::ProtocolEngine::Constrained => {
                 // Check if we have an established constrained connection for this address
@@ -3093,7 +3568,6 @@ impl P2pEndpoint {
         // Abort all background reader tasks
         self.reader_tasks.lock().await.abort_all();
         self.reader_handles.write().await.clear();
-        self.large_send_permits.clear();
 
         // Disconnect all peers
         let addrs: Vec<SocketAddr> = self.connected_peers.read().await.keys().copied().collect();
@@ -3131,79 +3605,16 @@ impl P2pEndpoint {
         let max_read_bytes = self.config.max_message_size;
         let exit_tx = self.reader_exit_tx.clone();
 
-        let abort_handle = self.reader_tasks.lock().await.spawn(async move {
-            info!("Reader task STARTED for {}", addr);
-
-            loop {
-                // Accept the next unidirectional stream
-                let mut recv_stream = match connection.accept_uni().await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        info!("Reader task for {} ending: accept_uni error: {}", addr, e);
-                        break;
-                    }
-                };
-
-                let data = match recv_stream.read_to_end(max_read_bytes).await {
-                    Ok(data) if data.is_empty() => continue,
-                    Ok(data) => data,
-                    Err(e) => {
-                        info!("Reader task for {}: read_to_end error: {}", addr, e);
-                        break;
-                    }
-                };
-
-                let data_len = data.len();
-                debug!("Reader task: {} bytes from {}", data_len, addr);
-
-                // Note: last_activity update moved out of the hot path to avoid
-                // RwLock write contention. With N reader tasks all acquiring
-                // write locks on every message, the lock becomes a bottleneck
-                // that can starve other tasks and deadlock the runtime.
-                // The DataReceived event below serves as a liveness signal.
-
-                // Emit DataReceived event
-                let _ = event_tx.send(P2pEvent::DataReceived {
-                    addr,
-                    bytes: data_len,
-                });
-
-                // Send through channel without blocking the reader task's
-                // event loop. Using try_send avoids holding a tokio worker
-                // thread when the channel is full. If the channel is full,
-                // spawn a short-lived task that retries with a timeout instead
-                // of dropping data immediately.
-                match data_tx.try_send((addr, data)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full((addr, data))) => {
-                        let tx = data_tx.clone();
-                        let data_len = data.len();
-                        tokio::spawn(async move {
-                            if tokio::time::timeout(
-                                Duration::from_secs(5),
-                                tx.send((addr, data)),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                warn!(
-                                    "Reader task for {}: data channel send timed out, dropping {} bytes",
-                                    addr, data_len
-                                );
-                            }
-                        });
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!("Reader task for {}: channel closed, exiting", addr);
-                        break;
-                    }
-                }
-            }
-
-            // Notify the reader-exit handler for immediate cleanup.
-            let _ = exit_tx.send((addr, connection.stable_id()));
-            addr
-        });
+        let abort_handle = self.reader_tasks.lock().await.spawn(run_quic_reader_task(
+            addr,
+            connection,
+            data_tx,
+            event_tx,
+            exit_tx,
+            max_read_bytes,
+            "",
+            InboundDataSendMode::TrySendWithTimeout,
+        ));
 
         let key = normalize_socket_addr(addr);
         if let Some(old) = self.reader_handles.write().await.insert(key, abort_handle) {
@@ -3402,7 +3813,6 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
-        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3432,7 +3842,6 @@ impl P2pEndpoint {
                     &stats,
                     &event_tx,
                     &emitted_peer_connected,
-                    &large_send_permits,
                     &addr,
                     DisconnectReason::Timeout,
                     Some(stable_id),
@@ -3463,7 +3872,6 @@ impl P2pEndpoint {
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
         let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
-        let large_send_permits = Arc::clone(&self.large_send_permits);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3505,7 +3913,6 @@ impl P2pEndpoint {
                         &stats,
                         &event_tx,
                         &emitted_peer_connected,
-                        &large_send_permits,
                         addr,
                         DisconnectReason::Timeout,
                         None,
@@ -3674,44 +4081,16 @@ impl P2pEndpoint {
                     let event_tx = event_tx.clone();
                     let exit_tx = reader_exit_tx.clone();
 
-                    let abort_handle = reader_tasks.lock().await.spawn(async move {
-                        info!("Reader task STARTED for {} (via forwarder)", addr);
-
-                        loop {
-                            let mut recv_stream = match conn.accept_uni().await {
-                                Ok(stream) => stream,
-                                Err(e) => {
-                                    info!("Reader task for {} (forwarder) ending: accept_uni error: {}", addr, e);
-                                    break;
-                                }
-                            };
-
-                            let data = match recv_stream.read_to_end(max_read_bytes).await {
-                                Ok(data) if data.is_empty() => continue,
-                                Ok(data) => data,
-                                Err(e) => {
-                                    info!("Reader task for {} (forwarder): read_to_end error: {}", addr, e);
-                                    break;
-                                }
-                            };
-
-                            let data_len = data.len();
-                            debug!("Reader task (forwarder): {} bytes from {}", data_len, addr);
-
-                            let _ = event_tx.send(P2pEvent::DataReceived {
-                                addr,
-                                bytes: data_len,
-                            });
-
-                            if data_tx.send((addr, data)).await.is_err() {
-                                debug!("Reader task for {} (forwarder): channel closed, exiting", addr);
-                                break;
-                            }
-                        }
-
-                        let _ = exit_tx.send((addr, conn.stable_id()));
-                        addr
-                    });
+                    let abort_handle = reader_tasks.lock().await.spawn(run_quic_reader_task(
+                        addr,
+                        conn,
+                        data_tx,
+                        event_tx,
+                        exit_tx,
+                        max_read_bytes,
+                        " (forwarder)",
+                        InboundDataSendMode::AwaitSend,
+                    ));
 
                     let key = normalize_socket_addr(addr);
                     if let Some(old) = reader_handles.write().await.insert(key, abort_handle) {
@@ -3769,7 +4148,6 @@ impl Clone for P2pEndpoint {
             reader_handles: Arc::clone(&self.reader_handles),
             reader_exit_tx: self.reader_exit_tx.clone(),
             pending_dials: Arc::clone(&self.pending_dials),
-            large_send_permits: Arc::clone(&self.large_send_permits),
         }
     }
 }
@@ -3777,6 +4155,176 @@ impl Clone for P2pEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pending_dial_wait_timeout_covers_default_strategy_budget() {
+        let strategy = StrategyConfig::default();
+        let wait = pending_dial_wait_timeout(Some(&strategy));
+
+        let direct = strategy.direct_connect_timeout + strategy.direct_handshake_timeout;
+        let holepunch_round = strategy.holepunch_timeout + POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT;
+        let holepunch = holepunch_round * strategy.max_holepunch_rounds;
+        let expected = direct + holepunch + strategy.relay_timeout + PENDING_DIAL_WAIT_SLACK;
+        assert_eq!(wait, expected);
+    }
+
+    #[test]
+    fn test_pending_dial_wait_timeout_excludes_disabled_stages() {
+        let strategy = StrategyConfig {
+            holepunch_enabled: false,
+            relay_enabled: false,
+            ..StrategyConfig::default()
+        };
+        let wait = pending_dial_wait_timeout(Some(&strategy));
+
+        let direct = strategy.direct_connect_timeout + strategy.direct_handshake_timeout;
+        assert_eq!(wait, direct + PENDING_DIAL_WAIT_SLACK);
+    }
+
+    #[test]
+    fn test_pending_dial_remaining_wait_subtracts_age() {
+        let wait_timeout = Duration::from_secs(30);
+        let age = Duration::from_secs(12);
+
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, age),
+            Some(Duration::from_secs(18))
+        );
+    }
+
+    #[test]
+    fn test_pending_dial_remaining_wait_expires_stale_entries() {
+        let wait_timeout = Duration::from_secs(30);
+
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, wait_timeout),
+            None
+        );
+        assert_eq!(
+            pending_dial_remaining_wait(wait_timeout, wait_timeout + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_complete_broadcasts_and_clears_entry() {
+        let target: SocketAddr = "127.0.0.1:12345".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let mut rx = tx.subscribe();
+        let id = 42;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut guard = PendingDialGuard::new(Arc::clone(&pending_dials), target, id);
+        let conn = PeerConnection {
+            public_key: None,
+            remote_addr: TransportAddr::Quic(target),
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+        let result = Ok((conn.clone(), ConnectionMethod::DirectIPv4));
+
+        guard.complete(&result).await;
+
+        assert!(pending_dials.lock().await.is_empty());
+        let (received_conn, received_method) = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("pending dial result sent")
+            .expect("pending dial broadcast open")
+            .expect("pending dial succeeded");
+        assert_eq!(received_conn.remote_addr, conn.remote_addr);
+        assert_eq!(received_method, ConnectionMethod::DirectIPv4);
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_drop_clears_owned_entry() {
+        let target: SocketAddr = "127.0.0.1:12346".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let id = 43;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let guard = PendingDialGuard::new(Arc::clone(&pending_dials), target, id);
+        drop(guard);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_dials.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending dial guard cleared entry");
+    }
+
+    #[tokio::test]
+    async fn test_pending_dial_guard_abort_during_complete_clears_owned_entry() {
+        let target: SocketAddr = "127.0.0.1:12347".parse().expect("valid addr");
+        let pending_dials = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+        let id = 44;
+
+        {
+            let mut pending = pending_dials.lock().await;
+            pending.insert(
+                target,
+                PendingDial {
+                    id,
+                    tx,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let pending_lock = pending_dials.lock().await;
+        let pending_dials_for_task = Arc::clone(&pending_dials);
+        let handle = tokio::spawn(async move {
+            let mut guard = PendingDialGuard::new(pending_dials_for_task, target, id);
+            let result: Result<(PeerConnection, ConnectionMethod), EndpointError> =
+                Err(EndpointError::Timeout);
+            guard.complete(&result).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        drop(pending_lock);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_dials.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted pending dial guard cleared entry");
+    }
 
     #[test]
     fn test_endpoint_stats_default() {
