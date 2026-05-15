@@ -40,6 +40,7 @@ fn test_peer_config() -> NatTraversalConfig {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     }
 }
 
@@ -67,6 +68,7 @@ fn test_server_config() -> NatTraversalConfig {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     }
 }
 
@@ -117,6 +119,7 @@ async fn test_error_handling_no_panic() {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -148,6 +151,7 @@ async fn test_error_handling_no_panic() {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -242,6 +246,7 @@ async fn test_malformed_config_handling() {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     };
 
     let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
@@ -274,6 +279,7 @@ async fn test_malformed_config_handling() {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -313,6 +319,7 @@ async fn test_input_sanitization() {
         upnp: Default::default(),
         advertise_external_addresses: true,
         congestion_algorithm: Default::default(),
+        probe_advertised_addresses: false,
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -387,6 +394,7 @@ mod specific_regression_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         // Should not panic and should handle random port selection
@@ -441,6 +449,7 @@ mod specific_regression_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         // Should not panic, even if configuration is inconsistent

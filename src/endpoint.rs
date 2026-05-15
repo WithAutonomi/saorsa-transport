@@ -116,6 +116,30 @@ pub struct Endpoint {
     /// Pending peer address updates from ADD_ADDRESS frames.
     /// Each entry is (peer_connection_addr, new_advertised_addr).
     pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
+    /// Pending reachability-probe requests for `ADD_ADDRESS`-derived
+    /// candidates whose connection has the probe gate enabled. The
+    /// high-level layer drains these, runs a single short-timeout QUIC
+    /// Initial probe per entry, and delivers the result back via
+    /// `relay_event_to_connection` with an `AdvertisedAddressProbeResult`
+    /// connection event.
+    pending_address_probes: Vec<PendingAddressProbe>,
+}
+
+/// Queued reachability-probe request emitted by a connection that has the
+/// `probe_advertised_addresses` gate enabled.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAddressProbe {
+    /// Connection that asked for the probe (used to route the result back).
+    pub(crate) source: ConnectionHandle,
+    /// Connected peer that advertised this candidate.
+    pub(crate) peer_addr: SocketAddr,
+    /// Candidate address to probe.
+    pub(crate) candidate_addr: SocketAddr,
+    /// Local-only PeerId fingerprint of the advertiser. Carried so a
+    /// follow-up PR can wire failed probes into trust/reputation events.
+    /// Currently diagnostic only.
+    #[allow(dead_code)]
+    pub(crate) advertiser: [u8; 32],
 }
 
 /// Deterministic 32-byte wire ID from a SocketAddr, used to correlate
@@ -162,6 +186,7 @@ impl Endpoint {
             pending_relay_events: Vec::new(),
             pending_hole_punch_addrs: Vec::new(),
             pending_peer_address_updates: Vec::new(),
+            pending_address_probes: Vec::new(),
         }
     }
 
@@ -242,6 +267,36 @@ impl Endpoint {
         &mut self,
     ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
         self.pending_peer_address_updates.drain(..)
+    }
+
+    /// Drain pending reachability-probe requests for ADD_ADDRESS-derived
+    /// candidates. The high-level layer is expected to dispatch a single
+    /// short-timeout QUIC Initial probe per entry and feed the result back
+    /// via [`Endpoint::deliver_advertised_address_probe_result`].
+    pub(crate) fn drain_address_probes(
+        &mut self,
+    ) -> impl Iterator<Item = PendingAddressProbe> + '_ {
+        self.pending_address_probes.drain(..)
+    }
+
+    /// Queue an `AdvertisedAddressProbeResult` connection event for the
+    /// originating connection. Returns `false` when the connection is no
+    /// longer alive (in which case the result is silently dropped).
+    pub(crate) fn deliver_advertised_address_probe_result(
+        &mut self,
+        ch: ConnectionHandle,
+        candidate_addr: SocketAddr,
+        reachable: bool,
+    ) -> bool {
+        if self.connections.get(ch.0).is_none() {
+            return false;
+        }
+        let event = ConnectionEvent(ConnectionEventInner::AdvertisedAddressProbeResult {
+            candidate_addr,
+            reachable,
+        });
+        self.pending_relay_events.push((ch, event));
+        true
     }
 
     /// Set the peer ID for an existing connection
@@ -419,6 +474,52 @@ impl Endpoint {
                 );
                 self.pending_peer_address_updates
                     .push((peer_addr, advertised_addr));
+            }
+            ProbeAdvertisedAddress {
+                peer_addr,
+                candidate_addr,
+                advertiser,
+            } => {
+                // Cap the in-flight probe queue. With the gate enabled, a
+                // peer flooding ADD_ADDRESS frames would otherwise grow
+                // this Vec without bound until the next drain (and worse,
+                // each probe spawns a real QUIC handshake — see the
+                // KNOWN LIMITATION comment in
+                // `NatTraversalEndpoint::run_single_address_probe`).
+                //
+                // Per-address dedup short-circuits floods of the same
+                // candidate so retries cost O(1) per unique address.
+                const MAX_PENDING_ADDRESS_PROBES: usize = 256;
+                let already_queued = self
+                    .pending_address_probes
+                    .iter()
+                    .any(|p| p.candidate_addr == candidate_addr);
+                if already_queued {
+                    tracing::debug!(
+                        "address probe: already queued for {} (advertiser_conn={}), dropping duplicate",
+                        candidate_addr,
+                        peer_addr
+                    );
+                } else if self.pending_address_probes.len() >= MAX_PENDING_ADDRESS_PROBES {
+                    tracing::warn!(
+                        "address probe: queue full ({} pending), dropping probe for {} (advertiser_conn={})",
+                        self.pending_address_probes.len(),
+                        candidate_addr,
+                        peer_addr
+                    );
+                } else {
+                    tracing::info!(
+                        "Queueing reachability probe for ADD_ADDRESS candidate {} (advertiser_conn={})",
+                        candidate_addr,
+                        peer_addr
+                    );
+                    self.pending_address_probes.push(PendingAddressProbe {
+                        source: ch,
+                        peer_addr,
+                        candidate_addr,
+                        advertiser,
+                    });
+                }
             }
             InitiateHolePunch { peer_address } => {
                 // Queue a hole-punch connection attempt as a relay event.

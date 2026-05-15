@@ -429,6 +429,12 @@ pub struct NatTraversalEndpoint {
     /// Channel for receiving peer address updates (ADD_ADDRESS → DHT bridge)
     pub(crate) peer_address_update_rx:
         TokioMutex<mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+    /// Channel for receiving ADD_ADDRESS reachability-probe requests from
+    /// the low-level endpoint. Drained by [`Self::run_address_probe_loop`],
+    /// which spawns one short-timeout dial per request and feeds the result
+    /// back via [`crate::high_level::Endpoint::deliver_address_probe_result`].
+    pub(crate) address_probe_rx:
+        TokioMutex<mpsc::UnboundedReceiver<crate::endpoint::PendingAddressProbe>>,
     /// Server config cloned at endpoint creation time for building the
     /// relay endpoint in [`setup_proactive_relay`].
     relay_server_config: Arc<std::sync::Mutex<Option<crate::ServerConfig>>>,
@@ -698,6 +704,26 @@ pub struct NatTraversalConfig {
     /// Default: [`CongestionAlgorithm::Bbr2`].
     #[serde(default)]
     pub congestion_algorithm: CongestionAlgorithm,
+
+    /// Gate `ADD_ADDRESS`-derived candidates on a sub-second QUIC Initial
+    /// reachability probe before allowing them to consume `PATH_CHALLENGE`
+    /// validation budget.
+    ///
+    /// Closes a measured amplification vector: in production (24 ant-node
+    /// v0.11.3 hosts, 3 h 47 m window) one peer (`5.250.190.226`) advertised
+    /// an unreachable BLAKE3-binding attacker IP (`75.48.86.24`) via
+    /// `ADD_ADDRESS`. Receivers admitted it with no reachability check and
+    /// dialed it 35 592 times across the fleet.
+    ///
+    /// Loopback addresses always skip the probe (devnet correctness). The
+    /// probe is fire-and-forget on a spawned task and does NOT block
+    /// `ADD_ADDRESS` frame processing.
+    ///
+    /// Default: `false` (preserves existing behaviour). Will be flipped to
+    /// `true` in a follow-up release once measurement confirms latency
+    /// impact is within budget.
+    #[serde(default)]
+    pub probe_advertised_addresses: bool,
 }
 
 fn default_advertise_external_addresses() -> bool {
@@ -1114,6 +1140,9 @@ impl CandidateAddress {
             CandidateState::Valid => self.priority,
             CandidateState::New => self.priority.saturating_sub(10),
             CandidateState::Validating => self.priority.saturating_sub(5),
+            // Probing candidates are awaiting an out-of-band reachability
+            // check and must not influence pair selection.
+            CandidateState::Probing => 0,
             CandidateState::Failed => 0,
             CandidateState::Removed => 0,
         }
@@ -1343,6 +1372,7 @@ impl Default for NatTraversalConfig {
             upnp: crate::upnp::UpnpConfig::default(),
             advertise_external_addresses: true,
             congestion_algorithm: CongestionAlgorithm::default(),
+            probe_advertised_addresses: false,
         }
     }
 }
@@ -1665,6 +1695,10 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for ADD_ADDRESS reachability-probe requests
+        let (probe_tx, probe_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_address_probe_tx(probe_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(HANDSHAKE_CHANNEL_CAPACITY);
 
@@ -1692,6 +1726,7 @@ impl NatTraversalEndpoint {
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
+            address_probe_rx: TokioMutex::new(probe_rx),
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2105,6 +2140,10 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for ADD_ADDRESS reachability-probe requests
+        let (probe_tx, probe_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_address_probe_tx(probe_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(HANDSHAKE_CHANNEL_CAPACITY);
 
@@ -2132,6 +2171,7 @@ impl NatTraversalEndpoint {
             transport_candidates: Arc::new(dashmap::DashMap::new()),
             transport_registry,
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
+            address_probe_rx: TokioMutex::new(probe_rx),
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2990,6 +3030,7 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.probe_advertised_addresses(config.probe_advertised_addresses);
 
             server_config.transport_config(Arc::new(transport_config));
 
@@ -3071,6 +3112,7 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.probe_advertised_addresses(config.probe_advertised_addresses);
 
             client_config.transport_config(Arc::new(transport_config));
 
@@ -6924,6 +6966,150 @@ impl NatTraversalEndpoint {
                 });
             }
         }
+    }
+
+    /// Drain queued ADD_ADDRESS reachability-probe requests and dispatch a
+    /// single short-timeout dial per candidate on a spawned task. Probe
+    /// completion delivers an `AdvertisedAddressProbeResult` ConnectionEvent
+    /// back to the originating connection.
+    ///
+    /// Called from the same poll cadence as
+    /// [`Self::process_pending_peer_address_updates`]. The dispatch loop
+    /// itself does not block on probe results — each probe runs on its own
+    /// `tokio::spawn` future with a 250 ms timeout.
+    pub async fn process_pending_address_probes(&self) {
+        let endpoint = match self.inner_endpoint.as_ref() {
+            Some(ep) => ep.clone(),
+            None => return,
+        };
+        let mut rx = self.address_probe_rx.lock().await;
+        while let Ok(probe) = rx.try_recv() {
+            let endpoint_for_task = endpoint.clone();
+            tokio::spawn(async move {
+                Self::run_single_address_probe(endpoint_for_task, probe).await;
+            });
+        }
+    }
+
+    /// Run a single ADD_ADDRESS reachability probe.
+    ///
+    /// Sends one QUIC Initial via `endpoint.connect()` and waits up to
+    /// 250 ms for the handshake to make progress. The result is delivered
+    /// back to the originating connection regardless of outcome:
+    ///
+    /// - Reachable → originating connection promotes the `Probing`
+    ///   candidate to `New` and triggers `PATH_CHALLENGE`.
+    /// - Unreachable → originating connection drops the candidate.
+    ///
+    /// If the connection is gone (peer disconnected before the probe
+    /// finished) the result is silently dropped.
+    async fn run_single_address_probe(
+        endpoint: crate::high_level::Endpoint,
+        probe: crate::endpoint::PendingAddressProbe,
+    ) {
+        // Match the existing cross-region connect budget rather than
+        // picking something tighter — saorsa-core's transport adapter uses
+        // 1250ms for `DIRECT_CONNECT_TIMEOUT` (see saorsa-core
+        // `src/transport/saorsa_transport_adapter.rs`). A tighter budget
+        // here would fail every legitimate cross-region candidate (lon1 →
+        // syd1 ~280ms one-way + ML-KEM-768 / ML-DSA-65 multi-packet
+        // handshake easily blows out 250ms).
+        const PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
+        // Hard ceiling to also cover the case where a slow handshake
+        // races past PROBE_TIMEOUT. If the handshake genuinely takes
+        // longer than this we close the connection and report the
+        // candidate as unreachable — better to drop a slow legitimate
+        // peer than to leak a `ConnectionDriver` into the registry until
+        // QUIC's own idle timer reaps it.
+        const PROBE_HARD_CEILING: Duration = Duration::from_secs(5);
+
+        let candidate = probe.candidate_addr;
+        let source = probe.source;
+
+        // Defensive: re-check loopback on the consumer side. Loopback
+        // probes should never reach this code (the connection layer
+        // short-circuits them) but we never want to spawn a probe at
+        // ourselves.
+        if candidate.ip().is_loopback() {
+            debug!(
+                "address probe: skipping loopback candidate {} (advertiser_conn={})",
+                candidate, probe.peer_addr
+            );
+            // Treat loopback-as-reachable so the connection promotes it
+            // (matches the loopback-skip path in handle_add_address).
+            endpoint.deliver_address_probe_result(source, candidate, true);
+            return;
+        }
+
+        // Use "localhost" as the SNI: saorsa uses Pure PQC Raw Public Key
+        // authentication, so the SNI is purely a placeholder and matches
+        // the convention of other internal `endpoint.connect()` callers
+        // (`attempt_connection_to_candidate`, hole-punch dials, etc.).
+        let connecting = match endpoint.connect(candidate, "localhost") {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "address probe: connect() rejected for {} (advertiser_conn={}): {}",
+                    candidate, probe.peer_addr, e
+                );
+                endpoint.deliver_address_probe_result(source, candidate, false);
+                return;
+            }
+        };
+
+        // Race the handshake against PROBE_TIMEOUT. Use the wider
+        // PROBE_HARD_CEILING for the await itself so a slow-but-eventual
+        // success still settles cleanly (we close it on success, see
+        // below), then narrow down to PROBE_TIMEOUT for the
+        // report-as-reachable decision. This keeps the connection-driver
+        // leak bounded by PROBE_HARD_CEILING rather than the full QUIC
+        // handshake timeout (~30s).
+        //
+        // KNOWN LIMITATION: when the handshake takes longer than
+        // PROBE_HARD_CEILING the underlying `ConnectionDriver` keeps
+        // polling QUIC retransmits until the QUIC idle timer reaps it.
+        // This is bounded per probe but uncapped fleet-wide; the
+        // companion bounded-queue + in-flight-dedup guard
+        // (`pending_address_probes`) caps the steady-state cost. A
+        // future refactor to expose a probe-only `Endpoint::probe_addr`
+        // that uses raw UDP would eliminate the residual leak entirely.
+        let probe_started = std::time::Instant::now();
+        let probe_result = tokio::time::timeout(PROBE_HARD_CEILING, connecting).await;
+        let elapsed = probe_started.elapsed();
+        let reachable = match probe_result {
+            Ok(Ok(connection)) => {
+                connection.close(0u32.into(), b"address-probe-complete");
+                elapsed <= PROBE_TIMEOUT
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "address probe: handshake failed for {} (advertiser_conn={}): {}",
+                    candidate, probe.peer_addr, e
+                );
+                false
+            }
+            Err(_elapsed) => {
+                debug!(
+                    "address probe: handshake exceeded hard ceiling {:?} for {} (advertiser_conn={})",
+                    PROBE_HARD_CEILING, candidate, probe.peer_addr
+                );
+                false
+            }
+        };
+
+        if reachable {
+            info!(
+                "address probe: {} responded within {:?} (advertiser_conn={})",
+                candidate, PROBE_TIMEOUT, probe.peer_addr
+            );
+        } else {
+            info!(
+                "address probe: {} did NOT respond within {:?} (advertiser_conn={}) — dropping candidate",
+                candidate, PROBE_TIMEOUT, probe.peer_addr
+            );
+        }
+
+        endpoint.deliver_address_probe_result(source, candidate, reachable);
     }
 
     /// Attempt a QUIC connection to a peer address for hole-punching.

@@ -75,6 +75,17 @@ pub struct TransportConfig {
 
     /// Allow loopback addresses as valid NAT traversal candidates
     pub(crate) allow_loopback: bool,
+
+    /// When true, candidates received via `ADD_ADDRESS` frames are gated on
+    /// an out-of-band reachability probe before being eligible for
+    /// `PATH_CHALLENGE` validation. This closes the amplification vector
+    /// where a single peer can advertise an unreachable IP and cause every
+    /// other peer to spend dial budget on it (see prod log 2026-05-15:
+    /// `5.250.190.226 → 75.48.86.24`, 35 592 dials across 24 nodes).
+    ///
+    /// Defaults to `false` for backwards compatibility. Loopback addresses
+    /// always skip the probe (devnet correctness).
+    pub(crate) probe_advertised_addresses: bool,
 }
 
 impl TransportConfig {
@@ -480,6 +491,18 @@ impl TransportConfig {
         self.allow_loopback = allow;
         self
     }
+
+    /// Gate `ADD_ADDRESS`-derived candidates on a reachability probe before
+    /// allowing `PATH_CHALLENGE` validation. When `false` (default) the
+    /// previous behaviour is preserved: candidates are dialed immediately.
+    ///
+    /// Loopback addresses always skip the probe regardless of this setting.
+    ///
+    /// Default: `false`
+    pub fn probe_advertised_addresses(&mut self, enabled: bool) -> &mut Self {
+        self.probe_advertised_addresses = enabled;
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -533,6 +556,7 @@ impl Default for TransportConfig {
                 ml_dsa_65: false,
             }),
             allow_loopback: false,
+            probe_advertised_addresses: false,
         }
     }
 }
@@ -569,6 +593,7 @@ impl fmt::Debug for TransportConfig {
             address_discovery_config,
             pqc_algorithms,
             allow_loopback,
+            probe_advertised_addresses,
         } = self;
         fmt.debug_struct("TransportConfig")
             .field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
@@ -601,6 +626,7 @@ impl fmt::Debug for TransportConfig {
             .field("address_discovery_config", address_discovery_config)
             .field("pqc_algorithms", pqc_algorithms)
             .field("allow_loopback", allow_loopback)
+            .field("probe_advertised_addresses", probe_advertised_addresses)
             .finish_non_exhaustive()
     }
 }

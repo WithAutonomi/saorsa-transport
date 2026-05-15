@@ -174,6 +174,14 @@ pub struct NatConfig {
     /// under-used, while handling lossy paths and shared bottlenecks
     /// more gracefully than BBRv1.
     pub congestion_algorithm: crate::nat_traversal_api::CongestionAlgorithm,
+
+    /// Gate `ADD_ADDRESS`-derived candidates on a sub-second QUIC Initial
+    /// reachability probe before allowing them to consume `PATH_CHALLENGE`
+    /// validation budget. Mirrors
+    /// [`crate::nat_traversal_api::NatTraversalConfig::probe_advertised_addresses`].
+    ///
+    /// Default: `false`.
+    pub probe_advertised_addresses: bool,
 }
 
 impl Default for NatConfig {
@@ -190,6 +198,7 @@ impl Default for NatConfig {
             upnp: crate::upnp::UpnpConfig::default(),
             advertise_external_addresses: true,
             congestion_algorithm: crate::nat_traversal_api::CongestionAlgorithm::default(),
+            probe_advertised_addresses: false,
         }
     }
 }
@@ -346,6 +355,7 @@ impl P2pConfig {
             upnp: self.nat.upnp.clone(),
             advertise_external_addresses: self.nat.advertise_external_addresses,
             congestion_algorithm: self.nat.congestion_algorithm,
+            probe_advertised_addresses: self.nat.probe_advertised_addresses,
         }
     }
 

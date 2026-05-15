@@ -28,6 +28,16 @@ pub(crate) enum ConnectionEventInner {
     QueueAddAddress(crate::frame::AddAddress),
     /// Queue a PUNCH_ME_NOW frame for transmission
     QueuePunchMeNow(crate::frame::PunchMeNow),
+    /// Result of an out-of-band reachability probe issued in response to
+    /// `EndpointEventInner::ProbeAdvertisedAddress`. When `reachable` is
+    /// `true` the connection promotes the matching `Probing` candidate to
+    /// `New`; when `false` the candidate is removed.
+    AdvertisedAddressProbeResult {
+        /// The candidate address that was probed.
+        candidate_addr: SocketAddr,
+        /// Whether the probe succeeded within the timeout window.
+        reachable: bool,
+    },
 }
 
 /// Variant of [`ConnectionEventInner`].
@@ -96,6 +106,25 @@ pub(crate) enum EndpointEventInner {
         peer_addr: SocketAddr,
         /// The new address the peer is advertising
         advertised_addr: SocketAddr,
+    },
+    /// Request the high-level endpoint to issue an out-of-band reachability
+    /// probe (a single QUIC Initial with a short timeout) to a candidate
+    /// learned via `ADD_ADDRESS`, before allowing it to consume validation
+    /// budget. The result is delivered back as
+    /// `ConnectionEventInner::AdvertisedAddressProbeResult` to the
+    /// originating connection.
+    ///
+    /// Emitted only when the connection has `probe_advertised_addresses`
+    /// enabled. Loopback and same-IP-as-advertiser candidates are
+    /// short-circuited at the connection layer and never produce this event.
+    ProbeAdvertisedAddress {
+        /// The connected peer that advertised the address (for diagnostics).
+        peer_addr: SocketAddr,
+        /// The candidate to probe.
+        candidate_addr: SocketAddr,
+        /// Local-only PeerId fingerprint of the advertiser. Carried so a
+        /// future PR can wire failed probes into reputation/trust events.
+        advertiser: [u8; 32],
     },
     /// Request to attempt connection to a target address (NAT callback mechanism)
     TryConnectTo {

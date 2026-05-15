@@ -344,6 +344,44 @@ impl Endpoint {
         }
     }
 
+    /// Set the channel for forwarding ADD_ADDRESS reachability-probe
+    /// requests to the upper layer (NatTraversalEndpoint).
+    pub(crate) fn set_address_probe_tx(
+        &self,
+        tx: mpsc::UnboundedSender<crate::endpoint::PendingAddressProbe>,
+    ) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.address_probe_tx = Some(tx);
+        }
+    }
+
+    /// Deliver the result of an ADD_ADDRESS reachability probe back to the
+    /// originating connection. The connection's state machine will promote
+    /// or remove the matching `Probing` candidate. Returns `false` if the
+    /// connection has gone away.
+    pub(crate) fn deliver_address_probe_result(
+        &self,
+        ch: ConnectionHandle,
+        candidate_addr: SocketAddr,
+        reachable: bool,
+    ) -> bool {
+        let Ok(mut state) = self.inner.0.state.lock() else {
+            return false;
+        };
+        let queued =
+            state
+                .inner
+                .deliver_advertised_address_probe_result(ch, candidate_addr, reachable);
+        if !queued {
+            return false;
+        }
+        // Wake the driver so it processes pending_relay_events.
+        if let Some(driver) = state.driver.as_ref() {
+            driver.wake_by_ref();
+        }
+        true
+    }
+
     /// Connect to a remote endpoint
     ///
     /// `server_name` must be covered by the certificate presented by the server. This prevents a
@@ -772,6 +810,11 @@ pub(crate) struct State {
     /// for full connection tracking instead of fire-and-forget.
     hole_punch_tx: Option<mpsc::UnboundedSender<SocketAddr>>,
     peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
+    /// Forward queued ADD_ADDRESS reachability-probe requests to the
+    /// NatTraversalEndpoint, which owns the async runtime needed to dial
+    /// the candidate. The receiver feeds [`Self::deliver_address_probe_result`]
+    /// back into the low-level endpoint when each probe completes.
+    address_probe_tx: Option<mpsc::UnboundedSender<crate::endpoint::PendingAddressProbe>>,
 }
 
 #[derive(Debug)]
@@ -923,6 +966,34 @@ impl State {
             did_work = true;
             if let Some(ref tx) = self.peer_address_update_tx {
                 let _ = tx.send((peer_addr, advertised_addr));
+            }
+        }
+
+        // Forward ADD_ADDRESS reachability-probe requests to the
+        // NatTraversalEndpoint. When the channel is unset (probe gate
+        // disabled or NatTraversalEndpoint not wired), each request is
+        // logged and dropped — the originating connection will leave the
+        // candidate in `Probing` state, which is intentionally invisible to
+        // PATH_CHALLENGE and pair-generation paths.
+        let probe_requests: Vec<crate::endpoint::PendingAddressProbe> =
+            self.inner.drain_address_probes().collect();
+        for probe in probe_requests {
+            did_work = true;
+            if let Some(ref tx) = self.address_probe_tx {
+                if let Err(e) = tx.send(probe.clone()) {
+                    tracing::debug!(
+                        "address probe channel closed: dropping probe for {} (advertiser_conn={}, err={})",
+                        probe.candidate_addr,
+                        probe.peer_addr,
+                        e,
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    "address probe channel unset: dropping probe for {} (advertiser_conn={})",
+                    probe.candidate_addr,
+                    probe.peer_addr,
+                );
             }
         }
 
@@ -1136,6 +1207,7 @@ impl EndpointRef {
                 default_client_config: None,
                 hole_punch_tx: None,
                 peer_address_update_tx: None,
+                address_probe_tx: None,
             }),
         }))
     }

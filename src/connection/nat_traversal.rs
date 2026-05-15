@@ -57,6 +57,14 @@ pub(super) struct NatTraversalState {
     pub(super) bootstrap_coordinator: Option<BootstrapCoordinator>,
     /// Port predictor for symmetric NAT traversal
     pub(super) port_predictor: PortPredictor,
+    /// When true, ADD_ADDRESS-derived candidates are placed in
+    /// `CandidateState::Probing` rather than `New`, deferring `PATH_CHALLENGE`
+    /// validation until an out-of-band reachability probe (run by the
+    /// high-level endpoint) reports success. Defaults to `false` for
+    /// backwards compatibility — flipping this on closes the
+    /// `5.250.190.226 → 75.48.86.24`-style amplification vector where one
+    /// peer can cause many peers to dial an unreachable address.
+    pub(super) probe_advertised_addresses: bool,
 }
 // v0.13.0: NatTraversalRole enum removed - all nodes are symmetric P2P nodes
 // Every node can initiate, accept, and coordinate NAT traversal without role distinction.
@@ -77,6 +85,17 @@ pub(super) struct AddressCandidate {
     pub(super) attempt_count: u32,
     /// Last validation attempt time
     pub(super) last_attempt: Option<Instant>,
+    /// PeerId fingerprint of the connected peer that advertised this
+    /// address via an `ADD_ADDRESS` frame. `None` for locally-derived
+    /// candidates (Local, Predicted, PortMapped, Observed). Local-only
+    /// state — never serialized over the wire.
+    ///
+    /// Used to attribute reachability-probe failures back to the source.
+    /// A future PR may wire this into trust/reputation events; today it is
+    /// purely informational and accessed only via the test helper
+    /// `advertiser()` below.
+    #[allow(dead_code)]
+    pub(super) advertiser: Option<[u8; 32]>,
 }
 /// How an address candidate was discovered
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +125,13 @@ pub enum CandidateSource {
 pub enum CandidateState {
     /// Newly discovered, not yet tested
     New,
+    /// ADD_ADDRESS-derived candidate awaiting an out-of-band reachability
+    /// probe before being promoted to `New` (and therefore eligible for
+    /// `PATH_CHALLENGE` validation). Used only when the receiving connection
+    /// has `probe_advertised_addresses` enabled. While in this state the
+    /// candidate is invisible to `get_validation_candidates`, so no budget
+    /// is spent dialing the address.
+    Probing,
     /// Currently being validated
     Validating,
     /// Successfully validated and usable
@@ -1824,6 +1850,7 @@ impl NatTraversalState {
         max_candidates: u32,
         coordination_timeout: Duration,
         allow_loopback: bool,
+        probe_advertised_addresses: bool,
     ) -> Self {
         // v0.13.0: All nodes can coordinate - always create coordinator
         let bootstrap_coordinator = Some(BootstrapCoordinator::new(
@@ -1848,6 +1875,7 @@ impl NatTraversalState {
             resource_manager: ResourceCleanupCoordinator::new(),
             bootstrap_coordinator,
             port_predictor: PortPredictor::new(PortPredictorConfig::default()),
+            probe_advertised_addresses,
         }
     }
 
@@ -1870,13 +1898,22 @@ impl NatTraversalState {
         VarInt::from_u32(current)
     }
 
-    /// Add a remote candidate from AddAddress frame with security validation
+    /// Add a remote candidate from AddAddress frame with security validation.
+    ///
+    /// `advertiser` is the PeerId fingerprint of the connected peer that sent
+    /// the `ADD_ADDRESS` frame. Stored for source attribution; never sent on
+    /// the wire. `probing` selects the initial state: when `true` the
+    /// candidate enters `CandidateState::Probing` (gated by an out-of-band
+    /// reachability probe), otherwise it enters `CandidateState::New` and is
+    /// immediately eligible for `PATH_CHALLENGE` validation.
     pub(super) fn add_remote_candidate(
         &mut self,
         sequence: VarInt,
         address: SocketAddr,
         priority: VarInt,
         now: Instant,
+        advertiser: Option<[u8; 32]>,
+        probing: bool,
     ) -> Result<(), NatTraversalError> {
         // Resource management: Check if we should reject new resources
         if self.should_reject_new_resources(now) {
@@ -1925,14 +1962,20 @@ impl NatTraversalState {
             return Err(NatTraversalError::DuplicateAddress);
         }
 
+        let initial_state = if probing {
+            CandidateState::Probing
+        } else {
+            CandidateState::New
+        };
         let candidate = AddressCandidate {
             address,
             priority: priority.into_inner() as u32,
             source: CandidateSource::Peer,
             discovered_at: now,
-            state: CandidateState::New,
+            state: initial_state,
             attempt_count: 0,
             last_attempt: None,
+            advertiser,
         };
 
         self.remote_candidates.insert(sequence, candidate);
@@ -1941,21 +1984,100 @@ impl NatTraversalState {
         // Incrementally add pairs for this new remote candidate (O(n) vs O(n*m))
         self.add_pairs_for_remote_candidate(sequence, now);
 
-        // Feed the predictor and potentially generate new candidates
-        // Only consider global unicast addresses (public IPs) for prediction
-        if !address.ip().is_loopback() && !address.ip().is_unspecified() {
-            // Record the observation
+        // Feed the port predictor only for candidates we have NOT deferred
+        // behind a reachability probe. An attacker advertising garbage IPs
+        // could otherwise pollute the predictor with predictions that
+        // generate new candidates outside the probe gate. Probed
+        // candidates feed the predictor in `promote_probed_candidate`
+        // after the probe succeeds.
+        // Only consider global unicast addresses (public IPs) for prediction.
+        if !probing && !address.ip().is_loopback() && !address.ip().is_unspecified() {
             self.port_predictor.record_observation(address, now);
-
-            // Try to generate predictions immediately
             self.generate_predicted_candidates(address.ip(), now);
         }
 
         trace!(
-            "Added remote candidate: {} with priority {}",
-            address, priority
+            "Added remote candidate: {} with priority {} probing={}",
+            address, priority, probing
         );
         Ok(())
+    }
+
+    /// Promote a candidate from `Probing` → `New` after a successful
+    /// reachability probe, generating candidate pairs so it becomes eligible
+    /// for `PATH_CHALLENGE` validation.
+    ///
+    /// Returns `true` if a candidate was promoted, `false` otherwise (no
+    /// matching candidate, or it had already moved to a different state — e.g.
+    /// a duplicate ADD_ADDRESS arrived in the meantime that already promoted
+    /// it).
+    pub(super) fn promote_probed_candidate(
+        &mut self,
+        candidate_addr: SocketAddr,
+        now: Instant,
+    ) -> bool {
+        // Find the sequence id for the probing candidate matching this address.
+        let target_seq = self.remote_candidates.iter().find_map(|(seq, c)| {
+            if c.address == candidate_addr && c.state == CandidateState::Probing {
+                Some(*seq)
+            } else {
+                None
+            }
+        });
+        let Some(seq) = target_seq else {
+            return false;
+        };
+        // Snapshot the address before promotion so we can feed the port
+        // predictor (which we deliberately skipped at admission time —
+        // see add_remote_candidate). Doing it here means a malicious
+        // advertiser cannot pollute the predictor with garbage IPs.
+        let promoted_addr = self.remote_candidates.get(&seq).map(|c| c.address);
+        if let Some(c) = self.remote_candidates.get_mut(&seq) {
+            c.state = CandidateState::New;
+        }
+        // Generate pairs now that the candidate is eligible for validation.
+        self.add_pairs_for_remote_candidate(seq, now);
+        if let Some(addr) = promoted_addr
+            && !addr.ip().is_loopback()
+            && !addr.ip().is_unspecified()
+        {
+            self.port_predictor.record_observation(addr, now);
+            self.generate_predicted_candidates(addr.ip(), now);
+        }
+        true
+    }
+
+    /// Drop a candidate that failed its reachability probe. Marks the entry
+    /// `Removed` (preserving sequence-number history) and removes any pairs
+    /// referencing it. The probe failure is NOT counted as a security
+    /// rejection because the address may simply be transiently unreachable.
+    pub(super) fn drop_unreachable_candidate(&mut self, candidate_addr: SocketAddr) -> bool {
+        let target_seq = self.remote_candidates.iter().find_map(|(seq, c)| {
+            if c.address == candidate_addr && c.state == CandidateState::Probing {
+                Some(*seq)
+            } else {
+                None
+            }
+        });
+        let Some(seq) = target_seq else {
+            return false;
+        };
+        if let Some(c) = self.remote_candidates.get_mut(&seq) {
+            c.state = CandidateState::Removed;
+        }
+        // Remove any pairs referencing this address (defensive — pair
+        // generation already skips Probing candidates).
+        let before = self.candidate_pairs.len();
+        self.candidate_pairs
+            .retain(|p| p.remote_addr != candidate_addr);
+        if self.candidate_pairs.len() != before {
+            // pair_index needs rebuild after retain.
+            self.pair_index.clear();
+            for (idx, pair) in self.candidate_pairs.iter().enumerate().rev() {
+                self.pair_index.insert(pair.remote_addr, idx);
+            }
+        }
+        true
     }
 
     /// Generate predicted candidates based on observation history
@@ -1996,6 +2118,7 @@ impl NatTraversalState {
                 state: CandidateState::New,
                 attempt_count: 0,
                 last_attempt: None,
+                advertiser: None,
             };
 
             debug!("Added predicted candidate: {}", predicted_addr);
@@ -2040,6 +2163,7 @@ impl NatTraversalState {
             state: CandidateState::New,
             attempt_count: 0,
             last_attempt: None,
+            advertiser: None,
         };
 
         self.local_candidates.insert(sequence, candidate);
@@ -2103,6 +2227,11 @@ impl NatTraversalState {
             for (remote_seq, remote_candidate) in &self.remote_candidates {
                 // Skip removed candidates
                 if remote_candidate.state == CandidateState::Removed {
+                    continue;
+                }
+                // Skip Probing candidates: a reachability probe must complete
+                // before this address consumes any validation budget.
+                if remote_candidate.state == CandidateState::Probing {
                     continue;
                 }
 
@@ -2195,6 +2324,9 @@ impl NatTraversalState {
             .remote_candidates
             .iter()
             .filter(|(_, rc)| rc.state != CandidateState::Removed)
+            // Skip Probing candidates: pair generation deferred until probe
+            // success promotes them to `New`.
+            .filter(|(_, rc)| rc.state != CandidateState::Probing)
             .filter(|(_, rc)| {
                 // Check compatibility inline to avoid needing local_candidate borrow
                 let local_is_v4 = local_addr.is_ipv4();
@@ -2243,7 +2375,13 @@ impl NatTraversalState {
         }
 
         let remote_candidate = match self.remote_candidates.get(&remote_seq) {
-            Some(c) if c.state != CandidateState::Removed => c,
+            Some(c) if c.state != CandidateState::Removed && c.state != CandidateState::Probing => {
+                c
+            }
+            // Skip pair generation for Probing candidates: until the
+            // reachability probe completes, no validation budget should
+            // be spent on this address. Once promoted to `New` (via
+            // `promote_probed_candidate`) pairs are generated then.
             _ => return,
         };
 
@@ -3455,6 +3593,7 @@ impl NatTraversalState {
             state: CandidateState::New,
             attempt_count: 0,
             last_attempt: None,
+            advertiser: None,
         };
 
         // Check if candidate already exists
@@ -3904,7 +4043,15 @@ mod tests {
             10,                      // max_candidates
             Duration::from_secs(30), // coordination_timeout
             true,                    // allow_loopback for tests
+            false,                   // probe_advertised_addresses (off by default)
         )
+    }
+
+    /// Create a test NAT traversal state with the probe gate explicitly
+    /// configured. Used by reachability-probe regression tests.
+    #[allow(dead_code)]
+    fn create_test_state_with_probe(probe: bool) -> NatTraversalState {
+        NatTraversalState::new(10, Duration::from_secs(30), true, probe)
     }
 
     #[test]
@@ -3995,7 +4142,7 @@ mod tests {
         let remote_addr = SocketAddr::from(([1, 2, 3, 4], 6000));
         let priority = VarInt::from_u32(100);
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote_addr, priority, now)
+            .add_remote_candidate(VarInt::from_u32(1), remote_addr, priority, now, None, false)
             .expect("add remote candidate should succeed");
 
         // Generate candidate pairs
@@ -4062,10 +4209,10 @@ mod tests {
         let remote2 = SocketAddr::from(([172, 217, 16, 34], 7000));
         let priority = VarInt::from_u32(100);
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote1, priority, now)
+            .add_remote_candidate(VarInt::from_u32(1), remote1, priority, now, None, false)
             .expect("add remote candidate should succeed");
         state
-            .add_remote_candidate(VarInt::from_u32(2), remote2, priority, now)
+            .add_remote_candidate(VarInt::from_u32(2), remote2, priority, now, None, false)
             .expect("add remote candidate should succeed");
 
         // Generate candidate pairs
@@ -4093,10 +4240,24 @@ mod tests {
         let remote1 = SocketAddr::from(([93, 184, 215, 1], 6000));
         let remote2 = SocketAddr::from(([93, 184, 215, 2], 7000));
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote1,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .expect("add remote candidate should succeed");
         state
-            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .add_remote_candidate(
+                VarInt::from_u32(2),
+                remote2,
+                VarInt::from_u32(200),
+                now,
+                None,
+                false,
+            )
             .expect("add remote candidate should succeed");
 
         // Now add a local candidate - this triggers incremental pair generation
@@ -4149,7 +4310,14 @@ mod tests {
         // Add a remote candidate - this triggers incremental pair generation
         let remote_addr = SocketAddr::from(([93, 184, 215, 1], 6000));
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote_addr, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote_addr,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .expect("add remote candidate should succeed");
 
         // Should have 2 pairs (2 local × 1 remote)
@@ -4178,7 +4346,14 @@ mod tests {
         // Add one remote candidate (both local candidates will pair with it)
         let remote_addr = SocketAddr::from(([93, 184, 215, 1], 6000));
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote_addr, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote_addr,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .expect("add remote candidate should succeed");
 
         // Should have 2 pairs with the same remote_addr
@@ -4226,10 +4401,24 @@ mod tests {
         state_incremental.add_local_candidate(local1, CandidateSource::Local, now);
         state_incremental.add_local_candidate(local2, CandidateSource::Local, now);
         state_incremental
-            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote1,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .unwrap();
         state_incremental
-            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .add_remote_candidate(
+                VarInt::from_u32(2),
+                remote2,
+                VarInt::from_u32(200),
+                now,
+                None,
+                false,
+            )
             .unwrap();
 
         // Create another state and do full regeneration
@@ -4237,10 +4426,24 @@ mod tests {
         state_full.add_local_candidate(local1, CandidateSource::Local, now);
         state_full.add_local_candidate(local2, CandidateSource::Local, now);
         state_full
-            .add_remote_candidate(VarInt::from_u32(1), remote1, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote1,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .unwrap();
         state_full
-            .add_remote_candidate(VarInt::from_u32(2), remote2, VarInt::from_u32(200), now)
+            .add_remote_candidate(
+                VarInt::from_u32(2),
+                remote2,
+                VarInt::from_u32(200),
+                now,
+                None,
+                false,
+            )
             .unwrap();
         // Force full regeneration
         state_full.generate_candidate_pairs(now);
@@ -4285,7 +4488,8 @@ mod tests {
         let mut state = NatTraversalState::new(
             100, // max_candidates (high enough to not limit)
             Duration::from_secs(30),
-            true, // allow_loopback for tests
+            true,  // allow_loopback for tests
+            false, // probe_advertised_addresses
         );
         let now = Instant::now();
 
@@ -4299,8 +4503,14 @@ mod tests {
 
         for i in 0..15u32 {
             let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
-            let _ =
-                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+            let _ = state.add_remote_candidate(
+                VarInt::from_u32(i),
+                remote,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            );
         }
 
         // Should be capped at max_candidate_pairs (200)
@@ -4316,7 +4526,7 @@ mod tests {
     #[test]
     fn test_add_pairs_at_exact_limit() {
         // Test behavior when exactly at the limit
-        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true);
+        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true, false);
         let now = Instant::now();
 
         // Add candidates to get close to limit (14 × 14 = 196 pairs)
@@ -4326,8 +4536,14 @@ mod tests {
         }
         for i in 0..14u32 {
             let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
-            let _ =
-                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+            let _ = state.add_remote_candidate(
+                VarInt::from_u32(i),
+                remote,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            );
         }
 
         let pairs_at_limit = state.candidate_pairs.len();
@@ -4362,7 +4578,14 @@ mod tests {
         // Add one remote - creates 3 pairs with same remote_addr
         let remote = SocketAddr::from(([93, 184, 215, 1], 6000));
         state
-            .add_remote_candidate(VarInt::from_u32(1), remote, VarInt::from_u32(100), now)
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                remote,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            )
             .unwrap();
 
         // Should have 3 pairs
@@ -4396,7 +4619,7 @@ mod tests {
     #[test]
     fn test_incremental_add_with_zero_remaining_capacity() {
         // Test that incremental add gracefully handles zero capacity
-        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true);
+        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true, false);
         let now = Instant::now();
 
         // Fill up to the limit
@@ -4406,8 +4629,14 @@ mod tests {
         }
         for i in 0..14u32 {
             let remote = SocketAddr::from(([93, 184, 215, i as u8], 6000 + i as u16));
-            let _ =
-                state.add_remote_candidate(VarInt::from_u32(i), remote, VarInt::from_u32(100), now);
+            let _ = state.add_remote_candidate(
+                VarInt::from_u32(i),
+                remote,
+                VarInt::from_u32(100),
+                now,
+                None,
+                false,
+            );
         }
 
         // Record count at limit
@@ -4420,6 +4649,8 @@ mod tests {
             extra_remote,
             VarInt::from_u32(100),
             now,
+            None,
+            false,
         );
 
         // Should not panic, and count should not exceed limit
@@ -4427,5 +4658,194 @@ mod tests {
             state.candidate_pairs.len() <= 200,
             "Should handle limit gracefully without panic"
         );
+    }
+
+    // ---------- ADD_ADDRESS reachability-probe gate regression tests ----------
+
+    #[test]
+    fn probe_gate_disabled_admits_candidate_immediately() {
+        // Default behaviour: with the probe gate off, an ADD_ADDRESS-derived
+        // candidate enters CandidateState::New and shows up as a validation
+        // candidate (so PATH_CHALLENGE will be sent on the next opportunity).
+        let mut state = create_test_state_with_probe(false);
+        let now = Instant::now();
+        // Add a local candidate so pair generation has something to work with.
+        state.add_local_candidate(
+            SocketAddr::from(([192, 168, 1, 1], 5000)),
+            CandidateSource::Local,
+            now,
+        );
+
+        let advertiser = [7u8; 32];
+        let advertised = SocketAddr::from(([1, 2, 3, 4], 9000));
+        state
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                advertised,
+                VarInt::from_u32(100),
+                now,
+                Some(advertiser),
+                false,
+            )
+            .expect("add_remote_candidate should succeed");
+
+        let candidate = state
+            .remote_candidates
+            .get(&VarInt::from_u32(1))
+            .expect("candidate should be present");
+        assert_eq!(
+            candidate.state,
+            CandidateState::New,
+            "probe-disabled should leave candidate in New"
+        );
+        assert_eq!(
+            candidate.advertiser,
+            Some(advertiser),
+            "advertiser fingerprint should be stored regardless of gate"
+        );
+        let validation_candidates = state.get_validation_candidates();
+        assert_eq!(
+            validation_candidates.len(),
+            1,
+            "candidate should be eligible for PATH_CHALLENGE"
+        );
+        assert_eq!(state.candidate_pairs.len(), 1, "pair should be generated");
+    }
+
+    #[test]
+    fn probe_gate_enabled_holds_candidate_in_probing() {
+        // With the probe gate on, an ADD_ADDRESS-derived candidate enters
+        // Probing — invisible to PATH_CHALLENGE selection and to pair
+        // generation, so no dial budget is consumed until a probe completes.
+        let mut state = create_test_state_with_probe(true);
+        let now = Instant::now();
+        state.add_local_candidate(
+            SocketAddr::from(([192, 168, 1, 1], 5000)),
+            CandidateSource::Local,
+            now,
+        );
+
+        let advertised = SocketAddr::from(([1, 2, 3, 4], 9000));
+        state
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                advertised,
+                VarInt::from_u32(100),
+                now,
+                Some([3u8; 32]),
+                true, // probing
+            )
+            .expect("add_remote_candidate should succeed");
+
+        let candidate = state
+            .remote_candidates
+            .get(&VarInt::from_u32(1))
+            .expect("candidate should be present");
+        assert_eq!(candidate.state, CandidateState::Probing);
+        assert!(
+            state.get_validation_candidates().is_empty(),
+            "Probing candidate must NOT be eligible for PATH_CHALLENGE"
+        );
+        assert!(
+            state.candidate_pairs.is_empty(),
+            "Probing candidate must NOT contribute to candidate pairs"
+        );
+    }
+
+    #[test]
+    fn probe_success_promotes_candidate_to_new() {
+        let mut state = create_test_state_with_probe(true);
+        let now = Instant::now();
+        state.add_local_candidate(
+            SocketAddr::from(([192, 168, 1, 1], 5000)),
+            CandidateSource::Local,
+            now,
+        );
+
+        let advertised = SocketAddr::from(([1, 2, 3, 4], 9000));
+        state
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                advertised,
+                VarInt::from_u32(100),
+                now,
+                Some([5u8; 32]),
+                true,
+            )
+            .expect("add_remote_candidate should succeed");
+
+        // Promote on probe success.
+        let promoted = state.promote_probed_candidate(advertised, now);
+        assert!(
+            promoted,
+            "promotion should succeed for an existing Probing candidate"
+        );
+        let candidate = state
+            .remote_candidates
+            .get(&VarInt::from_u32(1))
+            .expect("candidate should still exist");
+        assert_eq!(candidate.state, CandidateState::New);
+        assert_eq!(
+            state.get_validation_candidates().len(),
+            1,
+            "promoted candidate should now be eligible for PATH_CHALLENGE"
+        );
+        assert_eq!(
+            state.candidate_pairs.len(),
+            1,
+            "pair generated on promotion"
+        );
+    }
+
+    #[test]
+    fn probe_failure_drops_candidate_without_banning_advertiser() {
+        let mut state = create_test_state_with_probe(true);
+        let now = Instant::now();
+        state.add_local_candidate(
+            SocketAddr::from(([192, 168, 1, 1], 5000)),
+            CandidateSource::Local,
+            now,
+        );
+
+        let advertised = SocketAddr::from(([1, 2, 3, 4], 9000));
+        let advertiser = [42u8; 32];
+        state
+            .add_remote_candidate(
+                VarInt::from_u32(1),
+                advertised,
+                VarInt::from_u32(100),
+                now,
+                Some(advertiser),
+                true,
+            )
+            .expect("add_remote_candidate should succeed");
+
+        let dropped = state.drop_unreachable_candidate(advertised);
+        assert!(dropped, "should drop the Probing candidate");
+
+        let candidate = state
+            .remote_candidates
+            .get(&VarInt::from_u32(1))
+            .expect("entry preserved with Removed state");
+        assert_eq!(candidate.state, CandidateState::Removed);
+
+        // No security/rate-limit counters should be incremented — failed
+        // probes are not treated as attacks.
+        assert_eq!(state.stats.security_rejections, 0);
+        assert_eq!(state.stats.rate_limit_violations, 0);
+        assert_eq!(state.stats.invalid_address_rejections, 0);
+    }
+
+    #[test]
+    fn promote_probed_candidate_is_idempotent_on_missing() {
+        // Calling promote on an unknown address returns false and does not
+        // panic — guards against duplicate probe results racing with peer
+        // disconnect / candidate cleanup.
+        let mut state = create_test_state_with_probe(true);
+        let promoted =
+            state.promote_probed_candidate(SocketAddr::from(([1, 2, 3, 4], 9000)), Instant::now());
+        assert!(!promoted);
+        let dropped = state.drop_unreachable_candidate(SocketAddr::from(([1, 2, 3, 4], 9000)));
+        assert!(!dropped);
     }
 }

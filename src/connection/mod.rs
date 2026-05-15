@@ -1780,6 +1780,71 @@ impl Connection {
                 // Enqueue PunchMeNow frame for transmission
                 self.spaces[SpaceId::Data].pending.punch_me_now.push(punch);
             }
+            AdvertisedAddressProbeResult {
+                candidate_addr,
+                reachable,
+            } => {
+                self.handle_advertised_address_probe_result(
+                    candidate_addr,
+                    reachable,
+                    Instant::now(),
+                );
+            }
+        }
+    }
+
+    /// Handle the result of an out-of-band reachability probe issued for an
+    /// `ADD_ADDRESS`-derived candidate. Promotes a `Probing` candidate to
+    /// `New` (so the existing `PATH_CHALLENGE` machinery picks it up) on
+    /// success, or removes it on failure.
+    fn handle_advertised_address_probe_result(
+        &mut self,
+        candidate_addr: SocketAddr,
+        reachable: bool,
+        now: Instant,
+    ) {
+        let nat_state = match self.nat_traversal.as_mut() {
+            Some(state) => state,
+            None => {
+                trace!(
+                    "AdvertisedAddressProbeResult ignored — NAT traversal not initialized for {}",
+                    candidate_addr
+                );
+                return;
+            }
+        };
+        if reachable {
+            if nat_state.promote_probed_candidate(candidate_addr, now) {
+                info!(
+                    "Probe succeeded — promoted advertised candidate {} to New",
+                    candidate_addr
+                );
+                // Trigger validation on the now-eligible candidate. Errors
+                // here are non-fatal: the candidate is in `New` state and
+                // will be picked up by `send_nat_traversal_challenge` on
+                // the next opportunity.
+                if let Err(e) = self.trigger_candidate_validation(candidate_addr, now) {
+                    debug!(
+                        "trigger_candidate_validation after probe-success deferred: {}",
+                        e
+                    );
+                }
+            } else {
+                trace!(
+                    "AdvertisedAddressProbeResult(reachable=true) had no Probing candidate for {}",
+                    candidate_addr
+                );
+            }
+        } else if nat_state.drop_unreachable_candidate(candidate_addr) {
+            info!(
+                "Probe failed — dropped advertised candidate {} without dialing",
+                candidate_addr
+            );
+        } else {
+            trace!(
+                "AdvertisedAddressProbeResult(reachable=false) had no Probing candidate for {}",
+                candidate_addr
+            );
         }
     }
 
@@ -4768,6 +4833,7 @@ impl Connection {
             max_candidates,
             coordination_timeout,
             self.config.allow_loopback,
+            self.config.probe_advertised_addresses,
         ));
 
         trace!("NAT traversal initialized for symmetric P2P node");
@@ -4966,6 +5032,7 @@ impl Connection {
             8,
             Duration::from_secs(10),
             self.config.allow_loopback,
+            self.config.probe_advertised_addresses,
         ));
     }
 
@@ -4994,6 +5061,26 @@ impl Connection {
         add_address: &crate::frame::AddAddress,
         now: Instant,
     ) -> Result<(), TransportError> {
+        // Decide probe-gate state up front. When the gate is off we want
+        // BYTE-IDENTICAL behaviour to the pre-patch path: no advertiser
+        // hashing, no log format changes, no extra endpoint events.
+        let probe_gate_enabled = self
+            .nat_traversal
+            .as_ref()
+            .map(|s| s.probe_advertised_addresses)
+            .unwrap_or(false);
+
+        // Compute the advertiser fingerprint ONLY when the gate is on (it
+        // is used as the source-attribution key for the eventual probe
+        // result). Computing it eagerly under the off path would add a
+        // per-frame heap allocation (path.remote.to_string().into_bytes())
+        // for no benefit.
+        let advertiser = if probe_gate_enabled {
+            Some(self.derive_peer_id_from_connection())
+        } else {
+            None
+        };
+
         let nat_state = self.nat_traversal.as_mut().ok_or_else(|| {
             TransportError::PROTOCOL_VIOLATION("AddAddress frame without NAT traversal negotiation")
         })?;
@@ -5016,19 +5103,43 @@ impl Connection {
             return Ok(());
         }
 
+        // Decide whether to defer validation behind a reachability probe.
+        //
+        // Skip-conditions (apply probe = false, current behaviour preserved):
+        //   - The probe-gate is disabled in transport config.
+        //   - The advertised IP is loopback (devnet/local-test correctness).
+        //
+        // The peer-IP-matches-advertised-IP case is already short-circuited
+        // by the `peer_addr.ip() == normalized_addr.ip()` early-return
+        // above, so it cannot reach this point.
+        let is_loopback = normalized_addr.ip().is_loopback();
+        let probing = probe_gate_enabled && !is_loopback;
+
         match nat_state.add_remote_candidate(
             add_address.sequence,
             normalized_addr,
             add_address.priority,
             now,
+            advertiser,
+            probing,
         ) {
             Ok(()) => {
-                info!(
-                    "Added remote candidate: {} (seq={}, priority={})",
-                    normalized_addr, add_address.sequence, add_address.priority
-                );
+                if probing {
+                    info!(
+                        "Added remote candidate: {} (seq={}, priority={}, probing=true)",
+                        normalized_addr, add_address.sequence, add_address.priority
+                    );
+                } else {
+                    info!(
+                        "Added remote candidate: {} (seq={}, priority={})",
+                        normalized_addr, add_address.sequence, add_address.priority
+                    );
+                }
 
-                // Notify the endpoint so the DHT routing table can be updated
+                // Notify the endpoint so the DHT routing table can be updated.
+                // We emit this regardless of probe-gate state — the upper
+                // layer (saorsa-core) may still want to learn about the
+                // advertisement even if we don't dial it.
                 self.endpoint_events.push_back(
                     crate::shared::EndpointEventInner::PeerAddressAdvertised {
                         peer_addr: self.path.remote,
@@ -5036,8 +5147,31 @@ impl Connection {
                     },
                 );
 
-                // Trigger validation of this new candidate
-                self.trigger_candidate_validation(normalized_addr, now)?;
+                if probing {
+                    // Invariant: when `probing` is true, `probe_gate_enabled`
+                    // is true, so we computed `advertiser = Some(_)` above.
+                    // Unwrap safely with default for the impossible None
+                    // case; if a future refactor changes the invariant the
+                    // probe target loses its source-attribution rather
+                    // than panicking.
+                    let advertiser_id = advertiser.unwrap_or_default();
+                    // Defer PATH_CHALLENGE: ask the high-level endpoint to
+                    // run an out-of-band reachability probe. The connection
+                    // will either receive an `AdvertisedAddressProbeResult`
+                    // event promoting the candidate to `New`, or no event
+                    // at all (in which case the candidate stays in
+                    // `Probing` and is never dialed).
+                    self.endpoint_events.push_back(
+                        crate::shared::EndpointEventInner::ProbeAdvertisedAddress {
+                            peer_addr: self.path.remote,
+                            candidate_addr: normalized_addr,
+                            advertiser: advertiser_id,
+                        },
+                    );
+                } else {
+                    // Trigger validation of this new candidate
+                    self.trigger_candidate_validation(normalized_addr, now)?;
+                }
                 Ok(())
             }
             Err(NatTraversalError::TooManyCandidates) => Err(TransportError::PROTOCOL_VIOLATION(
@@ -5722,6 +5856,7 @@ impl Connection {
                 state: nat_traversal::CandidateState::New,
                 attempt_count: 0,
                 last_attempt: None,
+                advertiser: None,
             },
         );
 

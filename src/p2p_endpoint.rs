@@ -3971,6 +3971,10 @@ impl P2pEndpoint {
                 // outgoing connections (not fire-and-forget).
                 inner.process_pending_hole_punches().await;
 
+                // Dispatch ADD_ADDRESS reachability probes (no-op when the
+                // probe gate is disabled — the queue stays empty).
+                inner.process_pending_address_probes().await;
+
                 // Forward peer address updates as P2pEvents so the upper layer
                 // (saorsa-core) can update its DHT routing table.
                 {

@@ -58,6 +58,7 @@ mod nat_traversal_api_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -197,6 +198,7 @@ mod functional_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         // May fail due to zero values or other validation
@@ -226,6 +228,7 @@ mod functional_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         let result = NatTraversalEndpoint::new(valid_config, None, None).await;
@@ -421,6 +424,7 @@ mod performance_tests {
                 upnp: Default::default(),
                 advertise_external_addresses: true,
                 congestion_algorithm: Default::default(),
+                probe_advertised_addresses: false,
             };
 
             // Use the config to prevent optimization
@@ -494,6 +498,7 @@ mod relay_functionality_tests {
             upnp: Default::default(),
             advertise_external_addresses: true,
             congestion_algorithm: Default::default(),
+            probe_advertised_addresses: false,
         };
 
         // This might be accepted or rejected depending on implementation
