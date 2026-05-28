@@ -817,12 +817,6 @@ pub enum LinkEvent {
         /// Coordination round number.
         round: u64,
     },
-
-    /// The bootstrap cache has been updated.
-    BootstrapCacheUpdated {
-        /// Number of peers in the cache.
-        peer_count: usize,
-    },
 }
 
 // ============================================================================
@@ -1321,7 +1315,6 @@ pub trait LinkTransport: Send + Sync + 'static {
     ///
     /// Includes:
     /// - Currently connected peers (`caps.is_connected = true`)
-    /// - Previously connected peers still in bootstrap cache
     /// - Peers learned from relay/coordination traffic
     ///
     /// Use `Capabilities::quality_score()` to rank peers for selection.
@@ -1391,9 +1384,8 @@ pub trait LinkTransport: Send + Sync + 'static {
 
     /// Gracefully shutdown the transport.
     ///
-    /// Closes all connections, stops accepting new ones, and flushes
-    /// the bootstrap cache to disk. Pending operations will complete
-    /// or error.
+    /// Closes all connections and stops accepting new ones. Pending operations
+    /// will complete or error.
     ///
     /// Call this before exiting to ensure clean shutdown.
     fn shutdown(&self) -> BoxFuture<'_, ()>;
