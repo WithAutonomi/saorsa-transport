@@ -11,12 +11,12 @@ ADRs document significant architectural decisions made in the project. Each reco
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
 | [ADR-001](ADR-001-link-transport-abstraction.md) | LinkTransport Trait Abstraction | Accepted | 2025-12-21 |
-| [ADR-002](ADR-002-epsilon-greedy-bootstrap-cache.md) | Epsilon-Greedy Bootstrap Cache | Accepted | 2025-12-21 |
+| [ADR-002](ADR-002-epsilon-greedy-bootstrap-cache.md) | Epsilon-Greedy Bootstrap Cache | Superseded | 2026-05-28 |
 | [ADR-003](ADR-003-pure-post-quantum-cryptography.md) | Pure Post-Quantum Cryptography | Accepted | 2025-12-21 |
 | [ADR-004](ADR-004-symmetric-p2p-architecture.md) | Symmetric P2P Architecture | Accepted | 2025-12-21 |
 | [ADR-005](ADR-005-native-quic-nat-traversal.md) | Native QUIC NAT Traversal | Accepted | 2025-12-21 |
 | [ADR-006](ADR-006-masque-relay-fallback.md) | MASQUE CONNECT-UDP Bind Relay | Accepted | 2025-12-21 |
-| [ADR-007](ADR-007-local-only-hostkey.md) | Local-only HostKey | Accepted | 2025-12-22 |
+| [ADR-007](ADR-007-local-only-hostkey.md) | Local-only HostKey for Local State Encryption | Amended | 2026-05-28 |
 | [ADR-008](ADR-008-universal-connectivity-architecture.md) | Universal Connectivity Architecture | Accepted | 2025-12-26 |
 | [ADR-009](ADR-009-masque-relay-data-plane.md) | MASQUE Relay Data Plane Implementation | Accepted | 2026-03-29 |
 | [ADR-010](ADR-010-repository-ownership.md) | Repository Ownership under WithAutonomi | Accepted | 2026-05-29 |
