@@ -393,7 +393,7 @@ The following types were **removed** in v0.13.0:
 
 ## Support
 
-- GitHub Issues: https://github.com/saorsa-labs/saorsa-transport/issues
+- GitHub Issues: https://github.com/WithAutonomi/saorsa-transport/issues
 - Documentation: https://docs.rs/saorsa-transport
-- Examples: https://github.com/saorsa-labs/saorsa-transport/tree/main/examples
+- Examples: https://github.com/WithAutonomi/saorsa-transport/tree/main/examples
 

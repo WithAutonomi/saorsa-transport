@@ -6,14 +6,14 @@
 
 - ❌ **DO NOT** create PRs to quinn-rs/quinn
 - ❌ **DO NOT** reference "upstream" Quinn repository
-- ✅ **DO** create PRs to github.com/saorsa-labs/saorsa-transport
+- ✅ **DO** create PRs to github.com/WithAutonomi/saorsa-transport
 - ✅ **DO** treat this as a standalone project
 
 Although GitHub may show this as a fork (legacy reason), saorsa-transport has diverged completely and is maintained independently.
 
 ## How to Contribute
 
-1. Fork the repository from https://github.com/saorsa-labs/saorsa-transport
+1. Fork the repository from https://github.com/WithAutonomi/saorsa-transport
 2. Create a feature branch: `git checkout -b feature/your-feature`
 3. Make your changes and ensure tests pass: `cargo test`
 4. Run formatting and linting: `cargo fmt && cargo clippy`
@@ -45,4 +45,4 @@ cargo test
 
 ## Questions?
 
-Open an issue at https://github.com/saorsa-labs/saorsa-transport/issues
+Open an issue at https://github.com/WithAutonomi/saorsa-transport/issues

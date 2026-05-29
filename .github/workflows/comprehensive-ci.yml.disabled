@@ -232,7 +232,7 @@ jobs:
         # Deploy
         ssh $DO_USER@$DO_HOST << 'ENDSSH'
           set -e
-          cd ~/saorsa-transport || git clone https://github.com/saorsa-labs/saorsa-transport ~/saorsa-transport
+          cd ~/saorsa-transport || git clone https://github.com/WithAutonomi/saorsa-transport ~/saorsa-transport
           cd ~/saorsa-transport
           git fetch origin
           git checkout ${{ github.sha }}
