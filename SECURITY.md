@@ -135,4 +135,4 @@ saorsa-transport follows security best practices from:
 
 - Security Team: security@maidsafe.net
 - Project Maintainers: @dirvine
-- Security Advisory URL: https://github.com/saorsa-labs/saorsa-transport/security/advisories
+- Security Advisory URL: https://github.com/WithAutonomi/saorsa-transport/security/advisories

@@ -7,8 +7,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
 
-[![CI Status](https://github.com/saorsa-labs/saorsa-transport/actions/workflows/ci.yml/badge.svg)](https://github.com/saorsa-labs/saorsa-transport/actions/workflows/ci.yml)
-[![Security Audit](https://github.com/saorsa-labs/saorsa-transport/actions/workflows/security.yml/badge.svg)](https://github.com/saorsa-labs/saorsa-transport/actions/workflows/security.yml)
+[![CI Status](https://github.com/WithAutonomi/saorsa-transport/actions/workflows/ci.yml/badge.svg)](https://github.com/WithAutonomi/saorsa-transport/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/WithAutonomi/saorsa-transport/actions/workflows/security.yml/badge.svg)](https://github.com/WithAutonomi/saorsa-transport/actions/workflows/security.yml)
 
 ## Key Features
 
@@ -215,7 +215,7 @@ cargo add saorsa-transport
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/saorsa-labs/saorsa-transport/releases):
+Download from [GitHub Releases](https://github.com/WithAutonomi/saorsa-transport/releases):
 - Linux: `saorsa-transport-linux-x86_64`, `saorsa-transport-linux-aarch64`
 - Windows: `saorsa-transport-windows-x86_64.exe`
 - macOS: `saorsa-transport-macos-x86_64`, `saorsa-transport-macos-aarch64`
@@ -223,7 +223,7 @@ Download from [GitHub Releases](https://github.com/saorsa-labs/saorsa-transport/
 ### From Source
 
 ```bash
-git clone https://github.com/saorsa-labs/saorsa-transport
+git clone https://github.com/WithAutonomi/saorsa-transport
 cd saorsa-transport
 cargo build --release
 ```
@@ -427,7 +427,7 @@ Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 # Development setup
-git clone https://github.com/saorsa-labs/saorsa-transport
+git clone https://github.com/WithAutonomi/saorsa-transport
 cd saorsa-transport
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings

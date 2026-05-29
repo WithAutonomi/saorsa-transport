@@ -540,4 +540,4 @@ If you've tried the solutions above and still have issues:
    - Debug logs
    - Steps to reproduce
 
-Report issues at: https://github.com/saorsa-labs/saorsa-transport/issues
+Report issues at: https://github.com/WithAutonomi/saorsa-transport/issues

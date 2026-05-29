@@ -9,7 +9,7 @@ on:
 jobs:
   check-pr-target:
     runs-on: ubuntu-latest
-    if: github.repository == 'saorsa-labs/saorsa-transport'
+    if: github.repository == 'WithAutonomi/saorsa-transport'
     steps:
       - name: Check PR Target
         run: |
@@ -21,10 +21,10 @@ jobs:
             echo "❌ ERROR: This PR targets quinn-rs/quinn!"
             echo ""
             echo "saorsa-transport is NOT a fork of Quinn - it's an independent project."
-            echo "PRs should target saorsa-labs/saorsa-transport only."
+            echo "PRs should target WithAutonomi/saorsa-transport only."
             echo ""
             echo "Please close this PR and create a new one targeting:"
-            echo "  https://github.com/saorsa-labs/saorsa-transport"
+            echo "  https://github.com/WithAutonomi/saorsa-transport"
             exit 1
           fi
 

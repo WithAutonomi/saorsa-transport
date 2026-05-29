@@ -122,7 +122,7 @@ sudo ip netns exec nat_ns sysctl -w net.ipv4.ip_forward=1
 
 ```bash
 # Clone the repository
-git clone https://github.com/saorsa-labs/saorsa-transport.git
+git clone https://github.com/WithAutonomi/saorsa-transport.git
 cd saorsa-transport/docker
 
 # Build Docker images
