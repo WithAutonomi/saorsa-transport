@@ -1,12 +1,19 @@
-# ADR-007: Local-only HostKey for Key Hierarchy and Bootstrap Cache
+# ADR-007: Local-only HostKey for Key Hierarchy and Local State Encryption
 
 ## Status
 
 Accepted (2025-12-22)
 
+Amended (2026-05-28): bootstrap cache integration was removed. HostKey remains
+the local root secret for endpoint key derivation and encrypted local state, but
+there is no current public `BootstrapCache` API, cache CLI, or
+`src/bootstrap_cache/` implementation.
+
 ## Context
 
-saorsa-transport is a global, decentralised connectivity substrate: PQC-by-default QUIC transport with NAT traversal (including IPv4/IPv6 dual-stack and MASQUE relay fallback), and a greedy bootstrap cache for rapid rejoin and improved reachability.
+saorsa-transport is a global, decentralised connectivity substrate:
+PQC-by-default QUIC transport with NAT traversal, including IPv4/IPv6 dual-stack
+and MASQUE relay fallback.
 
 Current constraints and observations:
 
@@ -18,7 +25,7 @@ Current constraints and observations:
 A missing piece is a clean model for local key management and state storage that:
 
 - Supports multiple endpoints and multiple overlays on the same host
-- Allows a greedy peer cache to be shared safely across endpoints
+- Allows encrypted local state to be shared safely across endpoints when needed
 - Does not introduce a network-visible "host identity" that increases correlatability or invites incorrect assumptions about Sybil resistance
 
 ## Decision
@@ -28,8 +35,8 @@ Introduce a **single, local-only HostKey** (host root secret) that:
 1. **Never appears on the wire** (not transmitted, not advertised, not referenced in any protocol frame, handshake extension, or node record)
 2. Is used to deterministically derive:
    - Endpoint authentication keys (`EndpointKeys`) according to a key policy
-   - Encryption keys for local state (bootstrap cache and related databases)
-3. Enables a **host-scoped greedy bootstrap cache** shared across all endpoints on the host, encrypted at rest with HostKey-derived keys
+   - Encryption keys for local state
+3. Reserves host-scoped local-state key derivation without creating a network-visible host identity
 
 ### Key Derivation (HKDF-SHA256)
 
@@ -70,10 +77,9 @@ Enforcement remains **resource-based**, not keyed to HostKey:
 ### Positive
 
 - **Clean key hierarchy**: One root secret, deterministic derivation, versioning, and rotation hooks
-- **Host-scoped bootstrap cache**: Safely shared across endpoints and processes, encrypted at rest
+- **Host-scoped local state encryption**: Endpoint keypairs and other local state can be protected at rest
 - **Better UX**: No PoW/PoS, no sign-ups, no central service
 - **Improved privacy defaults**: Per-network endpoint identities reduce cross-overlay correlation
-- **Faster rejoin**: Accumulated NAT traversal observations benefit all endpoints
 
 ### Negative / Trade-offs
 
@@ -132,11 +138,19 @@ impl HostIdentity {
 }
 ```
 
-### Bootstrap Cache Integration
+### Removed Bootstrap Cache Integration
 
-- **Max peers**: Increased from 20,000 → 30,000
-- **Encryption**: XChaCha20-Poly1305 with HostKey-derived `K_cache`
-- **New field**: `RelayPathHint` for MASQUE relay path tracking
+The original ADR tied HostKey-derived local-state encryption to a host-scoped
+bootstrap cache. That integration is no longer part of the current
+implementation:
+
+- The public `bootstrap_cache` module was removed.
+- `P2pConfig` no longer exposes bootstrap cache configuration.
+- The CLI no longer provides cache management commands.
+- Relay selection no longer consults cached peer quality or dual-stack hints.
+
+`derive_cache_key()` remains as a domain-separated local-state key derivation
+for future encrypted host-local state.
 
 ### API Surface
 
@@ -145,19 +159,13 @@ impl HostIdentity {
 P2pEndpoint::builder()
     .with_host_identity(&host_id, network_id)
     .build()
-
-// Cache construction with encryption
-BootstrapCache::builder()
-    .with_encryption_key(host_id.derive_cache_key())
-    .build()
 ```
 
 ### CLI Commands
 
 ```
 saorsa-transport identity show     # Show EndpointId(s) without exposing HostKey
-saorsa-transport identity wipe     # Delete HostKey and cache, start fresh
-saorsa-transport cache stats       # Show cache health metrics
+saorsa-transport identity wipe     # Delete HostKey and start fresh
 saorsa-transport doctor            # Diagnostic mode
 ```
 
@@ -165,6 +173,5 @@ saorsa-transport doctor            # Diagnostic mode
 
 - `src/crypto/raw_public_keys/pqc.rs` - Current PeerId derivation using domain separator `AUTONOMI_PEER_ID_V2:`
 - `src/crypto/ring_like.rs` - Existing HKDF-SHA256 patterns
-- `src/bootstrap_cache/` - Current cache implementation with file locking
-- [ADR-002](ADR-002-epsilon-greedy-bootstrap-cache.md) - Epsilon-greedy bootstrap cache design
+- [ADR-002](ADR-002-epsilon-greedy-bootstrap-cache.md) - Superseded epsilon-greedy bootstrap cache design
 - [ADR-003](ADR-003-pure-post-quantum-cryptography.md) - Pure PQC architecture (ML-DSA-65)

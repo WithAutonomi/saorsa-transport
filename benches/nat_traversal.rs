@@ -449,7 +449,8 @@ fn bench_multi_destination(c: &mut Criterion) {
                 b.iter(|| {
                     // Select top candidates for transmission
                     let mut sorted_candidates = candidates.clone();
-                    sorted_candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+                    sorted_candidates
+                        .sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
 
                     let selected: Vec<_> = sorted_candidates.into_iter().take(size).collect();
 
@@ -608,7 +609,7 @@ fn bench_pair_generation(c: &mut Criterion) {
                     }
 
                     // Sort by priority (unstable sort for performance)
-                    pairs.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+                    pairs.sort_unstable_by_key(|pair| std::cmp::Reverse(pair.2));
 
                     black_box(pairs)
                 });

@@ -29,8 +29,12 @@ saorsa-transport should be the **smallest useful substrate** that can reliably c
 - QUIC transport (streams + datagrams) with symmetric peer roles
 - QUIC NAT traversal and address discovery
 - Mandatory capability to coordinate and relay (with rate limits)
-- Greedy bootstrap cache with peer capabilities
+- Known-peer based initial discovery and address observation
 - Application protocol multiplexing
+
+Historical note: the original accepted scope included a greedy bootstrap cache
+with peer capabilities. That cache was later removed; see
+[ADR-002](ADR-002-epsilon-greedy-bootstrap-cache.md).
 
 **What saorsa-transport must NOT provide**:
 - DHT semantics (replication, close-groups, pricing)

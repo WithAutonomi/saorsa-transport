@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted (2025-12-21)
+Superseded (2026-05-28)
+
+This ADR is historical. The bootstrap cache implementation described here was
+removed by the `feat!: remove bootstrap cache` change. The public
+`bootstrap_cache` module, `P2pConfig::bootstrap_cache`, CLI cache commands, and
+cache-backed token/relay selection APIs no longer exist.
 
 ## Context
 
@@ -18,29 +23,33 @@ We need a bootstrap cache that:
 - Persists across restarts
 - Handles multi-process access safely
 
-### Latest Release
+### Historical Release
 
-All features implemented and tested with 40 passing unit tests.
+The original implementation was completed and tested with 40 unit tests before
+being removed from the current architecture.
 
 ---
 
 ## Implementation Notes
 
-### Naming Convention (2025-12-22)
+### Historical Naming Convention (2025-12-22)
 
-The actual implementation uses the type name `BootstrapCache` rather than `GreedyBootstrapCache` as originally specified in this ADR. This decision prioritizes API simplicity and ergonomics:
+The removed implementation used the type name `BootstrapCache` rather than
+`GreedyBootstrapCache` as originally specified in this ADR. This decision
+prioritized API simplicity and ergonomics:
 
 - **Type name**: `BootstrapCache` (src/bootstrap_cache/cache.rs)
 - **Algorithm**: Epsilon-greedy selection (unchanged)
-- **Rationale**: The term "epsilon-greedy" describes the internal algorithm, not the user-facing purpose. Users interact with a "bootstrap cache" that happens to use smart selection internally.
+- **Rationale**: The term "epsilon-greedy" describes the internal algorithm, not the user-facing purpose. Users interacted with a "bootstrap cache" that happened to use smart selection internally.
 
-The epsilon-greedy strategy remains fully implemented with all specified features:
+The epsilon-greedy strategy was implemented with all specified features:
 - Quality scoring based on success/failure ratio
 - Configurable exploration rate (ε = 0.1)
 - Time-based decay
 - Capacity limits with LRU eviction
 
-This naming change affects only the public API surface - the algorithmic behavior is identical to the ADR specification.
+This naming change affected only the public API surface - the algorithmic
+behavior was identical to the ADR specification.
 
 ## Decision
 
@@ -148,6 +157,6 @@ This ensures NAT traversal works reliably while keeping resource usage bounded a
 
 ## References
 
-- Commit: `5586820e` (feat(bootstrap): add greedy bootstrap cache)
-- Files: `src/bootstrap_cache/*.rs`
-- Config: `BootstrapCacheConfig` with tunable epsilon, capacity, decay rates
+- Historical add commit: `5586820e` (feat(bootstrap): add greedy bootstrap cache)
+- Removed files: `src/bootstrap_cache/*.rs`
+- Removed config: `BootstrapCacheConfig` with tunable epsilon, capacity, decay rates

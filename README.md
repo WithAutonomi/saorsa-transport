@@ -258,24 +258,6 @@ If no `--known-peers` are specified, saorsa-transport automatically connects to 
 
 These nodes run the same saorsa-transport software as any peer - they help with initial peer discovery and external address observation.
 
-### Bootstrap Cache
-
-saorsa-transport maintains a local cache of discovered peers to improve startup time and resilience. The cache is stored as a JSON file:
-
-| Platform | Cache Location |
-|----------|----------------|
-| **macOS** | `~/Library/Caches/saorsa-transport/bootstrap_cache.json` |
-| **Linux** | `~/.cache/saorsa-transport/bootstrap_cache.json` |
-| **Windows** | `%LOCALAPPDATA%\saorsa-transport\bootstrap_cache.json` |
-
-The cache includes:
-- Peer IDs and socket addresses
-- Connection quality scores (RTT, success rate)
-- NAT type hints for traversal optimization
-- Last-seen timestamps for freshness
-
-The cache is automatically managed - stale entries are pruned and high-quality peers are prioritized for reconnection.
-
 ## API Reference
 
 ### Primary Types

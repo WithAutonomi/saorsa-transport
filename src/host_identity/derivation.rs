@@ -26,7 +26,7 @@
 //!    │       ├── network_id_2 → encryption key for stored ML-DSA-65 keypair
 //!    │       └── ...
 //!    │
-//!    └── K_cache → XChaCha20-Poly1305 encryption key for bootstrap cache
+//!    └── K_cache → XChaCha20-Poly1305 encryption key for local cache state
 //! ```
 
 use aws_lc_rs::hkdf;
@@ -45,7 +45,7 @@ const HOSTKEY_SALT: &[u8] = b"antq:hostkey:v1";
 /// Info string for endpoint encryption key derivation
 const ENDPOINT_ENCRYPT_INFO: &[u8] = b"antq:endpoint-encrypt:v1";
 
-/// Info string for cache key derivation
+/// Info string for local cache key derivation
 const CACHE_KEY_INFO: &[u8] = b"antq:cache-key:v1";
 
 /// Derived key size in bytes
@@ -75,7 +75,7 @@ pub enum EndpointKeyPolicy {
 ///
 /// The HostKey never appears on the wire. It is used only for:
 /// - Deriving encryption keys for per-network endpoint keypair storage
-/// - Deriving encryption keys for local state (bootstrap cache)
+/// - Deriving encryption keys for local cache state
 ///
 /// Endpoint keypairs are generated once and stored encrypted. The HostKey
 /// ensures that the same host can decrypt its stored keypairs across restarts.
@@ -178,9 +178,9 @@ impl HostIdentity {
         key
     }
 
-    /// Derive the cache encryption key
+    /// Derive the local cache encryption key.
     ///
-    /// This key is used to encrypt the bootstrap cache at rest.
+    /// This key is reserved for encrypted local cache state.
     #[allow(clippy::expect_used)] // HKDF operations are infallible with valid fixed-size parameters
     pub fn derive_cache_key(&self) -> [u8; DERIVED_KEY_SIZE] {
         let mut key = [0u8; DERIVED_KEY_SIZE];

@@ -5,12 +5,12 @@
 //
 // Full details available at https://saorsalabs.com/licenses
 
-//! Local-only HostKey for key hierarchy and bootstrap cache encryption
+//! Local-only HostKey for key hierarchy and local state encryption
 //!
 //! This module provides a host-scoped identity system where:
 //! - A single HostKey (root secret) exists only on the local machine
 //! - The HostKey is NEVER transmitted on the wire
-//! - All endpoint keys and cache encryption keys are derived from the HostKey
+//! - All endpoint keys and local state encryption keys are derived from the HostKey
 //!
 //! ## Architecture (ADR-007)
 //!
@@ -24,7 +24,7 @@
 //! │    │     └── Used to encrypt/decrypt per-network ML-DSA-65 keypair │
 //! │    │                                                                │
 //! │    └── derive_cache_key()                                           │
-//! │          └── Used to encrypt bootstrap cache at rest                │
+//! │          └── Used to encrypt local cache state at rest              │
 //! └─────────────────────────────────────────────────────────────────────┘
 //!
 //!                              │ (encrypted storage)
@@ -45,7 +45,7 @@
 //!
 //! 1. **Privacy by Default**: Per-network endpoint keys prevent cross-overlay correlation
 //! 2. **No Sybil Resistance**: HostKey is local-only; Sybil resistance belongs at overlay layer
-//! 3. **Encrypted Storage**: Bootstrap cache and endpoint keypairs encrypted at rest
+//! 3. **Encrypted Storage**: Endpoint keypairs and local state encrypted at rest
 //! 4. **Platform Storage**: Uses OS keychain when available, encrypted file fallback
 //!
 //! ## Usage
@@ -59,7 +59,7 @@
 //! // Derive encryption key for a network's endpoint keypair
 //! let encryption_key = host.derive_endpoint_encryption_key(b"my-network");
 //!
-//! // Derive cache encryption key
+//! // Derive a local cache encryption key
 //! let cache_key = host.derive_cache_key();
 //!
 //! // Display-safe fingerprint (not the actual secret)
