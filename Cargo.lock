@@ -1518,6 +1518,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "hyper"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2464,15 +2470,14 @@ dependencies = [
 
 [[package]]
 name = "qlog"
-version = "0.13.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b5f65b920fa913ce92267bb3c4ed3b9c2f81d05f8e1376c3bbc95455eedb7df"
+checksum = "c65c0ae39cba4538fd935d376ba17f858046b386dc4597e3fa5c1aedb919ef30"
 dependencies = [
+ "humantime",
  "serde",
- "serde_derive",
  "serde_json",
  "serde_with",
- "smallvec",
 ]
 
 [[package]]
