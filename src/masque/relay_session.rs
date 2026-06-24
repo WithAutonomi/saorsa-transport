@@ -147,6 +147,13 @@ impl RelaySessionStats {
 
 /// A MASQUE relay session
 ///
+/// 32-byte BLAKE3 fingerprint of a relayed peer's authenticated ML-DSA-65
+/// identity (the canonical `AUTONOMI_PEER_ID_V2` peer id). Relay-port
+/// reservations are keyed by this so a reconnecting peer can reclaim the
+/// public port it previously advertised. It is always derived from the
+/// authenticated QUIC/TLS identity — never from untrusted request payload.
+pub type RelayPeerId = [u8; 32];
+
 /// Manages the lifecycle of a single relay connection, including context
 /// registration, datagram forwarding, and session cleanup.
 #[derive(Debug)]
@@ -161,6 +168,10 @@ pub struct RelaySession {
     public_address: SocketAddr,
     /// Client's address
     client_address: Option<SocketAddr>,
+    /// Authenticated peer fingerprint (`AUTONOMI_PEER_ID_V2`) of the relayed
+    /// peer, when the QUIC connection is PQC-authenticated. Keys stable-port
+    /// reservations; `None` when the identity is unavailable.
+    peer_id: Option<RelayPeerId>,
     /// Context manager for this session (server role - odd context IDs)
     context_manager: ContextManager,
     /// Reverse mapping: target address → context ID
@@ -191,6 +202,7 @@ impl RelaySession {
             state: RelaySessionState::Pending,
             public_address,
             client_address: None,
+            peer_id: None,
             context_manager: ContextManager::new(false), // Server role (odd IDs)
             target_to_context: HashMap::new(),
             created_at: now,
@@ -226,6 +238,17 @@ impl RelaySession {
     /// Get client address if known
     pub fn client_address(&self) -> Option<SocketAddr> {
         self.client_address
+    }
+
+    /// Set the authenticated peer fingerprint for this session.
+    pub fn set_peer_id(&mut self, peer_id: Option<RelayPeerId>) {
+        self.peer_id = peer_id;
+    }
+
+    /// Get the authenticated peer fingerprint if the connection was
+    /// PQC-authenticated.
+    pub fn peer_id(&self) -> Option<RelayPeerId> {
+        self.peer_id
     }
 
     /// Get session statistics

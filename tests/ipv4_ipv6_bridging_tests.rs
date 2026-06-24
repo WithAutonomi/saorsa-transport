@@ -97,7 +97,7 @@ async fn test_ipv4_to_ipv4_relay() {
 
     // Request to relay traffic to IPv4 target
     let request = ConnectUdpRequest::target(target_addr);
-    let response = relay.handle_connect_request(&request, client_addr).await;
+    let response = relay.handle_connect_request(&request, client_addr, None).await;
 
     assert!(response.is_ok(), "IPv4→IPv4 should succeed");
     assert!(response.unwrap().is_success());
@@ -115,7 +115,7 @@ async fn test_ipv4_to_ipv6_bridging() {
 
     // Request to relay traffic to IPv6 target from IPv4 client
     let request = ConnectUdpRequest::target(target_addr);
-    let response = relay.handle_connect_request(&request, client_addr).await;
+    let response = relay.handle_connect_request(&request, client_addr, None).await;
 
     assert!(
         response.is_ok(),
@@ -144,7 +144,7 @@ async fn test_ipv6_to_ipv4_bridging() {
 
     // Request to relay traffic to IPv4 target from IPv6 client
     let request = ConnectUdpRequest::target(target_addr);
-    let response = relay.handle_connect_request(&request, client_addr).await;
+    let response = relay.handle_connect_request(&request, client_addr, None).await;
 
     assert!(
         response.is_ok(),
@@ -163,7 +163,7 @@ async fn test_ipv6_to_ipv6_relay() {
     let target_addr = ipv6_addr(10008);
 
     let request = ConnectUdpRequest::target(target_addr);
-    let response = relay.handle_connect_request(&request, client_addr).await;
+    let response = relay.handle_connect_request(&request, client_addr, None).await;
 
     assert!(response.is_ok(), "IPv6→IPv6 should succeed");
     assert!(response.unwrap().is_success());
@@ -183,7 +183,7 @@ async fn test_no_dual_stack_relay_fails_cross_version() {
     let target_addr = ipv6_addr(10010);
 
     let request = ConnectUdpRequest::target(target_addr);
-    let response = relay.handle_connect_request(&request, client_addr).await;
+    let response = relay.handle_connect_request(&request, client_addr, None).await;
 
     // Should fail with clear error
     assert!(response.is_err() || !response.unwrap().is_success());
@@ -198,7 +198,7 @@ async fn test_relay_session_timeout() {
 
     let client_addr = ipv4_addr(10011);
     let request = ConnectUdpRequest::bind_any();
-    let _ = relay.handle_connect_request(&request, client_addr).await;
+    let _ = relay.handle_connect_request(&request, client_addr, None).await;
 
     // Verify session exists
     assert!(relay.get_session_for_client(client_addr).await.is_some());
@@ -228,7 +228,7 @@ async fn test_relay_rate_limit_rejection() {
     let client_addr = ipv4_addr(10012);
     let request = ConnectUdpRequest::bind_any();
     let _ = relay
-        .handle_connect_request(&request, client_addr)
+        .handle_connect_request(&request, client_addr, None)
         .await
         .unwrap();
 
@@ -305,7 +305,7 @@ async fn test_sustained_bridging_load_30s() {
 
         for (client, target) in scenarios.iter() {
             let request = ConnectUdpRequest::target(*target);
-            match relay.handle_connect_request(&request, *client).await {
+            match relay.handle_connect_request(&request, *client, None).await {
                 Ok(resp) if resp.is_success() => success_count += 1,
                 _ => failure_count += 1,
             }
