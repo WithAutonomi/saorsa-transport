@@ -275,6 +275,11 @@ pub struct ConnectUdpResponse {
     pub proxy_public_address: Option<SocketAddr>,
     /// Human-readable reason phrase
     pub reason: Option<String>,
+    /// Relay-internal: the session id created for a successful CONNECT. NOT part
+    /// of the wire format (it is not encoded/decoded); the relay sets it so the
+    /// connection handler can start forwarding the *exact* session it created,
+    /// rather than re-looking-up by client address (which races on reconnect).
+    pub session_id: Option<u64>,
 }
 
 impl ConnectUdpResponse {
@@ -295,6 +300,7 @@ impl ConnectUdpResponse {
             status: Self::STATUS_OK,
             proxy_public_address: public_addr,
             reason: None,
+            session_id: None,
         }
     }
 
@@ -304,6 +310,7 @@ impl ConnectUdpResponse {
             status,
             proxy_public_address: None,
             reason: Some(reason.into()),
+            session_id: None,
         }
     }
 
@@ -454,6 +461,9 @@ impl ConnectUdpResponse {
             status,
             proxy_public_address,
             reason,
+            // Not part of the wire format; only set by the relay on the response
+            // object it returns locally.
+            session_id: None,
         })
     }
 }

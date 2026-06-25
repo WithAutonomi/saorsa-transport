@@ -95,18 +95,23 @@ On an incoming CONNECT from authenticated peer `P`, `handle_connect_request`:
   and the session insert — so concurrent CONNECTs from the same identity are
   serialized and never leave two live sessions for one identity.
 - **Retires any live session `P` already holds, before the capacity/duplicate
-  checks**, so an authenticated reconnect is not rejected with `503`/`409`. A
-  session whose stream-forwarding loop is still live is *not* leased (its
-  reader/writer tasks still hold the socket); that handover therefore takes a
-  **fresh** port. The common path — `P` disconnected, its loop ended and leased
-  the port, then `P` reconnects — reclaims the **same** port.
+  checks**, so an authenticated reconnect is not rejected with `503`/`409`.
+  `close_session` **cancels and awaits** that session's stream-forwarding loop —
+  the loop aborts its reader/writer tasks and releases the socket before the
+  call returns — so no orphaned data plane survives the handover and the port can
+  be leased and immediately reclaimed by the reconnect (**same** port). The
+  common path (`P` disconnected, its loop ended and leased the port, then `P`
+  reconnects) reclaims the same port the same way.
 - Takes the reservation only if it is **fresh** (within `reservation_ttl`) and
   its socket matches the client's **IP family**; otherwise discards it and binds
   a fresh port.
 
-Socket exclusivity is enforced by aborting and awaiting a session's forwarding
-tasks before its socket can be leased/reclaimed, so old and new sessions never
-share a socket (see §"Consequences").
+Socket exclusivity is enforced two ways: the loop aborts and awaits its forwarding
+tasks on its own exit, and `close_session` cancels and awaits a still-live loop
+before the socket can be leased/reclaimed — so old and new sessions never share a
+socket. The connection handler also forwards the **exact** session id returned by
+`handle_connect_request` (not a later client-address lookup), and a loop claims its
+session id, so one session never gets two forwarding loops.
 
 ### 4. Fallback path
 

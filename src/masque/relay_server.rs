@@ -33,13 +33,14 @@
 
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingRwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::os::unix::io::AsRawFd;
@@ -376,6 +377,19 @@ fn short_peer_hex(id: &RelayPeerId) -> String {
     s
 }
 
+/// Per-session control handle for the stream-forwarding loop (ADR-011).
+///
+/// `cancel` lets `close_session` stop a still-live forwarding loop — e.g. a
+/// same-identity handover — rather than leaving an untracked data plane running
+/// after the session is removed. `done` is signalled by the loop once it has
+/// aborted its reader/writer tasks and released the socket, so a handover waits
+/// until the old loop has fully quiesced before the port is reused.
+#[derive(Clone)]
+struct ForwardingControl {
+    cancel: CancellationToken,
+    done: Arc<Notify>,
+}
+
 /// A retained stable relay-port reservation (ADR-011).
 ///
 /// Created when a relayed peer's session ends: instead of dropping the bound
@@ -441,14 +455,14 @@ pub struct MasqueRelayServer {
     reservations_evicted: AtomicU64,
     /// Epoch-millis of the last reservation summary emit (rate-limit gate).
     last_reservation_summary_ms: AtomicU64,
-    /// Session IDs whose stream-forwarding loop is currently live. While a
-    /// session is in this set its reader/writer tasks still hold the bound UDP
-    /// socket, so `close_session` must NOT lease that socket into a reservation
-    /// (a still-live handover): leasing+reclaiming a live socket would let the
-    /// old and new sessions race on the same port. The natural session-end path
-    /// removes the id only after aborting its forwarding tasks, so the socket is
-    /// exclusively owned before it can be leased.
-    active_forwarding: RwLock<HashSet<u64>>,
+    /// Control handles for currently-live stream-forwarding loops, keyed by
+    /// session id. Lets `close_session` cancel and await a live loop (so a
+    /// same-identity handover stops the old data plane before reusing the port)
+    /// and serves as a claim so a session never gets two concurrent loops. A
+    /// loop registers here before touching its socket and deregisters only after
+    /// aborting its reader/writer tasks, so the socket is exclusively owned by the
+    /// time it can be leased.
+    forwarding: RwLock<HashMap<u64, ForwardingControl>>,
     /// Mutex stripes serializing concurrent CONNECTs from the same authenticated
     /// identity (ADR-011), indexed by the first fingerprint byte. Length is
     /// `RELAY_PEER_LOCK_STRIPES`.
@@ -511,7 +525,7 @@ impl MasqueRelayServer {
             last_reservation_summary_ms: AtomicU64::new(0),
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
-            active_forwarding: RwLock::new(HashSet::new()),
+            forwarding: RwLock::new(HashMap::new()),
             peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
                 .collect(),
@@ -583,7 +597,7 @@ impl MasqueRelayServer {
             last_reservation_summary_ms: AtomicU64::new(0),
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
-            active_forwarding: RwLock::new(HashSet::new()),
+            forwarding: RwLock::new(HashMap::new()),
             peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
                 .collect(),
@@ -773,10 +787,9 @@ impl MasqueRelayServer {
         // any live session this identity already holds, so an authenticated
         // reconnect is never rejected by the capacity (503) or duplicate-address
         // (409) checks below, and we never leave two live sessions for one
-        // identity. close_session will not lease a still-forwarding session's
-        // socket (see `active_forwarding`), so a live handover takes a fresh port;
-        // the common disconnect→reconnect path instead reclaims the reservation
-        // left when the previous session's forwarding loop ended.
+        // identity. close_session cancels and awaits the old session's forwarding
+        // loop before leasing its socket, so the old data plane is fully stopped
+        // and the reclaim below hands this reconnect back the same port.
         if let Some(pid) = peer_id {
             let old = {
                 let sessions = self.sessions.read().await;
@@ -989,7 +1002,12 @@ impl MasqueRelayServer {
             "MASQUE relay session created with bound UDP socket"
         );
 
-        Ok(ConnectUdpResponse::success(Some(advertised_address)))
+        // Expose the exact session id so the connection handler forwards *this*
+        // session rather than re-looking-up by client address (which races with a
+        // same-address reconnect). Not part of the wire format.
+        let mut response = ConnectUdpResponse::success(Some(advertised_address));
+        response.session_id = Some(session_id);
+        Ok(response)
     }
 
     /// Get session for a specific client address
@@ -1382,11 +1400,34 @@ impl MasqueRelayServer {
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
     ) {
-        // Mark this session's forwarding as live BEFORE touching the socket, so a
-        // concurrent handover close_session sees it active and will not lease the
-        // socket out from under us (Blocker 1). Removed on every exit path below.
-        self.active_forwarding.write().await.insert(session_id);
+        // Claim this session's forwarding slot BEFORE touching the socket. The
+        // registration (a) lets a concurrent handover close_session cancel this
+        // loop and wait until it has released the socket, and (b) guards against a
+        // second loop ever running for the same session id (e.g. a racing
+        // duplicate from the connection handler). If one is already registered,
+        // do not start another.
+        let cancel = CancellationToken::new();
+        let done = Arc::new(Notify::new());
+        let claimed = match self.forwarding.write().await.entry(session_id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ForwardingControl {
+                    cancel: cancel.clone(),
+                    done: done.clone(),
+                });
+                true
+            }
+        };
+        if !claimed {
+            tracing::debug!(
+                session_id,
+                "stream forwarding already active for session; not starting a second loop"
+            );
+            return;
+        }
 
+        // From here every exit path must call `finish_forwarding` so a handover
+        // close_session waiting on `done` is released.
         let udp_socket = {
             let sessions = self.sessions.read().await;
             match sessions.get(&session_id) {
@@ -1396,7 +1437,7 @@ impl MasqueRelayServer {
                         session_id,
                         "Cannot start stream forwarding: session not found"
                     );
-                    self.active_forwarding.write().await.remove(&session_id);
+                    self.finish_forwarding(session_id, &done).await;
                     return;
                 }
             }
@@ -1406,7 +1447,7 @@ impl MasqueRelayServer {
             Some(s) => s,
             None => {
                 tracing::warn!(session_id, "Cannot start stream forwarding: no UDP socket");
-                self.active_forwarding.write().await.remove(&session_id);
+                self.finish_forwarding(session_id, &done).await;
                 return;
             }
         };
@@ -1539,6 +1580,9 @@ impl MasqueRelayServer {
         // we retain ownership and explicitly abort + await both afterwards so no
         // detached task can keep using the socket (Blocker 1).
         let close_reason = tokio::select! {
+            // A handover (or any external close_session) cancels the loop so it
+            // stops relaying before its socket is reused.
+            _ = cancel.cancelled() => "handover_cancelled",
             result = &mut reader_handle => {
                 match result {
                     Ok(reason) => reason,
@@ -1679,14 +1723,28 @@ impl MasqueRelayServer {
         writer_handle.abort();
         let _ = reader_handle.await;
         let _ = writer_handle.await;
-        // Forwarding is finished; clear the live flag BEFORE close_session so the
-        // natural session-end close is allowed to lease the now exclusively-owned
-        // socket (a still-live handover close would instead skip the lease).
-        self.active_forwarding.write().await.remove(&session_id);
 
-        if let Err(e) = self.close_session(session_id).await {
-            tracing::debug!(session_id, error = %e, "Error closing session");
+        // Deregister and release any handover waiter now that the tasks are gone
+        // and the socket is exclusively owned again. Done BEFORE close_session so
+        // the natural-end close sees no live loop and may lease the socket.
+        self.finish_forwarding(session_id, &done).await;
+
+        // Natural end: close the session here (which leases the freed socket). On
+        // a handover the cancelling close_session owns the close and the lease, so
+        // we must not double-close.
+        if !cancel.is_cancelled() {
+            if let Err(e) = self.close_session(session_id).await {
+                tracing::debug!(session_id, error = %e, "Error closing session");
+            }
         }
+    }
+
+    /// Deregister a session's forwarding control and release any `close_session`
+    /// waiting (via `done`) for the loop to fully exit. `notify_one` stores a
+    /// permit if no waiter is registered yet, so the signal can't be lost.
+    async fn finish_forwarding(&self, session_id: u64, done: &Arc<Notify>) {
+        self.forwarding.write().await.remove(&session_id);
+        done.notify_one();
     }
 
     /// Close a specific session.
@@ -1707,6 +1765,21 @@ impl MasqueRelayServer {
                     kind: SessionErrorKind::NotFound,
                 })?
         };
+
+        // If a forwarding loop is still live for this session, cancel it and wait
+        // until it has aborted its tasks and released the socket — so an old
+        // session stops relaying before we remove/lease it (no untracked data
+        // plane left behind after a handover), and the socket is exclusively
+        // owned before it can be reused. Removing the session above serialized
+        // concurrent closes, so only one caller reaches this; on a natural end the
+        // loop has already deregistered, making this a no-op.
+        let control = { self.forwarding.read().await.get(&session_id).cloned() };
+        if let Some(control) = control {
+            let exited = control.done.notified();
+            control.cancel.cancel();
+            exited.await;
+        }
+
         session.close();
 
         if let Some(addr) = session.client_address() {
@@ -1717,24 +1790,13 @@ impl MasqueRelayServer {
         let upnp = self.upnp_mappings.write().await.remove(&session_id);
 
         // ADR-011: lease the port for reconnect when the peer's authenticated
-        // identity is known; otherwise drop the socket and shut the UPnP
-        // mapping down (the original behaviour for unauthenticated sessions).
-        //
-        // BUT never lease a socket whose forwarding loop is still live: its
-        // reader/writer tasks still hold the socket, so leasing then reclaiming it
-        // would let the old and new sessions race on the same port. This is the
-        // still-live handover case; drop the socket instead and let the old loop
-        // tear it down when it ends. The natural session-end path has already
-        // removed the id from `active_forwarding` (after aborting its tasks), so
-        // there the socket is free and the lease proceeds.
-        let forwarding_active = self.active_forwarding.read().await.contains(&session_id);
-        let lease = if forwarding_active {
-            None
-        } else {
-            match (session.peer_id(), session.udp_socket().cloned()) {
-                (Some(peer_id), Some(socket)) => Some((peer_id, socket)),
-                _ => None,
-            }
+        // identity is known; otherwise drop the socket and shut the UPnP mapping
+        // down (the original behaviour for unauthenticated sessions). The socket
+        // is now exclusively owned — any forwarding loop has been cancelled and
+        // awaited above — so leasing it is race-free.
+        let lease = match (session.peer_id(), session.udp_socket().cloned()) {
+            (Some(peer_id), Some(socket)) => Some((peer_id, socket)),
+            _ => None,
         };
         match lease {
             Some((peer_id, socket)) => {
@@ -2321,48 +2383,63 @@ mod tests {
         );
     }
 
-    /// Review blocker 1: while a session's forwarding loop is live, `close_session`
-    /// must NOT lease its socket — leasing then reclaiming a socket still held by
-    /// the old reader/writer tasks would let old and new sessions race on the port.
+    /// Review (round 2) blocker: `close_session` must actively cancel a still-live
+    /// forwarding loop and wait for it to exit before returning — so a same-identity
+    /// handover stops the old data plane (no untracked loop survives) and only then
+    /// leases the socket for reuse.
     #[tokio::test]
-    async fn stable_ports_no_lease_while_forwarding_active() {
-        let server = MasqueRelayServer::new(MasqueRelayConfig::default(), test_addr(9000));
+    async fn stable_ports_close_cancels_live_forwarding_loop() {
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            test_addr(9000),
+        ));
         let peer = peer_fp(7);
-        let request = ConnectUdpRequest::bind_any();
 
-        server
-            .handle_connect_request(&request, client_addr(1), Some(peer))
+        let resp = server
+            .handle_connect_request(&ConnectUdpRequest::bind_any(), client_addr(1), Some(peer))
             .await
             .unwrap();
-        let sid = server
-            .get_session_for_client(client_addr(1))
-            .await
-            .unwrap()
-            .session_id;
+        let sid = resp
+            .session_id
+            .expect("success response carries the created session id");
 
-        // Simulate a still-live forwarding loop holding the socket.
-        server.active_forwarding.write().await.insert(sid);
-        server.close_session(sid).await.unwrap();
-        assert_eq!(
-            server.reservations.read().await.len(),
-            0,
-            "must not lease a socket whose forwarding loop is still live"
+        // Register a control and spawn a stand-in forwarding loop that runs until
+        // close_session cancels it, then deregisters + signals done — exactly what
+        // run_stream_forwarding_loop does on cancellation.
+        let cancel = CancellationToken::new();
+        let done = Arc::new(Notify::new());
+        server.forwarding.write().await.insert(
+            sid,
+            ForwardingControl {
+                cancel: cancel.clone(),
+                done: done.clone(),
+            },
         );
-        server.active_forwarding.write().await.remove(&sid);
+        let exited = Arc::new(AtomicBool::new(false));
+        let task = {
+            let server = server.clone();
+            let exited = exited.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                exited.store(true, Ordering::SeqCst);
+                server.finish_forwarding(sid, &done).await;
+            })
+        };
 
-        // With forwarding no longer active, the same flow leases normally.
-        server
-            .handle_connect_request(&request, client_addr(2), Some(peer))
-            .await
-            .unwrap();
-        server
-            .close_session_by_client(client_addr(2))
-            .await
-            .unwrap();
+        // Must cancel the stand-in loop and block until it has fully exited.
+        server.close_session(sid).await.unwrap();
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "close_session must cancel and await the live forwarding loop"
+        );
+        let _ = task.await;
+
+        // The socket was leased only after the loop quiesced, so the port is
+        // retained for the peer to reclaim on reconnect.
         assert_eq!(
             server.reservations.read().await.len(),
             1,
-            "leases once forwarding is no longer active"
+            "port leased once the loop stopped"
         );
     }
 

@@ -3446,7 +3446,12 @@ impl NatTraversalEndpoint {
                                             .await
                                         {
                                             Ok(response) => {
-                                                let is_success = response.is_success();
+                                                // Capture the exact session id the
+                                                // relay created for THIS request, so
+                                                // forwarding can't bind to a different
+                                                // session via a later client-address
+                                                // lookup (which races on reconnect).
+                                                let created_session = response.session_id;
                                                 debug!(
                                                     "Sending CONNECT-UDP response to {}: {:?}",
                                                     addr, response
@@ -3476,22 +3481,20 @@ impl NatTraversalEndpoint {
                                                 // Do NOT call finish() — stream stays open for forwarding
 
                                                 // Start stream-based forwarding loop
-                                                if is_success {
-                                                    if let Some(session_info) =
-                                                        server.get_session_for_client(addr).await
-                                                    {
-                                                        info!(
-                                                            "Starting stream-based relay forwarding for session {} (client: {})",
-                                                            session_info.session_id, addr
-                                                        );
-                                                        server
-                                                            .run_stream_forwarding_loop(
-                                                                session_info.session_id,
-                                                                send_stream,
-                                                                recv_stream,
-                                                            )
-                                                            .await;
-                                                    }
+                                                // for exactly the session that was
+                                                // created (if the request succeeded).
+                                                if let Some(session_id) = created_session {
+                                                    info!(
+                                                        "Starting stream-based relay forwarding for session {} (client: {})",
+                                                        session_id, addr
+                                                    );
+                                                    server
+                                                        .run_stream_forwarding_loop(
+                                                            session_id,
+                                                            send_stream,
+                                                            recv_stream,
+                                                        )
+                                                        .await;
                                                 }
                                             }
                                             Err(e) => {
