@@ -12,14 +12,14 @@ on:
         value: ${{ jobs.security-report.result == 'success' }}
   workflow_dispatch:
   push:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/security.yml'
       - 'deny.toml'
   pull_request:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'

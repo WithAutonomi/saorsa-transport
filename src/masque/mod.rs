@@ -124,5 +124,7 @@ pub use relay_server::{
     DatagramResult, MasqueRelayConfig, MasqueRelayServer, MasqueRelayStats, OutboundDatagram,
     SessionInfo,
 };
-pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats};
+pub use relay_session::{
+    RelayPeerId, RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats,
+};
 pub use relay_socket::{MasqueRelaySocket, RawRelayStreams};
