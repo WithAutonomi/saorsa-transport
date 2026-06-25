@@ -5,9 +5,9 @@ name: Coverage
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
   pull_request:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
   workflow_dispatch:
 
 env:

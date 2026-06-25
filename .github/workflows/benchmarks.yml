@@ -5,14 +5,14 @@ name: Benchmarks
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "benches/**"
   pull_request:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - "src/**"
       - "Cargo.toml"

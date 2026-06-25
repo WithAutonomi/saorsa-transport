@@ -31,13 +31,13 @@ on:
         type: boolean
         default: false
   push:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - '**.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
   pull_request:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
   schedule:
     # Extended tests weekly on Mondays at 4 AM UTC
     - cron: '0 4 * * 1'

@@ -33,13 +33,13 @@
 
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingRwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::os::unix::io::AsRawFd;
@@ -76,6 +76,12 @@ const RELAY_FORWARD_CHANNEL_CAPACITY: usize = 8192;
 /// volume low; one summary per relay per interval is enough to confirm the
 /// feature is working (reclaim hits climbing, reservation pool size).
 const RELAY_RESERVATION_SUMMARY_INTERVAL_MS: u64 = 5 * 60 * 1000; // 5 minutes
+
+/// Number of mutex stripes used to serialize concurrent CONNECTs from the same
+/// authenticated identity (ADR-011). A peer maps to a stripe by the first byte
+/// of its fingerprint, so same-identity CONNECTs always take the same lock while
+/// memory stays bounded (no per-peer map that grows without limit).
+const RELAY_PEER_LOCK_STRIPES: usize = 256;
 
 /// Suggested PMTU sent to the relay-client when the egress UDP send
 /// fails with `EMSGSIZE`.  Picked to be QUIC's mandatory minimum
@@ -238,10 +244,14 @@ pub struct MasqueRelayConfig {
     pub global_bandwidth_limit: u64,
     /// Enable authentication requirement
     pub require_authentication: bool,
-    /// How long a stable-port reservation (ADR-011) is retained after the
-    /// session using it ends, waiting for the same authenticated peer to
-    /// reconnect and reclaim its previously-advertised port. Bounds how long an
-    /// idle port is held.
+    /// Freshness window for a stable-port reservation (ADR-011): after the
+    /// session using it ends, a reconnecting authenticated peer reclaims the port
+    /// only if it returns within this window. Expiry is **lazy** — the TTL is
+    /// checked when the peer reconnects (a stale reservation is discarded and a
+    /// fresh port bound), not by a background sweeper. Idle reservations from
+    /// peers that never return are bounded instead by `max_reservations` (LRU
+    /// eviction); `cleanup_expired_reservations()` can be called to sweep them
+    /// proactively but is not wired to a timer.
     pub reservation_ttl: Duration,
     /// Maximum number of idle stable-port reservations held at once. When the
     /// cap is reached the least-recently-released reservation is evicted (its
@@ -431,6 +441,18 @@ pub struct MasqueRelayServer {
     reservations_evicted: AtomicU64,
     /// Epoch-millis of the last reservation summary emit (rate-limit gate).
     last_reservation_summary_ms: AtomicU64,
+    /// Session IDs whose stream-forwarding loop is currently live. While a
+    /// session is in this set its reader/writer tasks still hold the bound UDP
+    /// socket, so `close_session` must NOT lease that socket into a reservation
+    /// (a still-live handover): leasing+reclaiming a live socket would let the
+    /// old and new sessions race on the same port. The natural session-end path
+    /// removes the id only after aborting its forwarding tasks, so the socket is
+    /// exclusively owned before it can be leased.
+    active_forwarding: RwLock<HashSet<u64>>,
+    /// Mutex stripes serializing concurrent CONNECTs from the same authenticated
+    /// identity (ADR-011), indexed by the first fingerprint byte. Length is
+    /// `RELAY_PEER_LOCK_STRIPES`.
+    peer_locks: Vec<Mutex<()>>,
     /// Whether this node is willing to serve as a relay for private peers.
     ///
     /// Set to `false` by the ADR-014 reachability classifier when the node
@@ -489,6 +511,10 @@ impl MasqueRelayServer {
             last_reservation_summary_ms: AtomicU64::new(0),
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
+            active_forwarding: RwLock::new(HashSet::new()),
+            peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
+                .map(|_| Mutex::new(()))
+                .collect(),
             ip_policy: None,
         }
     }
@@ -557,6 +583,10 @@ impl MasqueRelayServer {
             last_reservation_summary_ms: AtomicU64::new(0),
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
+            active_forwarding: RwLock::new(HashSet::new()),
+            peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
+                .map(|_| Mutex::new(()))
+                .collect(),
             ip_policy: None,
         }
     }
@@ -727,6 +757,36 @@ impl MasqueRelayServer {
                     "Rejecting relay CONNECT (IP policy: client on upstream relay IP)",
                 );
                 return Ok(ConnectUdpResponse::error(403, denial.to_string()));
+            }
+        }
+
+        // ADR-011 [W1]: serialize concurrent CONNECTs from the same authenticated
+        // identity via a bounded mutex stripe, so the handover below plus the
+        // capacity / duplicate-address checks plus the reclaim-or-bind and session
+        // insert form a single critical section per identity. Held to function end.
+        let _peer_guard = match peer_id {
+            Some(pid) => Some(self.peer_lock(&pid).lock().await),
+            None => None,
+        };
+
+        // ADR-011 [handover, ordered BEFORE the capacity/duplicate checks]: retire
+        // any live session this identity already holds, so an authenticated
+        // reconnect is never rejected by the capacity (503) or duplicate-address
+        // (409) checks below, and we never leave two live sessions for one
+        // identity. close_session will not lease a still-forwarding session's
+        // socket (see `active_forwarding`), so a live handover takes a fresh port;
+        // the common disconnect→reconnect path instead reclaims the reservation
+        // left when the previous session's forwarding loop ended.
+        if let Some(pid) = peer_id {
+            let old = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .iter()
+                    .find(|(_, s)| s.peer_id() == Some(pid))
+                    .map(|(id, _)| *id)
+            };
+            if let Some(old_sid) = old {
+                let _ = self.close_session(old_sid).await;
             }
         }
 
@@ -1322,6 +1382,11 @@ impl MasqueRelayServer {
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
     ) {
+        // Mark this session's forwarding as live BEFORE touching the socket, so a
+        // concurrent handover close_session sees it active and will not lease the
+        // socket out from under us (Blocker 1). Removed on every exit path below.
+        self.active_forwarding.write().await.insert(session_id);
+
         let udp_socket = {
             let sessions = self.sessions.read().await;
             match sessions.get(&session_id) {
@@ -1331,6 +1396,7 @@ impl MasqueRelayServer {
                         session_id,
                         "Cannot start stream forwarding: session not found"
                     );
+                    self.active_forwarding.write().await.remove(&session_id);
                     return;
                 }
             }
@@ -1340,6 +1406,7 @@ impl MasqueRelayServer {
             Some(s) => s,
             None => {
                 tracing::warn!(session_id, "Cannot start stream forwarding: no UDP socket");
+                self.active_forwarding.write().await.remove(&session_id);
                 return;
             }
         };
@@ -1375,7 +1442,7 @@ impl MasqueRelayServer {
         let ctrl_tx = fwd_tx.clone();
 
         // Reader: UDP socket → channel (never blocked by stream writes)
-        let reader_handle = tokio::spawn(async move {
+        let mut reader_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
                 match socket.recv_from(&mut buf).await {
@@ -1403,7 +1470,7 @@ impl MasqueRelayServer {
         });
 
         // Writer: channel → QUIC stream (paced by stream flow control)
-        let writer_handle = tokio::spawn(async move {
+        let mut writer_handle = tokio::spawn(async move {
             let mut keepalive = tokio::time::interval(RELAY_KEEPALIVE_INTERVAL);
             keepalive.tick().await; // skip immediate first tick
 
@@ -1468,8 +1535,11 @@ impl MasqueRelayServer {
             }
         });
 
+        // Borrow the task handles (`&mut`) so the select! does not consume them;
+        // we retain ownership and explicitly abort + await both afterwards so no
+        // detached task can keep using the socket (Blocker 1).
         let close_reason = tokio::select! {
-            result = reader_handle => {
+            result = &mut reader_handle => {
                 match result {
                     Ok(reason) => reason,
                     Err(e) => {
@@ -1478,7 +1548,7 @@ impl MasqueRelayServer {
                     }
                 }
             },
-            result = writer_handle => {
+            result = &mut writer_handle => {
                 match result {
                     Ok(reason) => reason,
                     Err(e) => {
@@ -1600,6 +1670,20 @@ impl MasqueRelayServer {
             close_reason,
             "Stream-based relay forwarding loop ended"
         );
+
+        // Blocker 1: stop the forwarding tasks so neither still holds the UDP
+        // socket once it can be leased/reclaimed. The select! polled the handles
+        // by &mut, so we still own them; abort + await guarantees both tasks have
+        // dropped their socket clones before we close (and possibly lease) it.
+        reader_handle.abort();
+        writer_handle.abort();
+        let _ = reader_handle.await;
+        let _ = writer_handle.await;
+        // Forwarding is finished; clear the live flag BEFORE close_session so the
+        // natural session-end close is allowed to lease the now exclusively-owned
+        // socket (a still-live handover close would instead skip the lease).
+        self.active_forwarding.write().await.remove(&session_id);
+
         if let Err(e) = self.close_session(session_id).await {
             tracing::debug!(session_id, error = %e, "Error closing session");
         }
@@ -1616,10 +1700,12 @@ impl MasqueRelayServer {
         // for a possible stable-port lease before it is dropped.
         let mut session = {
             let mut sessions = self.sessions.write().await;
-            sessions.remove(&session_id).ok_or(RelayError::SessionError {
-                session_id: Some(session_id as u32),
-                kind: SessionErrorKind::NotFound,
-            })?
+            sessions
+                .remove(&session_id)
+                .ok_or(RelayError::SessionError {
+                    session_id: Some(session_id as u32),
+                    kind: SessionErrorKind::NotFound,
+                })?
         };
         session.close();
 
@@ -1633,9 +1719,22 @@ impl MasqueRelayServer {
         // ADR-011: lease the port for reconnect when the peer's authenticated
         // identity is known; otherwise drop the socket and shut the UPnP
         // mapping down (the original behaviour for unauthenticated sessions).
-        let lease = match (session.peer_id(), session.udp_socket().cloned()) {
-            (Some(peer_id), Some(socket)) => Some((peer_id, socket)),
-            _ => None,
+        //
+        // BUT never lease a socket whose forwarding loop is still live: its
+        // reader/writer tasks still hold the socket, so leasing then reclaiming it
+        // would let the old and new sessions race on the same port. This is the
+        // still-live handover case; drop the socket instead and let the old loop
+        // tear it down when it ends. The natural session-end path has already
+        // removed the id from `active_forwarding` (after aborting its tasks), so
+        // there the socket is free and the lease proceeds.
+        let forwarding_active = self.active_forwarding.read().await.contains(&session_id);
+        let lease = if forwarding_active {
+            None
+        } else {
+            match (session.peer_id(), session.udp_socket().cloned()) {
+                (Some(peer_id), Some(socket)) => Some((peer_id, socket)),
+                _ => None,
+            }
         };
         match lease {
             Some((peer_id, socket)) => {
@@ -1781,19 +1880,10 @@ impl MasqueRelayServer {
         peer_id: RelayPeerId,
         want_ipv4: bool,
     ) -> Option<(Arc<UdpSocket>, u16, Option<UpnpMappingService>)> {
-        // Deterministic handover: if this identity still has a live session
-        // (duplicate / stale half-open), retire it first so its port is leased
-        // and can be reclaimed below.
-        let live = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .iter()
-                .find(|(_, s)| s.peer_id() == Some(peer_id))
-                .map(|(id, _)| *id)
-        };
-        if let Some(session_id) = live {
-            let _ = self.close_session(session_id).await;
-        }
+        // Deterministic handover (retiring any live session for this identity) is
+        // performed up-front in `handle_connect_request`, under the per-identity
+        // lock and before the capacity/duplicate checks — so by here there is at
+        // most a leased reservation to take, never a live session to close.
 
         // Take the reservation if present, fresh, and IP-family-compatible.
         let ttl = self.config.reservation_ttl;
@@ -1876,6 +1966,12 @@ impl MasqueRelayServer {
             active_reservations = active_reservations,
             "relay-reservation activity summary (cumulative counts)"
         );
+    }
+
+    /// The mutex stripe that serializes concurrent CONNECTs for a given
+    /// authenticated identity (ADR-011). Same fingerprint → same stripe.
+    fn peer_lock(&self, peer_id: &RelayPeerId) -> &Mutex<()> {
+        &self.peer_locks[peer_id[0] as usize % RELAY_PEER_LOCK_STRIPES]
     }
 
     /// Close session by client address
@@ -2010,7 +2106,10 @@ mod tests {
         let port1 = r1.proxy_public_address.unwrap().port();
 
         // Session drops → the port is leased as a reservation.
-        server.close_session_by_client(client_addr(1)).await.unwrap();
+        server
+            .close_session_by_client(client_addr(1))
+            .await
+            .unwrap();
         assert_eq!(server.session_count().await, 0);
         assert_eq!(server.reservations.read().await.len(), 1);
 
@@ -2022,7 +2121,10 @@ mod tests {
         assert_eq!(r2.status, 200);
         let port2 = r2.proxy_public_address.unwrap().port();
 
-        assert_eq!(port1, port2, "reconnecting peer should reclaim its stable port");
+        assert_eq!(
+            port1, port2,
+            "reconnecting peer should reclaim its stable port"
+        );
         // Reservation consumed by the reclaim.
         assert_eq!(server.reservations.read().await.len(), 0);
     }
@@ -2038,7 +2140,10 @@ mod tests {
             .await
             .unwrap();
         let port1 = r1.proxy_public_address.unwrap().port();
-        server.close_session_by_client(client_addr(1)).await.unwrap();
+        server
+            .close_session_by_client(client_addr(1))
+            .await
+            .unwrap();
 
         // peer_1's reservation still holds port1's socket, so peer_2 cannot get it.
         let r2 = server
@@ -2059,7 +2164,10 @@ mod tests {
             .handle_connect_request(&request, client_addr(1), None)
             .await
             .unwrap();
-        server.close_session_by_client(client_addr(1)).await.unwrap();
+        server
+            .close_session_by_client(client_addr(1))
+            .await
+            .unwrap();
 
         assert_eq!(server.reservations.read().await.len(), 0);
     }
@@ -2078,7 +2186,10 @@ mod tests {
             .handle_connect_request(&request, client_addr(1), Some(peer_fp(7)))
             .await
             .unwrap();
-        server.close_session_by_client(client_addr(1)).await.unwrap();
+        server
+            .close_session_by_client(client_addr(1))
+            .await
+            .unwrap();
         assert_eq!(server.reservations.read().await.len(), 1);
 
         tokio::time::sleep(Duration::from_millis(90)).await;
@@ -2102,7 +2213,10 @@ mod tests {
                 .handle_connect_request(&request, client_addr(i), Some(peer_fp(i)))
                 .await
                 .unwrap();
-            server.close_session_by_client(client_addr(i)).await.unwrap();
+            server
+                .close_session_by_client(client_addr(i))
+                .await
+                .unwrap();
             // Distinct release timestamps so LRU order is unambiguous.
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2142,8 +2256,114 @@ mod tests {
 
         assert_eq!(port1, port2, "handover should reuse the port");
         assert_eq!(server.session_count().await, 1, "old session retired");
-        assert!(server.get_session_for_client(client_addr(2)).await.is_some());
-        assert!(server.get_session_for_client(client_addr(1)).await.is_none());
+        assert!(
+            server
+                .get_session_for_client(client_addr(2))
+                .await
+                .is_some()
+        );
+        assert!(
+            server
+                .get_session_for_client(client_addr(1))
+                .await
+                .is_none()
+        );
+    }
+
+    /// Review blocker 2: an authenticated reconnect must retire the peer's
+    /// existing session BEFORE the capacity check, so a full relay
+    /// (`max_sessions = 1`) still admits the reconnect rather than returning 503.
+    #[tokio::test]
+    async fn stable_ports_handover_precedes_capacity_check() {
+        let config = MasqueRelayConfig {
+            max_sessions: 1,
+            ..Default::default()
+        };
+        let server = MasqueRelayServer::new(config, test_addr(9000));
+        let peer = peer_fp(7);
+        let request = ConnectUdpRequest::bind_any();
+
+        let r1 = server
+            .handle_connect_request(&request, client_addr(1), Some(peer))
+            .await
+            .unwrap();
+        assert_eq!(r1.status, 200);
+        let port1 = r1.proxy_public_address.unwrap().port();
+        assert_eq!(server.session_count().await, 1);
+
+        // Relay is at capacity. The same identity reconnecting from a new address
+        // must hand over (retire the old session first), not be rejected with 503.
+        let r2 = server
+            .handle_connect_request(&request, client_addr(2), Some(peer))
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.status, 200,
+            "reconnect at capacity must hand over, not 503"
+        );
+        assert_eq!(server.session_count().await, 1, "old session retired");
+        assert_eq!(
+            r2.proxy_public_address.unwrap().port(),
+            port1,
+            "reconnect reclaims the same port"
+        );
+        assert!(
+            server
+                .get_session_for_client(client_addr(2))
+                .await
+                .is_some()
+        );
+        assert!(
+            server
+                .get_session_for_client(client_addr(1))
+                .await
+                .is_none()
+        );
+    }
+
+    /// Review blocker 1: while a session's forwarding loop is live, `close_session`
+    /// must NOT lease its socket — leasing then reclaiming a socket still held by
+    /// the old reader/writer tasks would let old and new sessions race on the port.
+    #[tokio::test]
+    async fn stable_ports_no_lease_while_forwarding_active() {
+        let server = MasqueRelayServer::new(MasqueRelayConfig::default(), test_addr(9000));
+        let peer = peer_fp(7);
+        let request = ConnectUdpRequest::bind_any();
+
+        server
+            .handle_connect_request(&request, client_addr(1), Some(peer))
+            .await
+            .unwrap();
+        let sid = server
+            .get_session_for_client(client_addr(1))
+            .await
+            .unwrap()
+            .session_id;
+
+        // Simulate a still-live forwarding loop holding the socket.
+        server.active_forwarding.write().await.insert(sid);
+        server.close_session(sid).await.unwrap();
+        assert_eq!(
+            server.reservations.read().await.len(),
+            0,
+            "must not lease a socket whose forwarding loop is still live"
+        );
+        server.active_forwarding.write().await.remove(&sid);
+
+        // With forwarding no longer active, the same flow leases normally.
+        server
+            .handle_connect_request(&request, client_addr(2), Some(peer))
+            .await
+            .unwrap();
+        server
+            .close_session_by_client(client_addr(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.reservations.read().await.len(),
+            1,
+            "leases once forwarding is no longer active"
+        );
     }
 
     #[tokio::test]

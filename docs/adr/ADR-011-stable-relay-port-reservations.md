@@ -88,18 +88,25 @@ and avoids new startup wiring (the relay server has no periodic task today).
 
 ### 3. Safe reconnect / handover
 
-On an incoming CONNECT from authenticated peer `P` (`reclaim_reservation`):
+On an incoming CONNECT from authenticated peer `P`, `handle_connect_request`:
 
-- If `P` still has a **live session** (duplicate / stale half-open), it is
-  retired first — `close_session` leases that session's port into
-  `reservations`, which the step below then reclaims. This is the deterministic
-  handover: the port is reused only after ownership is unambiguous.
-- The reservation is taken only if it is **fresh** (within `reservation_ttl`) and
-  its socket matches the client's **IP family**; otherwise it is discarded and a
-  fresh port is bound.
+- Acquires a **per-identity mutex stripe** (bounded; indexed by the fingerprint)
+  and holds it across the handover, the capacity/duplicate checks, the reclaim,
+  and the session insert — so concurrent CONNECTs from the same identity are
+  serialized and never leave two live sessions for one identity.
+- **Retires any live session `P` already holds, before the capacity/duplicate
+  checks**, so an authenticated reconnect is not rejected with `503`/`409`. A
+  session whose stream-forwarding loop is still live is *not* leased (its
+  reader/writer tasks still hold the socket); that handover therefore takes a
+  **fresh** port. The common path — `P` disconnected, its loop ended and leased
+  the port, then `P` reconnects — reclaims the **same** port.
+- Takes the reservation only if it is **fresh** (within `reservation_ttl`) and
+  its socket matches the client's **IP family**; otherwise discards it and binds
+  a fresh port.
 
-Concurrent CONNECTs from the same identity are serialized by the reservation
-lock so only one adopts the port.
+Socket exclusivity is enforced by aborting and awaiting a session's forwarding
+tasks before its socket can be leased/reclaimed, so old and new sessions never
+share a socket (see §"Consequences").
 
 ### 4. Fallback path
 
