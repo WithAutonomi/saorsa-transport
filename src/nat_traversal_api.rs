@@ -3390,9 +3390,15 @@ impl NatTraversalEndpoint {
         };
 
         let client_addr = connection.remote_address();
+        // Resolve the relayed peer's authenticated identity once for the
+        // connection's lifetime; it keys stable-port reservations. `Copy`, so
+        // it threads into each per-stream task for free.
+        let peer_fingerprint = Self::authenticated_peer_fingerprint(&connection);
         debug!(
-            "Started relay request handler for peer at {} (stable_id={})",
-            client_addr, stable_id
+            "Started relay request handler for peer at {} (stable_id={}, authenticated={})",
+            client_addr,
+            stable_id,
+            peer_fingerprint.is_some()
         );
 
         loop {
@@ -3401,6 +3407,7 @@ impl NatTraversalEndpoint {
                 Ok((mut send_stream, mut recv_stream)) => {
                     let server = Arc::clone(&relay_server);
                     let addr = client_addr;
+                    let peer_id = peer_fingerprint;
                     let _conn_for_relay = connection.clone();
 
                     tokio::spawn(async move {
@@ -3434,9 +3441,17 @@ impl NatTraversalEndpoint {
                                         );
 
                                         // Handle the request via relay server
-                                        match server.handle_connect_request(&request, addr).await {
+                                        match server
+                                            .handle_connect_request(&request, addr, peer_id)
+                                            .await
+                                        {
                                             Ok(response) => {
-                                                let is_success = response.is_success();
+                                                // Capture the exact session id the
+                                                // relay created for THIS request, so
+                                                // forwarding can't bind to a different
+                                                // session via a later client-address
+                                                // lookup (which races on reconnect).
+                                                let created_session = response.session_id;
                                                 debug!(
                                                     "Sending CONNECT-UDP response to {}: {:?}",
                                                     addr, response
@@ -3466,22 +3481,20 @@ impl NatTraversalEndpoint {
                                                 // Do NOT call finish() — stream stays open for forwarding
 
                                                 // Start stream-based forwarding loop
-                                                if is_success {
-                                                    if let Some(session_info) =
-                                                        server.get_session_for_client(addr).await
-                                                    {
-                                                        info!(
-                                                            "Starting stream-based relay forwarding for session {} (client: {})",
-                                                            session_info.session_id, addr
-                                                        );
-                                                        server
-                                                            .run_stream_forwarding_loop(
-                                                                session_info.session_id,
-                                                                send_stream,
-                                                                recv_stream,
-                                                            )
-                                                            .await;
-                                                    }
+                                                // for exactly the session that was
+                                                // created (if the request succeeded).
+                                                if let Some(session_id) = created_session {
+                                                    info!(
+                                                        "Starting stream-based relay forwarding for session {} (client: {})",
+                                                        session_id, addr
+                                                    );
+                                                    server
+                                                        .run_stream_forwarding_loop(
+                                                            session_id,
+                                                            send_stream,
+                                                            recv_stream,
+                                                        )
+                                                        .await;
                                                 }
                                             }
                                             Err(e) => {
@@ -5554,6 +5567,22 @@ impl NatTraversalEndpoint {
         }
 
         None
+    }
+
+    /// Derive the canonical 32-byte peer fingerprint (`AUTONOMI_PEER_ID_V2`)
+    /// from a connection's authenticated ML-DSA-65 identity, or `None` if the
+    /// peer is not PQC-authenticated.
+    ///
+    /// This keys relay-port reservations to a cryptographic identity rather
+    /// than an ephemeral socket address. The identity comes solely from the
+    /// authenticated QUIC/TLS handshake — never from untrusted request payload.
+    fn authenticated_peer_fingerprint(connection: &InnerConnection) -> Option<[u8; 32]> {
+        let spki = Self::extract_public_key_from_connection(connection)?;
+        let public_key =
+            crate::crypto::raw_public_keys::pqc::extract_public_key_from_spki(&spki).ok()?;
+        Some(crate::crypto::raw_public_keys::pqc::fingerprint_public_key(
+            &public_key,
+        ))
     }
 
     /// Extract the raw SPKI bytes from a connection's TLS identity.

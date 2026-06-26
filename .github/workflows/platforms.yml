@@ -22,13 +22,13 @@ on:
           - minimal
           - full
   push:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
     paths:
       - '**.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
   pull_request:
-    branches: [master, main]
+    branches: [master, main, "rc-*"]
   schedule:
     # Run weekly
     - cron: '0 2 * * 1'

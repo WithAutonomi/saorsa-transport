@@ -1184,6 +1184,37 @@ struct RecvState {
     recv_limiter: WorkLimiter,
 }
 
+/// Returns `true` for UDP receive errors that pertain to a single prior
+/// transmit — typically surfaced from an ICMP error report — rather than to the
+/// shared endpoint socket itself. Such errors must NOT terminate the endpoint
+/// driver: the endpoint multiplexes every peer connection over one socket, so
+/// tearing it down on a per-peer ICMP report drops all connections at once and,
+/// because the driver is never respawned, wedges the node permanently.
+///
+/// On Windows these are delivered inline from `recvfrom` unless the
+/// `SIO_UDP_CONNRESET` / `SIO_UDP_NETRESET` ioctls are cleared (which this
+/// socket path does not do). The damaging one observed in the field is
+/// `WSAENETRESET` (os error 10052), reported for an ICMP "TTL expired in
+/// transit" on an earlier outbound datagram; it has no stable `io::ErrorKind`,
+/// so it is matched by raw code. The numeric WinSock codes do not collide with
+/// Unix `errno` values, so the raw-code check is harmless on every platform.
+fn is_transient_recv_error(e: &io::Error) -> bool {
+    use io::ErrorKind::{ConnectionRefused, ConnectionReset, HostUnreachable, NetworkUnreachable};
+    if matches!(
+        e.kind(),
+        ConnectionReset | ConnectionRefused | HostUnreachable | NetworkUnreachable
+    ) {
+        return true;
+    }
+    // WinSock codes for per-datagram ICMP conditions, several of which lack a
+    // portable `ErrorKind`: NETUNREACH(10051), NETRESET(10052), CONNRESET(10054),
+    // CONNREFUSED(10061), HOSTUNREACH(10065).
+    matches!(
+        e.raw_os_error(),
+        Some(10051 | 10052 | 10054 | 10061 | 10065)
+    )
+}
+
 impl RecvState {
     fn new(
         sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
@@ -1292,9 +1323,15 @@ impl RecvState {
                         keep_going: false,
                     });
                 }
-                // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
-                // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                // Tolerate per-datagram receive errors instead of killing the
+                // endpoint driver. ECONNRESET is undefined in QUIC and may be
+                // injected by an attacker; the ICMP-driven family (e.g. Windows
+                // WSAENETRESET / os error 10052) refers to a single prior transmit
+                // to one peer. Tearing down the shared socket for any of these
+                // drops every multiplexed connection permanently. See
+                // `is_transient_recv_error`.
+                Poll::Ready(Err(ref e)) if is_transient_recv_error(e) => {
+                    trace!(error = %e, "ignoring transient UDP recv error");
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
@@ -1328,4 +1365,59 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(test)]
+mod transient_recv_error_tests {
+    use super::is_transient_recv_error;
+    use std::io;
+
+    #[test]
+    fn wsaenetreset_10052_is_transient() {
+        // The exact error that wedged Windows nodes in the field: an ICMP
+        // "TTL expired in transit" surfaced as WSAENETRESET. It has no portable
+        // ErrorKind, so it must be recognised by its raw WinSock code.
+        assert!(is_transient_recv_error(&io::Error::from_raw_os_error(
+            10052
+        )));
+    }
+
+    #[test]
+    fn icmp_family_winsock_codes_are_transient() {
+        // NETUNREACH, CONNRESET, CONNREFUSED, HOSTUNREACH.
+        for code in [10051, 10054, 10061, 10065] {
+            assert!(
+                is_transient_recv_error(&io::Error::from_raw_os_error(code)),
+                "WinSock {code} should be tolerated"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_error_kinds_are_transient() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            assert!(
+                is_transient_recv_error(&io::Error::from(kind)),
+                "{kind:?} should be tolerated"
+            );
+        }
+    }
+
+    #[test]
+    fn genuinely_fatal_errors_still_propagate() {
+        // A dead/closed socket must still kill the driver, not be swallowed.
+        assert!(!is_transient_recv_error(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        // WSAENETDOWN (10050) is deliberately excluded: a downed adapter is not a
+        // per-datagram condition and tolerating it could busy-loop the driver.
+        assert!(!is_transient_recv_error(&io::Error::from_raw_os_error(
+            10050
+        )));
+    }
 }

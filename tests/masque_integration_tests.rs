@@ -71,7 +71,7 @@ async fn test_relay_server_handles_connect_request() {
     let request = ConnectUdpRequest::bind_any();
 
     let response = server
-        .handle_connect_request(&request, client_addr)
+        .handle_connect_request(&request, client_addr, None)
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn test_relay_server_session_limit() {
         let client = test_addr(12345 + i);
         let request = ConnectUdpRequest::bind_any();
         let response = server
-            .handle_connect_request(&request, client)
+            .handle_connect_request(&request, client, None)
             .await
             .unwrap();
         assert!(response.is_success());
@@ -102,7 +102,7 @@ async fn test_relay_server_session_limit() {
     let extra_client = test_addr(12347);
     let request = ConnectUdpRequest::bind_any();
     let response = server
-        .handle_connect_request(&request, extra_client)
+        .handle_connect_request(&request, extra_client, None)
         .await
         .unwrap();
     assert!(!response.is_success());
@@ -341,7 +341,7 @@ async fn test_e2e_relay_scenario() {
     // Client connects to relay
     let request = ConnectUdpRequest::bind_any();
     let response = server
-        .handle_connect_request(&request, test_addr(12345))
+        .handle_connect_request(&request, test_addr(12345), None)
         .await
         .unwrap();
 
@@ -387,7 +387,7 @@ async fn test_high_session_count() {
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, i as u8)), 12345 + i);
         let request = ConnectUdpRequest::bind_any();
         let response = server
-            .handle_connect_request(&request, client)
+            .handle_connect_request(&request, client, None)
             .await
             .unwrap();
         assert!(response.is_success());
