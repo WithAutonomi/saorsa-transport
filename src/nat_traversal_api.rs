@@ -315,6 +315,12 @@ use crate::crypto::{pqc::PqcConfig, raw_public_keys::RawPublicKeyConfigBuilder};
 /// retry via a non-relay address.
 const RELAY_TUNNEL_LOST_CODE: u32 = 0x52_4c_4f_53; // "RLOS"
 
+/// Cadence of the `endpoint traffic summary (cumulative)` INFO line (V2-623).
+/// A `const` so testnets can drop it to 60s; 300s is the production default
+/// that keeps log volume negligible (one line per node per interval). The
+/// shipping pipeline only carries INFO+, so this line is emitted at INFO.
+const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
 /// An active relay session for MASQUE CONNECT-UDP
 ///
 /// Stores the QUIC connection to a relay server and the public address
@@ -1873,6 +1879,7 @@ impl NatTraversalEndpoint {
         // P2pEndpoint — that's done by the caller of accept_connection_direct.
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
+        endpoint.spawn_endpoint_traffic_summary();
 
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
@@ -2313,6 +2320,7 @@ impl NatTraversalEndpoint {
         // P2pEndpoint — that's done by the caller of accept_connection_direct.
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
+        endpoint.spawn_endpoint_traffic_summary();
 
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
@@ -4317,6 +4325,106 @@ impl NatTraversalEndpoint {
     /// looked up directly in the connections DashMap, avoiding competing
     /// consumers on the `event_rx` channel (which is drained by `poll()`).
     /// All completed connections are sent through `handshake_tx`.
+    /// Spawn the periodic endpoint traffic-summary task (V2-623).
+    ///
+    /// Emits a cumulative `endpoint traffic summary (cumulative)` INFO line
+    /// carrying total UDP bytes tx/rx across all QUIC connections plus
+    /// connection open/close counts. This is the reconciliation line for the
+    /// application-payload counters in ant-node/saorsa-core: (replication +
+    /// wire + relay) plus transport overhead should account for the bulk of
+    /// these numbers, and these should in turn track telegraf's host `net`
+    /// counters. A persistent unexplained gap is the signal that some traffic
+    /// source is still invisible.
+    ///
+    /// quinn's per-connection `ConnectionStats` are cumulative for a
+    /// connection's lifetime but vanish when the connection is dropped. Rather
+    /// than instrument every one of the several connection-removal sites (a
+    /// single missed site would make the emitted total non-monotonic), we
+    /// sample live connections each tick and fold only the positive delta since
+    /// the previous observation into a process-wide accumulator, keyed by the
+    /// connection's stable id. This is monotonic by construction and fully
+    /// self-contained. Trade-off: a connection that both opens and closes
+    /// entirely within one interval is never sampled, so its (handshake-sized)
+    /// bytes and its open/close are not counted — acceptable, since the bytes
+    /// are negligible and this line exists to catch large persistent gaps.
+    fn spawn_endpoint_traffic_summary(&self) {
+        let connections = self.connections.clone();
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ENDPOINT_TRAFFIC_SUMMARY_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+
+            // Cumulative process-wide accumulators (monotonic).
+            let mut udp_tx_bytes: u64 = 0;
+            let mut udp_rx_bytes: u64 = 0;
+            let mut connections_opened: u64 = 0;
+            let mut connections_closed: u64 = 0;
+            // Per-connection last-observed cumulative UDP bytes, keyed by
+            // quinn stable id. Bounded by the live connection count (reaped
+            // below when a connection disappears).
+            let mut seen: std::collections::HashMap<usize, (u64, u64)> =
+                std::collections::HashMap::new();
+
+            loop {
+                ticker.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let mut live_ids: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for entry in connections.iter() {
+                    let conn = entry.value();
+                    let id = conn.stable_id();
+                    live_ids.insert(id);
+                    let stats = conn.stats();
+                    let tx = stats.udp_tx.bytes;
+                    let rx = stats.udp_rx.bytes;
+                    match seen.get(&id) {
+                        Some(&(last_tx, last_rx)) => {
+                            // Per-connection stats are monotonic; add the delta.
+                            udp_tx_bytes += tx.saturating_sub(last_tx);
+                            udp_rx_bytes += rx.saturating_sub(last_rx);
+                        }
+                        None => {
+                            connections_opened += 1;
+                            udp_tx_bytes += tx;
+                            udp_rx_bytes += rx;
+                        }
+                    }
+                    seen.insert(id, (tx, rx));
+                }
+
+                // Reap connections that have disappeared since the last tick.
+                // Their bytes were already folded through the previous
+                // observation, so this only advances the closed counter and
+                // keeps `seen` bounded.
+                let gone: Vec<usize> = seen
+                    .keys()
+                    .copied()
+                    .filter(|id| !live_ids.contains(id))
+                    .collect();
+                for id in gone {
+                    seen.remove(&id);
+                    connections_closed += 1;
+                }
+
+                info!(
+                    target: "saorsa_transport::traffic",
+                    udp_tx_bytes,
+                    udp_rx_bytes,
+                    connections_opened,
+                    connections_closed,
+                    active_connections = live_ids.len(),
+                    "endpoint traffic summary (cumulative)"
+                );
+            }
+
+            debug!("Endpoint traffic-summary task shut down");
+        });
+    }
+
     fn spawn_accept_loop(&self) {
         let endpoint = match self.inner_endpoint.clone() {
             Some(ep) => ep,

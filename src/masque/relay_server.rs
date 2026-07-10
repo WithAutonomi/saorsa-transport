@@ -287,6 +287,17 @@ pub struct MasqueRelayStats {
     pub bytes_relayed: AtomicU64,
     /// Total datagrams forwarded
     pub datagrams_forwarded: AtomicU64,
+    /// Cumulative bytes forwarded relay → third-party target (relayed peer's
+    /// egress; Direction 2). Counts the datagram payload length.
+    pub forwarded_to_target_bytes: AtomicU64,
+    /// Cumulative count of datagrams forwarded to the third-party target.
+    pub forwarded_to_target_count: AtomicU64,
+    /// Cumulative bytes forwarded third-party → relayed peer (Direction 1).
+    /// Counts the encoded tunnel-frame length, so it is slightly larger than
+    /// the raw payload (a few bytes of datagram framing per packet).
+    pub forwarded_to_client_bytes: AtomicU64,
+    /// Cumulative count of frames forwarded back to the relayed peer.
+    pub forwarded_to_client_count: AtomicU64,
     /// Authentication failures
     pub auth_failures: AtomicU64,
     /// Rate limit rejections
@@ -319,6 +330,22 @@ impl MasqueRelayStats {
     /// Record a datagram forwarded
     pub fn record_datagram(&self) {
         self.datagrams_forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record bytes forwarded relay → third-party target (Direction 2 egress).
+    pub fn record_forwarded_to_target(&self, bytes: u64) {
+        self.forwarded_to_target_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.forwarded_to_target_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record bytes forwarded third-party → relayed peer (Direction 1 ingress).
+    pub fn record_forwarded_to_client(&self, bytes: u64) {
+        self.forwarded_to_client_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.forwarded_to_client_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record authentication failure
@@ -1498,6 +1525,7 @@ impl MasqueRelayServer {
                         let encoded = datagram.encode();
                         stats.record_bytes(encoded.len() as u64);
                         stats.record_datagram();
+                        stats.record_forwarded_to_client(encoded.len() as u64);
                         if fwd_tx.send(WriterItem::Data(encoded)).await.is_err() {
                             return "writer_channel_closed";
                         }
@@ -1650,6 +1678,7 @@ impl MasqueRelayServer {
                             );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
+                            stats2.record_forwarded_to_target(datagram.payload.len() as u64);
                             let target = datagram.target;
                             let payload_len = datagram.payload.len();
                             match socket2.send_to(&datagram.payload, target).await {
@@ -2026,6 +2055,21 @@ impl MasqueRelayServer {
             expired = self.reservations_expired.load(Ordering::Relaxed),
             evicted = self.reservations_evicted.load(Ordering::Relaxed),
             active_reservations = active_reservations,
+            // Cumulative relay-transit byte/datagram accounting (V2-623). These
+            // make this node's "bandwidth spent forwarding for other peers"
+            // first-class in the telegraf→ES pipeline. `to_client` counts encoded
+            // tunnel-frame length (Direction 1); `to_target` counts raw payload
+            // length (Direction 2) — the two are not directly comparable.
+            forwarded_to_target_bytes =
+                self.stats.forwarded_to_target_bytes.load(Ordering::Relaxed),
+            forwarded_to_target_count =
+                self.stats.forwarded_to_target_count.load(Ordering::Relaxed),
+            forwarded_to_client_bytes =
+                self.stats.forwarded_to_client_bytes.load(Ordering::Relaxed),
+            forwarded_to_client_count =
+                self.stats.forwarded_to_client_count.load(Ordering::Relaxed),
+            bytes_relayed = self.stats.bytes_relayed.load(Ordering::Relaxed),
+            datagrams_forwarded = self.stats.datagrams_forwarded.load(Ordering::Relaxed),
             "relay-reservation activity summary (cumulative counts)"
         );
     }
