@@ -269,7 +269,7 @@ impl TransportCandidate {
 
 use tracing::{debug, error, info, warn};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // Use parking_lot for faster, non-poisoning locks that work better with async code
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
@@ -320,6 +320,21 @@ const RELAY_TUNNEL_LOST_CODE: u32 = 0x52_4c_4f_53; // "RLOS"
 /// that keeps log volume negligible (one line per node per interval). The
 /// shipping pipeline only carries INFO+, so this line is emitted at INFO.
 const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Accumulator backing the endpoint traffic summary (V2-623).
+///
+/// Holds the cumulative UDP bytes of connections that have already closed. The
+/// summary task adds this to a live sum over the current connection table, so
+/// closed-connection byte tails are not lost. quinn's per-connection
+/// `ConnectionStats` are cumulative but vanish when the connection is dropped,
+/// so the bytes are folded in at every connection-removal site.
+#[derive(Debug, Default)]
+struct EndpointTraffic {
+    /// Cumulative UDP tx bytes of connections that have closed.
+    closed_udp_tx_bytes: AtomicU64,
+    /// Cumulative UDP rx bytes of connections that have closed.
+    closed_udp_rx_bytes: AtomicU64,
+}
 
 /// An active relay session for MASQUE CONNECT-UDP
 ///
@@ -403,6 +418,8 @@ pub struct NatTraversalEndpoint {
     /// Active connections keyed by remote SocketAddr
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+    /// Cumulative UDP bytes of closed connections (V2-623 endpoint accounting).
+    endpoint_traffic: Arc<EndpointTraffic>,
     /// Owning QUIC endpoint for each tracked connection.
     ///
     /// Most connections are owned by `inner_endpoint`, but inbound
@@ -1689,6 +1706,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            endpoint_traffic: Arc::new(EndpointTraffic::default()),
             connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -2130,6 +2148,7 @@ impl NatTraversalEndpoint {
             accepted_addrs_rx: Arc::new(TokioMutex::new(accepted_addrs_rx)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             connections: Arc::new(dashmap::DashMap::new()),
+            endpoint_traffic: Arc::new(EndpointTraffic::default()),
             connection_endpoints: Arc::new(dashmap::DashMap::new()),
             timeout_config: config.timeouts.clone(),
             emitted_established_events: emitted_established_events.clone(),
@@ -4325,46 +4344,58 @@ impl NatTraversalEndpoint {
     /// looked up directly in the connections DashMap, avoiding competing
     /// consumers on the `event_rx` channel (which is drained by `poll()`).
     /// All completed connections are sent through `handshake_tx`.
+    /// Fold a closing connection's final UDP byte stats into the endpoint
+    /// accumulator (V2-623). Called at every connection-removal site so the
+    /// summary task does not lose a connection's byte tail when it leaves the
+    /// table (quinn's per-connection stats vanish once the connection drops).
+    fn fold_closed_connection_bytes(&self, conn: &InnerConnection) {
+        let stats = conn.stats();
+        self.endpoint_traffic
+            .closed_udp_tx_bytes
+            .fetch_add(stats.udp_tx.bytes, Ordering::Relaxed);
+        self.endpoint_traffic
+            .closed_udp_rx_bytes
+            .fetch_add(stats.udp_rx.bytes, Ordering::Relaxed);
+    }
+
     /// Spawn the periodic endpoint traffic-summary task (V2-623).
     ///
     /// Emits a cumulative `endpoint traffic summary (cumulative)` INFO line
-    /// carrying total UDP bytes tx/rx across all QUIC connections plus
-    /// connection open/close counts. This is the reconciliation line for the
-    /// application-payload counters in ant-node/saorsa-core: (replication +
-    /// wire + relay) plus transport overhead should account for the bulk of
-    /// these numbers, and these should in turn track telegraf's host `net`
-    /// counters. A persistent unexplained gap is the signal that some traffic
-    /// source is still invisible.
+    /// (target `saorsa_transport::traffic`) with total UDP bytes tx/rx across
+    /// all QUIC connections plus connection open/close counts. This reconciles
+    /// the application-payload counters in ant-node/saorsa-core against what the
+    /// NIC actually moved.
     ///
-    /// quinn's per-connection `ConnectionStats` are cumulative for a
-    /// connection's lifetime but vanish when the connection is dropped. Rather
-    /// than instrument every one of the several connection-removal sites (a
-    /// single missed site would make the emitted total non-monotonic), we
-    /// sample live connections each tick and fold only the positive delta since
-    /// the previous observation into a process-wide accumulator, keyed by the
-    /// connection's stable id. This is monotonic by construction and fully
-    /// self-contained. Trade-off: a connection that both opens and closes
-    /// entirely within one interval is never sampled, so its (handshake-sized)
-    /// bytes and its open/close are not counted — acceptable, since the bytes
-    /// are negligible and this line exists to catch large persistent gaps.
+    /// Byte totals combine two sources so no closed connection's bytes are
+    /// lost: the [`EndpointTraffic`] accumulator (final per-connection stats
+    /// folded in at every connection-removal site via
+    /// [`Self::fold_closed_connection_bytes`]) plus a live sum over the current
+    /// connection table read fresh each tick. A monotonic guard (`max` against
+    /// the previous emit) keeps the series non-decreasing even in the one
+    /// remaining un-folded path — an accept-time overwrite of a
+    /// simultaneously-opened duplicate, whose byte count is effectively zero.
+    ///
+    /// The open/close *counts* are observed at sampling granularity: a
+    /// connection that opens and closes entirely within one interval is not
+    /// counted. Its bytes are still captured whenever it closes through a
+    /// removal site (final stats folded there); only the count is missed.
     fn spawn_endpoint_traffic_summary(&self) {
         let connections = self.connections.clone();
+        let endpoint_traffic = self.endpoint_traffic.clone();
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ENDPOINT_TRAFFIC_SUMMARY_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
 
-            // Cumulative process-wide accumulators (monotonic).
-            let mut udp_tx_bytes: u64 = 0;
-            let mut udp_rx_bytes: u64 = 0;
+            // Monotonic guards for the emitted byte totals.
+            let mut last_tx: u64 = 0;
+            let mut last_rx: u64 = 0;
+            // Cumulative open/close counts (sampling granularity).
             let mut connections_opened: u64 = 0;
             let mut connections_closed: u64 = 0;
-            // Per-connection last-observed cumulative UDP bytes, keyed by
-            // quinn stable id. Bounded by the live connection count (reaped
-            // below when a connection disappears).
-            let mut seen: std::collections::HashMap<usize, (u64, u64)> =
-                std::collections::HashMap::new();
+            // Connection ids seen live on the previous tick, to derive counts.
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
             loop {
                 ticker.tick().await;
@@ -4372,43 +4403,37 @@ impl NatTraversalEndpoint {
                     break;
                 }
 
+                let mut live_tx: u64 = 0;
+                let mut live_rx: u64 = 0;
                 let mut live_ids: std::collections::HashSet<usize> =
                     std::collections::HashSet::new();
                 for entry in connections.iter() {
                     let conn = entry.value();
-                    let id = conn.stable_id();
-                    live_ids.insert(id);
+                    live_ids.insert(conn.stable_id());
                     let stats = conn.stats();
-                    let tx = stats.udp_tx.bytes;
-                    let rx = stats.udp_rx.bytes;
-                    match seen.get(&id) {
-                        Some(&(last_tx, last_rx)) => {
-                            // Per-connection stats are monotonic; add the delta.
-                            udp_tx_bytes += tx.saturating_sub(last_tx);
-                            udp_rx_bytes += rx.saturating_sub(last_rx);
-                        }
-                        None => {
-                            connections_opened += 1;
-                            udp_tx_bytes += tx;
-                            udp_rx_bytes += rx;
-                        }
-                    }
-                    seen.insert(id, (tx, rx));
+                    live_tx += stats.udp_tx.bytes;
+                    live_rx += stats.udp_rx.bytes;
                 }
 
-                // Reap connections that have disappeared since the last tick.
-                // Their bytes were already folded through the previous
-                // observation, so this only advances the closed counter and
-                // keeps `seen` bounded.
-                let gone: Vec<usize> = seen
-                    .keys()
-                    .copied()
-                    .filter(|id| !live_ids.contains(id))
-                    .collect();
-                for id in gone {
-                    seen.remove(&id);
-                    connections_closed += 1;
-                }
+                let active_connections = live_ids.len();
+                connections_opened += live_ids.difference(&seen).count() as u64;
+                connections_closed += seen.difference(&live_ids).count() as u64;
+                seen = live_ids;
+
+                // Cumulative = bytes of already-closed connections + live sum,
+                // clamped monotonic against the previous emit.
+                let udp_tx_bytes = endpoint_traffic
+                    .closed_udp_tx_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(live_tx)
+                    .max(last_tx);
+                let udp_rx_bytes = endpoint_traffic
+                    .closed_udp_rx_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(live_rx)
+                    .max(last_rx);
+                last_tx = udp_tx_bytes;
+                last_rx = udp_rx_bytes;
 
                 info!(
                     target: "saorsa_transport::traffic",
@@ -4416,7 +4441,7 @@ impl NatTraversalEndpoint {
                     udp_rx_bytes,
                     connections_opened,
                     connections_closed,
-                    active_connections = live_ids.len(),
+                    active_connections,
                     "endpoint traffic summary (cumulative)"
                 );
             }
@@ -4643,7 +4668,9 @@ impl NatTraversalEndpoint {
                     candidate, reason
                 );
                 drop(entry); // release the DashMap ref before removing
-                self.connections.remove(&candidate);
+                if let Some((_, conn)) = self.connections.remove(&candidate) {
+                    self.fold_closed_connection_bytes(&conn);
+                }
                 Self::untrack_connection_endpoint(&self.connection_endpoints, candidate);
                 return false;
             }
@@ -4868,6 +4895,10 @@ impl NatTraversalEndpoint {
         for key in remove_keys {
             if let Some((_, connection)) = self.connections.remove(&key) {
                 if removed.is_none() {
+                    // Fold only the first removal: variant keys (v4/v6-mapped)
+                    // point at clones of the same connection, so folding each
+                    // would double-count its bytes.
+                    self.fold_closed_connection_bytes(&connection);
                     removed = Some(connection);
                 }
             }
@@ -5724,6 +5755,7 @@ impl NatTraversalEndpoint {
         let addrs: Vec<SocketAddr> = self.connections.iter().map(|e| *e.key()).collect();
         for addr in addrs {
             if let Some((_, connection)) = self.connections.remove(&addr) {
+                self.fold_closed_connection_bytes(&connection);
                 Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 info!("Closing connection to {}", addr);
                 connection.close(crate::VarInt::from_u32(0), b"Shutdown");
@@ -6125,7 +6157,9 @@ impl NatTraversalEndpoint {
 
             if now.duration_since(first_seen_closed) >= grace_period {
                 // Grace period elapsed — remove the dead connection.
-                self.connections.remove(&addr);
+                if let Some((_, conn)) = self.connections.remove(&addr) {
+                    self.fold_closed_connection_bytes(&conn);
+                }
                 Self::untrack_connection_endpoint(&self.connection_endpoints, addr);
                 self.closed_at.remove(&addr);
                 debug!(
@@ -6734,7 +6768,9 @@ impl NatTraversalEndpoint {
 
             if is_stale {
                 drop(entry);
-                self.connections.remove(&normalized_coordinator);
+                if let Some((_, conn)) = self.connections.remove(&normalized_coordinator) {
+                    self.fold_closed_connection_bytes(&conn);
+                }
                 Self::untrack_connection_endpoint(
                     &self.connection_endpoints,
                     normalized_coordinator,

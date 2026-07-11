@@ -332,20 +332,24 @@ impl MasqueRelayStats {
         self.datagrams_forwarded.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record bytes forwarded relay → third-party target (Direction 2 egress).
-    pub fn record_forwarded_to_target(&self, bytes: u64) {
+    /// Record datagrams confirmed forwarded relay → third-party target
+    /// (Direction 2 egress). Called only after the UDP `send_to` succeeds.
+    pub fn record_forwarded_to_target(&self, bytes: u64, datagrams: u64) {
         self.forwarded_to_target_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         self.forwarded_to_target_count
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(datagrams, Ordering::Relaxed);
     }
 
-    /// Record bytes forwarded third-party → relayed peer (Direction 1 ingress).
-    pub fn record_forwarded_to_client(&self, bytes: u64) {
+    /// Record datagrams confirmed forwarded third-party → relayed peer
+    /// (Direction 1 ingress). Called only after the QUIC stream write of the
+    /// batch succeeds, so this counts bytes actually delivered to the tunnel,
+    /// not merely enqueued. `datagrams` is the number of frames in the batch.
+    pub fn record_forwarded_to_client(&self, bytes: u64, datagrams: u64) {
         self.forwarded_to_client_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         self.forwarded_to_client_count
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(datagrams, Ordering::Relaxed);
     }
 
     /// Record authentication failure
@@ -1488,6 +1492,7 @@ impl MasqueRelayServer {
         let socket2 = Arc::clone(&socket);
         let stats = self.stats();
         let stats2 = self.stats();
+        let stats_writer = self.stats();
         let keepalive_bytes = 0u32.to_be_bytes();
 
         // Direction 1: UDP → Stream (target → relay → client)
@@ -1525,7 +1530,6 @@ impl MasqueRelayServer {
                         let encoded = datagram.encode();
                         stats.record_bytes(encoded.len() as u64);
                         stats.record_datagram();
-                        stats.record_forwarded_to_client(encoded.len() as u64);
                         if fwd_tx.send(WriterItem::Data(encoded)).await.is_err() {
                             return "writer_channel_closed";
                         }
@@ -1556,6 +1560,10 @@ impl MasqueRelayServer {
                                         .len()
                                         .saturating_add(std::mem::size_of::<u32>()),
                                 );
+                                // Sum of encoded datagram lengths (not batch
+                                // framing) so forwarded_to_client counts the
+                                // bytes the relayed peer actually receives.
+                                let mut fwd_bytes = encoded.len() as u64;
                                 append_relay_frame(&mut batch, &encoded);
 
                                 let mut frames = 1usize;
@@ -1564,6 +1572,7 @@ impl MasqueRelayServer {
                                 {
                                     match fwd_rx.try_recv() {
                                         Ok(WriterItem::Data(next)) => {
+                                            fwd_bytes += next.len() as u64;
                                             append_relay_frame(&mut batch, &next);
                                             frames += 1;
                                         }
@@ -1580,6 +1589,8 @@ impl MasqueRelayServer {
                                     tracing::debug!(session_id, error = %e, frames, bytes = batch.len(), "Stream batch write error");
                                     return "stream_batch_write_error";
                                 }
+                                // Confirmed delivered to the relayed peer.
+                                stats_writer.record_forwarded_to_client(fwd_bytes, frames as u64);
                             }
                             WriterItem::Control(body) => {
                                 let mut frame = Vec::with_capacity(
@@ -1678,11 +1689,12 @@ impl MasqueRelayServer {
                             );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
-                            stats2.record_forwarded_to_target(datagram.payload.len() as u64);
                             let target = datagram.target;
                             let payload_len = datagram.payload.len();
                             match socket2.send_to(&datagram.payload, target).await {
                                 Ok(n) => {
+                                    // Confirmed forwarded to the third-party target.
+                                    stats2.record_forwarded_to_target(payload_len as u64, 1);
                                     tracing::trace!(
                                         session_id,
                                         target = %target,
