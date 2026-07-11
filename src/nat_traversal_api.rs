@@ -328,12 +328,23 @@ const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// closed-connection byte tails are not lost. quinn's per-connection
 /// `ConnectionStats` are cumulative but vanish when the connection is dropped,
 /// so the bytes are folded in at every connection-removal site.
+///
+/// Folding is made idempotent by `stable_id` via `folded_ids`: a single quinn
+/// connection can sit in the connection map under more than one key (e.g. a v4
+/// and a v4-mapped-v6 address) and can be reached by more than one removal
+/// path, so without deduplication its bytes could be folded twice. `folded_ids`
+/// also lets the summary task exclude an already-folded connection from the
+/// live sum while a straggler alias key is still present, and is pruned to only
+/// currently-live ids each tick (an id absent from the live map has had every
+/// key removed, so it can never be folded again — safe to forget).
 #[derive(Debug, Default)]
 struct EndpointTraffic {
     /// Cumulative UDP tx bytes of connections that have closed.
     closed_udp_tx_bytes: AtomicU64,
     /// Cumulative UDP rx bytes of connections that have closed.
     closed_udp_rx_bytes: AtomicU64,
+    /// `stable_id`s already folded into the closed totals (idempotency guard).
+    folded_ids: dashmap::DashSet<usize>,
 }
 
 /// An active relay session for MASQUE CONNECT-UDP
@@ -4348,7 +4359,15 @@ impl NatTraversalEndpoint {
     /// accumulator (V2-623). Called at every connection-removal site so the
     /// summary task does not lose a connection's byte tail when it leaves the
     /// table (quinn's per-connection stats vanish once the connection drops).
+    ///
+    /// Idempotent by `stable_id`: alias keys and overlapping removal paths may
+    /// call this more than once for the same connection, but its bytes are
+    /// folded exactly once. `DashSet::insert` returns `false` when the id was
+    /// already present.
     fn fold_closed_connection_bytes(&self, conn: &InnerConnection) {
+        if !self.endpoint_traffic.folded_ids.insert(conn.stable_id()) {
+            return;
+        }
         let stats = conn.stats();
         self.endpoint_traffic
             .closed_udp_tx_bytes
@@ -4370,9 +4389,15 @@ impl NatTraversalEndpoint {
     /// lost: the [`EndpointTraffic`] accumulator (final per-connection stats
     /// folded in at every connection-removal site via
     /// [`Self::fold_closed_connection_bytes`]) plus a live sum over the current
-    /// connection table read fresh each tick. A monotonic guard (`max` against
-    /// the previous emit) keeps the series non-decreasing even in the one
-    /// remaining un-folded path — an accept-time overwrite of a
+    /// connection table read fresh each tick.
+    ///
+    /// Each connection is counted exactly once: the closed accumulator is
+    /// snapshotted *before* the live scan (so a connection removed mid-tick is
+    /// not counted in both), the live sum is deduplicated by `stable_id` (alias
+    /// keys), an already-folded connection is excluded from the live sum, and
+    /// folding itself is idempotent by `stable_id`. A monotonic guard (`max`
+    /// against the previous emit) keeps the series non-decreasing for the one
+    /// path that bypasses removal folding — an accept-time overwrite of a
     /// simultaneously-opened duplicate, whose byte count is effectively zero.
     ///
     /// The open/close *counts* are observed at sampling granularity: a
@@ -4403,17 +4428,43 @@ impl NatTraversalEndpoint {
                     break;
                 }
 
+                // Snapshot the closed accumulator BEFORE scanning live
+                // connections. Reading it afterwards would let a connection be
+                // summed live, then removed and folded mid-tick, then counted
+                // again in the closed total — a double count the monotonic
+                // clamp would make permanent.
+                let closed_tx = endpoint_traffic.closed_udp_tx_bytes.load(Ordering::Relaxed);
+                let closed_rx = endpoint_traffic.closed_udp_rx_bytes.load(Ordering::Relaxed);
+
                 let mut live_tx: u64 = 0;
                 let mut live_rx: u64 = 0;
                 let mut live_ids: std::collections::HashSet<usize> =
                     std::collections::HashSet::new();
                 for entry in connections.iter() {
                     let conn = entry.value();
-                    live_ids.insert(conn.stable_id());
+                    let id = conn.stable_id();
+                    // Dedup alias keys: one quinn connection may appear under
+                    // several map keys, but its bytes must be summed once.
+                    if !live_ids.insert(id) {
+                        continue;
+                    }
+                    // Skip a connection already folded into the closed total
+                    // (its bytes are in `closed_*`). Happens while a straggler
+                    // alias key lingers after one of its keys was removed.
+                    if endpoint_traffic.folded_ids.contains(&id) {
+                        continue;
+                    }
                     let stats = conn.stats();
                     live_tx += stats.udp_tx.bytes;
                     live_rx += stats.udp_rx.bytes;
                 }
+
+                // Forget folded ids no longer present in the live map: every key
+                // for that connection is gone, so it can never be folded again.
+                // Keeps `folded_ids` bounded to connections mid-teardown.
+                endpoint_traffic
+                    .folded_ids
+                    .retain(|id| live_ids.contains(id));
 
                 let active_connections = live_ids.len();
                 connections_opened += live_ids.difference(&seen).count() as u64;
@@ -4422,16 +4473,8 @@ impl NatTraversalEndpoint {
 
                 // Cumulative = bytes of already-closed connections + live sum,
                 // clamped monotonic against the previous emit.
-                let udp_tx_bytes = endpoint_traffic
-                    .closed_udp_tx_bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_add(live_tx)
-                    .max(last_tx);
-                let udp_rx_bytes = endpoint_traffic
-                    .closed_udp_rx_bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_add(live_rx)
-                    .max(last_rx);
+                let udp_tx_bytes = closed_tx.saturating_add(live_tx).max(last_tx);
+                let udp_rx_bytes = closed_rx.saturating_add(live_rx).max(last_rx);
                 last_tx = udp_tx_bytes;
                 last_rx = udp_rx_bytes;
 
@@ -4894,11 +4937,10 @@ impl NatTraversalEndpoint {
         let mut removed = None;
         for key in remove_keys {
             if let Some((_, connection)) = self.connections.remove(&key) {
+                // Fold is idempotent by stable_id, so alias keys pointing at the
+                // same connection do not double-count.
+                self.fold_closed_connection_bytes(&connection);
                 if removed.is_none() {
-                    // Fold only the first removal: variant keys (v4/v6-mapped)
-                    // point at clones of the same connection, so folding each
-                    // would double-count its bytes.
-                    self.fold_closed_connection_bytes(&connection);
                     removed = Some(connection);
                 }
             }
