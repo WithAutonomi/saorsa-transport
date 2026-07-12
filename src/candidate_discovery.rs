@@ -930,13 +930,10 @@ impl CandidateDiscoveryManager {
             if let Some((DiscoveryPhase::LocalInterfaceScanning { started_at }, session_start)) =
                 phase_info
             {
-                let bound_candidate = self.config.bound_address.and_then(|addr| {
-                    if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
-                        Some(addr)
-                    } else {
-                        None
-                    }
-                });
+                let bound_candidate = self
+                    .config
+                    .bound_address
+                    .filter(|&addr| self.is_valid_local_address(&addr) || addr.ip().is_loopback());
 
                 // Snapshot the current UPnP mapping (if any) once per poll —
                 // we will publish it to the session below alongside the
@@ -1159,12 +1156,8 @@ impl CandidateDiscoveryManager {
                         session_id
                     );
 
-                    let bound_candidate = self.config.bound_address.and_then(|addr| {
-                        if self.is_valid_local_address(&addr) || addr.ip().is_loopback() {
-                            Some(addr)
-                        } else {
-                            None
-                        }
+                    let bound_candidate = self.config.bound_address.filter(|&addr| {
+                        self.is_valid_local_address(&addr) || addr.ip().is_loopback()
                     });
 
                     let upnp_candidate_now = self.upnp_candidate();
