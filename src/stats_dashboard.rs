@@ -182,11 +182,7 @@ impl StatsDashboard {
     /// Handle NAT traversal event
     pub async fn handle_nat_event(&self, event: &NatTraversalEvent) {
         match event {
-            NatTraversalEvent::ConnectionEstablished {
-                remote_address,
-                side: _,
-                ..
-            } => {
+            NatTraversalEvent::ConnectionEstablished { remote_address, .. } => {
                 let mut connections = self.connections.write().await;
                 connections.insert(
                     *remote_address,
