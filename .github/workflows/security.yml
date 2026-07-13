@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload audit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: audit-results
           path: |
@@ -174,7 +174,7 @@ jobs:
 
       - name: Upload supply chain report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-report
           path: supply-chain-report.json
@@ -204,7 +204,7 @@ jobs:
           cargo cyclonedx --format xml > sbom.cyclonedx.xml
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: |
@@ -250,7 +250,7 @@ jobs:
           cat security-report.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload security report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-report
           path: security-report.md
