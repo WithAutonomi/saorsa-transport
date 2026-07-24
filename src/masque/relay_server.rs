@@ -72,6 +72,38 @@ const RELAY_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
 /// (208 KB default on Linux, which holds only ~170 packets).
 const RELAY_FORWARD_CHANNEL_CAPACITY: usize = 8192;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletedForwardingTask {
+    Neither,
+    Reader,
+    Writer,
+}
+
+/// Stop and drain only forwarding tasks whose output has not already been
+/// consumed by the surrounding `select!`.
+async fn drain_forwarding_tasks<T: Send + 'static>(
+    reader_handle: tokio::task::JoinHandle<T>,
+    writer_handle: tokio::task::JoinHandle<T>,
+    completed: CompletedForwardingTask,
+) {
+    match completed {
+        CompletedForwardingTask::Reader => {
+            writer_handle.abort();
+            let _ = writer_handle.await;
+        }
+        CompletedForwardingTask::Writer => {
+            reader_handle.abort();
+            let _ = reader_handle.await;
+        }
+        CompletedForwardingTask::Neither => {
+            reader_handle.abort();
+            writer_handle.abort();
+            let _ = reader_handle.await;
+            let _ = writer_handle.await;
+        }
+    }
+}
+
 /// Minimum interval between relay-reservation INFO summary lines (ADR-011).
 /// Per-event reservation detail is logged at DEBUG to keep production log
 /// volume low; one summary per relay per interval is enough to confirm the
@@ -1615,14 +1647,16 @@ impl MasqueRelayServer {
             }
         });
 
-        // Borrow the task handles (`&mut`) so the select! does not consume them;
-        // we retain ownership and explicitly abort + await both afterwards so no
-        // detached task can keep using the socket (Blocker 1).
+        // Borrow the task handles (`&mut`) so the select! does not consume them.
+        // Record a handle branch that completes because its output must not be
+        // polled a second time during cleanup.
+        let mut completed_task = CompletedForwardingTask::Neither;
         let close_reason = tokio::select! {
             // A handover (or any external close_session) cancels the loop so it
             // stops relaying before its socket is reused.
             _ = cancel.cancelled() => "handover_cancelled",
             result = &mut reader_handle => {
+                completed_task = CompletedForwardingTask::Reader;
                 match result {
                     Ok(reason) => reason,
                     Err(e) => {
@@ -1632,6 +1666,7 @@ impl MasqueRelayServer {
                 }
             },
             result = &mut writer_handle => {
+                completed_task = CompletedForwardingTask::Writer;
                 match result {
                     Ok(reason) => reason,
                     Err(e) => {
@@ -1756,14 +1791,11 @@ impl MasqueRelayServer {
             "Stream-based relay forwarding loop ended"
         );
 
-        // Blocker 1: stop the forwarding tasks so neither still holds the UDP
-        // socket once it can be leased/reclaimed. The select! polled the handles
-        // by &mut, so we still own them; abort + await guarantees both tasks have
-        // dropped their socket clones before we close (and possibly lease) it.
-        reader_handle.abort();
-        writer_handle.abort();
-        let _ = reader_handle.await;
-        let _ = writer_handle.await;
+        // Blocker 1: stop any still-live forwarding task so neither task holds
+        // the UDP socket once it can be leased/reclaimed. A handle that completed
+        // through select! has already yielded its output and must not be awaited
+        // again (`JoinHandle polled after completion`).
+        drain_forwarding_tasks(reader_handle, writer_handle, completed_task).await;
 
         // Deregister and release any handover waiter now that the tasks are gone
         // and the socket is exclusively owned again. Done BEFORE close_session so
@@ -2201,6 +2233,43 @@ mod tests {
 
     fn client_addr(id: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, id)), 12345)
+    }
+
+    #[tokio::test]
+    async fn forwarding_cleanup_does_not_repoll_completed_reader() {
+        let mut reader = tokio::spawn(async { "reader_done" });
+        let writer = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            "writer_done"
+        });
+
+        assert_eq!((&mut reader).await.unwrap(), "reader_done");
+        drain_forwarding_tasks(reader, writer, CompletedForwardingTask::Reader).await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_cleanup_does_not_repoll_completed_writer() {
+        let reader = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            "reader_done"
+        });
+        let mut writer = tokio::spawn(async { "writer_done" });
+
+        assert_eq!((&mut writer).await.unwrap(), "writer_done");
+        drain_forwarding_tasks(reader, writer, CompletedForwardingTask::Writer).await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_cleanup_aborts_both_when_neither_completed() {
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let writer = tokio::spawn(std::future::pending::<()>());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_forwarding_tasks(reader, writer, CompletedForwardingTask::Neither),
+        )
+        .await
+        .expect("cleanup should abort and drain both pending tasks");
     }
 
     // ── ADR-011: stable relay-port reservation tests ──────────────────────
