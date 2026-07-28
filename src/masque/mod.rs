@@ -127,4 +127,4 @@ pub use relay_server::{
 pub use relay_session::{
     RelayPeerId, RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats,
 };
-pub use relay_socket::{MasqueRelaySocket, RawRelayStreams};
+pub use relay_socket::{MasqueRelaySocket, RawRelayStreams, RelayTunnelControl};

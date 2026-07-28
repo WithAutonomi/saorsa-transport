@@ -660,11 +660,13 @@ impl LinkTransport for P2pLinkTransport {
                     // Get the underlying QUIC connection by address
                     match endpoint.get_quic_connection(&socket_addr).await {
                         Ok(Some(conn)) => {
-                            // Extract peer public key from TLS identity
-                            let public_key = conn
-                                .peer_identity()
-                                .and_then(|id| id.downcast::<Vec<u8>>().ok())
-                                .map(|boxed| *boxed);
+                            // rustls exposes the authenticated identity as a
+                            // certificate vector whose first entry is the RFC
+                            // 7250 ML-DSA SPKI, not as a bare `Vec<u8>`.
+                            let public_key =
+                                crate::p2p_endpoint::extract_public_key_bytes_from_connection(
+                                    &conn,
+                                );
                             let link_conn = P2pLinkConn::new(conn, public_key, socket_addr);
                             Some((Ok(link_conn), endpoint))
                         }
@@ -725,11 +727,8 @@ impl LinkTransport for P2pLinkTransport {
                 .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?
                 .ok_or_else(|| LinkError::ConnectionFailed("Connection not found".to_string()))?;
 
-            // Extract peer public key from TLS identity
-            let public_key = conn
-                .peer_identity()
-                .and_then(|id| id.downcast::<Vec<u8>>().ok())
-                .map(|boxed| *boxed);
+            // Preserve the identity authenticated by this exact connection.
+            let public_key = crate::p2p_endpoint::extract_public_key_bytes_from_connection(&conn);
 
             Ok(P2pLinkConn::new(conn, public_key, connected_addr))
         })

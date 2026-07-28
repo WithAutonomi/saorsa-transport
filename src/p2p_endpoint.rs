@@ -259,7 +259,7 @@ fn pending_dial_remaining_wait(wait_timeout: Duration, age: Duration) -> Option<
 /// peer identity, if TLS-based authentication was used.
 ///
 /// Returns `None` for unauthenticated or constrained connections.
-fn extract_public_key_bytes_from_connection(
+pub(crate) fn extract_public_key_bytes_from_connection(
     connection: &crate::high_level::Connection,
 ) -> Option<Vec<u8>> {
     let identity = connection.peer_identity()?;
@@ -1202,6 +1202,23 @@ async fn do_cleanup_connection(
     expected_stable_id: Option<usize>,
 ) -> bool {
     let variants = socket_addr_variants(*addr);
+
+    // A live CONNECT-UDP stream makes this connection part of an established
+    // relay's data plane. Ordinary disconnect APIs and the stale-peer reaper
+    // must not force-close it; the relay forwarding guard releases this pin
+    // when the stream actually ends. Reader-exit cleanup still proceeds for a
+    // connection that has already failed.
+    if expected_stable_id.is_none()
+        && variants
+            .iter()
+            .any(|candidate| inner.is_relay_control_connection(candidate))
+    {
+        info!(
+            peer = %addr,
+            "do_cleanup_connection: keeping live relay control connection"
+        );
+        return false;
+    }
 
     // Step 1: Try to remove from the NAT traversal layer first (lock-free
     // DashMap). When the caller is a reader-exit firing for an older
@@ -2746,7 +2763,7 @@ impl P2pEndpoint {
         // single connection and is discarded after the dial completes,
         // so we don't wire up a graceful-close watcher — the single
         // connection is the natural unit of recovery at this layer.
-        let (relay_socket, _closed) = crate::masque::MasqueRelaySocket::new(
+        let (relay_socket, _tunnel) = crate::masque::MasqueRelaySocket::new(
             raw_streams.send_stream,
             raw_streams.recv_stream,
             relay_public_addr,
@@ -3413,15 +3430,14 @@ impl P2pEndpoint {
         self.inner.set_relay_serving_enabled(enabled);
     }
 
-    /// Establish a proactive MASQUE relay session with `relay_addr` as a
-    /// supplementary inbound path.
+    /// Establish and immediately publish a proactive MASQUE relay session with
+    /// `relay_addr` as a supplementary inbound path.
     ///
-    /// This is the caller-driven entry point for ADR-014-style relay acquisition
-    /// in saorsa-core. It delegates to [`NatTraversalEndpoint::setup_proactive_relay`],
-    /// which establishes the MASQUE `CONNECT-UDP` session, creates a **second**
-    /// Quinn endpoint backed by the relay tunnel, and advertises the
-    /// relay-allocated address to all currently connected peers.  The main
-    /// endpoint and its original UDP socket are never touched.
+    /// This legacy convenience entry point prepares and publishes in one call.
+    /// Canary-gated callers should use
+    /// [`prepare_proactive_relay`](Self::prepare_proactive_relay), followed by
+    /// either [`publish_proactive_relay`](Self::publish_proactive_relay) or
+    /// [`abort_proactive_relay`](Self::abort_proactive_relay).
     ///
     /// On success, the returned `SocketAddr` is the relay-allocated public
     /// address the caller should publish as its contact address in the DHT
@@ -3438,6 +3454,42 @@ impl P2pEndpoint {
     ) -> Result<SocketAddr, EndpointError> {
         let allocated = self.inner.setup_proactive_relay(relay_addr).await?;
         Ok(allocated)
+    }
+
+    /// Prepare a proactive MASQUE relay without publishing its address.
+    ///
+    /// The relay endpoint is live so callers can run inbound canary probes,
+    /// but the address is not exposed through `relay_public_addr` or emitted as
+    /// `RelayEstablished` until
+    /// [`publish_proactive_relay`](Self::publish_proactive_relay) is called.
+    /// Relay addresses are not sent through connection-level `ADD_ADDRESS`;
+    /// authenticated upper layers own their publication.
+    pub async fn prepare_proactive_relay(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<SocketAddr, EndpointError> {
+        Ok(self.inner.prepare_proactive_relay(relay_addr).await?)
+    }
+
+    /// Activate the current provisional proactive relay.
+    pub async fn publish_proactive_relay(
+        &self,
+        relay_public_addr: SocketAddr,
+    ) -> Result<(), EndpointError> {
+        self.inner
+            .publish_proactive_relay(relay_public_addr)
+            .await?;
+        Ok(())
+    }
+
+    /// Abort a provisional or published proactive relay and release its
+    /// MASQUE session and relay-server capacity.
+    pub async fn abort_proactive_relay(
+        &self,
+        relay_public_addr: SocketAddr,
+    ) -> Result<(), EndpointError> {
+        self.inner.abort_proactive_relay(relay_public_addr).await?;
+        Ok(())
     }
 
     /// Get list of connected peers
@@ -3970,7 +4022,18 @@ impl P2pEndpoint {
                     // can tell upper layers exactly which relay to stop
                     // advertising.
                     let dead = inner.relay_public_addr();
-                    inner.reset_relay_state();
+                    if let Some(relay_addr) = dead {
+                        if let Err(error) = inner.abort_proactive_relay(relay_addr).await {
+                            warn!(
+                                relay_addr = %relay_addr,
+                                %error,
+                                "Failed to tear down unhealthy proactive relay"
+                            );
+                            inner.reset_relay_state();
+                        }
+                    } else {
+                        inner.reset_relay_state();
+                    }
                     relay_event_sent = false;
                     if let Some(relay_addr) = dead {
                         info!(
