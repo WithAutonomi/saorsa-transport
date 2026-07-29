@@ -1379,12 +1379,6 @@ impl MasqueRelayServer {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, source)) => {
                             let payload = Bytes::copy_from_slice(&buf[..len]);
-                            tracing::trace!(
-                                session_id,
-                                source = %source,
-                                len,
-                                "RELAY_TUNNEL[srv]: dgram-loop dir1 recv UDP → forwarding to relay-client"
-                            );
 
                             // Encode as uncompressed datagram (includes source address
                             // so client can decode without context registration)
@@ -1452,24 +1446,10 @@ impl MasqueRelayServer {
                             };
                             match resolved {
                                 Some((target, payload)) => {
-                                    tracing::trace!(
-                                        session_id,
-                                        target = %target,
-                                        len = payload.len(),
-                                        "RELAY_TUNNEL[srv]: dgram-loop dir2 recv from relay-client → sendto target"
-                                    );
                                     server2.stats.record_bytes(payload.len() as u64);
                                     server2.stats.record_datagram();
                                     match socket2.send_to(&payload, target).await {
-                                        Ok(n) => {
-                                            tracing::trace!(
-                                                session_id,
-                                                target = %target,
-                                                len = payload.len(),
-                                                sent = n,
-                                                "RELAY_TUNNEL[srv]: dgram-loop dir2 sendto OK"
-                                            );
-                                        }
+                                        Ok(_) => {}
                                         Err(e) => {
                                             tracing::warn!(
                                                 session_id,
@@ -1611,10 +1591,6 @@ impl MasqueRelayServer {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
                         let payload = Bytes::copy_from_slice(&buf[..len]);
-                        tracing::trace!(
-                            session_id, source = %source, len,
-                            "RELAY_TUNNEL[srv]: stream-loop dir1 recv UDP → forwarding to relay-client"
-                        );
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
                         let encoded = datagram.encode();
@@ -1775,26 +1751,14 @@ impl MasqueRelayServer {
                     let mut cursor = Bytes::from(frame_buf);
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
-                            tracing::trace!(
-                                session_id, target = %datagram.target,
-                                len = datagram.payload.len(),
-                                "RELAY_TUNNEL[srv]: stream-loop dir2 recv from relay-client → sendto target"
-                            );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
                             let target = datagram.target;
                             let payload_len = datagram.payload.len();
                             match socket2.send_to(&datagram.payload, target).await {
-                                Ok(n) => {
+                                Ok(_) => {
                                     // Confirmed forwarded to the third-party target.
                                     stats2.record_forwarded_to_target(payload_len as u64, 1);
-                                    tracing::trace!(
-                                        session_id,
-                                        target = %target,
-                                        len = payload_len,
-                                        sent = n,
-                                        "RELAY_TUNNEL[srv]: stream-loop dir2 sendto OK"
-                                    );
                                 }
                                 Err(e) if is_message_too_large(&e) => {
                                     // Path-MTU exceeded.  Emit a PmtuUpdate

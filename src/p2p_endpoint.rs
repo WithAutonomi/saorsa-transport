@@ -74,7 +74,7 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
     NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
-    RELAY_TUNNEL_INITIAL_MTU,
+    PreparedRelay, RELAY_TUNNEL_INITIAL_MTU,
 };
 use crate::shared::{normalize_socket_addr, socket_addr_variants};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
@@ -2886,6 +2886,19 @@ impl P2pEndpoint {
     /// This method races the inner accept against the shutdown token, so it
     /// will return promptly when `shutdown()` is called.
     pub async fn accept(&self) -> Option<PeerConnection> {
+        self.accept_with_connection()
+            .await
+            .map(|(peer, _connection)| peer)
+    }
+
+    /// Accept an incoming peer while retaining its authoritative QUIC handle.
+    ///
+    /// The link-transport adapter needs the exact accepted handle. Looking it
+    /// up again by address races connection cleanup when a short-lived peer
+    /// closes immediately after the handshake.
+    pub(crate) async fn accept_with_connection(
+        &self,
+    ) -> Option<(PeerConnection, crate::high_level::Connection)> {
         if self.shutdown.is_cancelled() {
             return None;
         }
@@ -2899,6 +2912,8 @@ impl P2pEndpoint {
             Ok((remote_addr, connection)) => {
                 // Extract public key from TLS handshake
                 let remote_public_key = extract_public_key_bytes_from_connection(&connection);
+                let reader_connection = connection.clone();
+                let accepted_connection = connection.clone();
 
                 // They initiated the connection to us = Server side
                 if let Err(e) =
@@ -2918,26 +2933,11 @@ impl P2pEndpoint {
                     last_activity: Instant::now(),
                 };
 
-                // Spawn background reader task BEFORE storing in connected_peers
-                // to prevent race where recv() misses early data
-                match self.inner.get_connection(&remote_addr) {
-                    Ok(Some(conn)) => {
-                        info!("accept: spawning reader task for {}", remote_addr);
-                        self.spawn_reader_task(remote_addr, conn).await;
-                    }
-                    Ok(None) => {
-                        error!(
-                            "accept: get_connection({}) returned None — NO reader task spawned!",
-                            remote_addr
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "accept: get_connection({}) failed: {} — NO reader task spawned!",
-                            remote_addr, e
-                        );
-                    }
-                }
+                // The accepted connection is authoritative. Using it directly
+                // avoids racing a peer's immediate close against a redundant
+                // lookup in the shared connection map.
+                info!("accept: spawning reader task for {}", remote_addr);
+                self.spawn_reader_task(remote_addr, reader_connection).await;
 
                 self.connected_peers
                     .write()
@@ -2959,7 +2959,7 @@ impl P2pEndpoint {
                     Side::Server,
                 );
 
-                Some(peer_conn)
+                Some((peer_conn, accepted_connection))
             }
             Err(e) => {
                 debug!("Accept failed: {}", e);
@@ -3416,8 +3416,8 @@ impl P2pEndpoint {
     /// relay's underlying QUIC connection is still open. Returns `false` if a
     /// relay was established but the session has died — the caller should
     /// rebind.
-    pub fn is_relay_healthy(&self) -> bool {
-        self.inner.is_relay_healthy()
+    pub async fn is_relay_healthy(&self) -> bool {
+        self.inner.is_relay_healthy().await
     }
 
     /// Enable or disable relay serving on this node's MASQUE relay server.
@@ -3467,18 +3467,16 @@ impl P2pEndpoint {
     pub async fn prepare_proactive_relay(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<SocketAddr, EndpointError> {
+    ) -> Result<PreparedRelay, EndpointError> {
         Ok(self.inner.prepare_proactive_relay(relay_addr).await?)
     }
 
     /// Activate the current provisional proactive relay.
     pub async fn publish_proactive_relay(
         &self,
-        relay_public_addr: SocketAddr,
+        prepared: PreparedRelay,
     ) -> Result<(), EndpointError> {
-        self.inner
-            .publish_proactive_relay(relay_public_addr)
-            .await?;
+        self.inner.publish_proactive_relay(prepared).await?;
         Ok(())
     }
 
@@ -3486,9 +3484,9 @@ impl P2pEndpoint {
     /// MASQUE session and relay-server capacity.
     pub async fn abort_proactive_relay(
         &self,
-        relay_public_addr: SocketAddr,
+        prepared: PreparedRelay,
     ) -> Result<(), EndpointError> {
-        self.inner.abort_proactive_relay(relay_public_addr).await?;
+        self.inner.abort_proactive_relay(prepared).await?;
         Ok(())
     }
 
@@ -4002,7 +4000,8 @@ impl P2pEndpoint {
                 // Upper layers use this to trigger a DHT self-lookup for
                 // relay address propagation.
                 if !relay_event_sent {
-                    if let Some(relay_addr) = inner.relay_public_addr() {
+                    if let Some(prepared) = inner.published_relay_handle().await {
+                        let relay_addr = prepared.public_addr();
                         info!(
                             "Relay established at {} — emitting RelayEstablished event",
                             relay_addr
@@ -4013,29 +4012,22 @@ impl P2pEndpoint {
                 }
 
                 // Monitor relay health. If the relay session died (connection
-                // closed, server restarted, etc.), reset state so the next
-                // poll cycle re-establishes through a (potentially different)
-                // relay candidate. The RelayEstablished flag is also reset so
-                // upper layers re-publish the new address.
-                if relay_event_sent && !inner.is_relay_healthy() {
-                    // Snapshot the dead address BEFORE reset clears it so we
-                    // can tell upper layers exactly which relay to stop
-                    // advertising.
-                    let dead = inner.relay_public_addr();
-                    if let Some(relay_addr) = dead {
-                        if let Err(error) = inner.abort_proactive_relay(relay_addr).await {
+                // closed, server restarted, etc.), tear down its one lifecycle
+                // state so the upper layer can acquire a replacement.
+                if relay_event_sent && !inner.is_relay_healthy().await {
+                    let dead = inner.published_relay_handle().await;
+                    if let Some(prepared) = dead {
+                        if let Err(error) = inner.abort_proactive_relay(prepared).await {
                             warn!(
-                                relay_addr = %relay_addr,
+                                relay_addr = %prepared.public_addr(),
                                 %error,
                                 "Failed to tear down unhealthy proactive relay"
                             );
-                            inner.reset_relay_state();
                         }
-                    } else {
-                        inner.reset_relay_state();
                     }
                     relay_event_sent = false;
-                    if let Some(relay_addr) = dead {
+                    if let Some(prepared) = dead {
+                        let relay_addr = prepared.public_addr();
                         info!(
                             "Relay tunnel at {} is unhealthy — emitting RelayLost event",
                             relay_addr

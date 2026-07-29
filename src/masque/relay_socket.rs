@@ -108,7 +108,7 @@ pub struct RawRelayStreams {
 /// promptly tells the relay server to close the associated MASQUE session and
 /// release its capacity slot. Shutdown is idempotent.
 #[derive(Debug)]
-pub struct RelayTunnelControl {
+pub(crate) struct RelayTunnelControl {
     tasks: PlMutex<Vec<tokio::task::JoinHandle<()>>>,
     closed: Notify,
     is_closed: AtomicBool,
@@ -144,12 +144,12 @@ impl RelayTunnelControl {
     }
 
     /// Returns whether the tunnel has failed or has been explicitly shut down.
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::Acquire)
     }
 
     /// Wait until the tunnel reader exits or shutdown is requested.
-    pub async fn closed(&self) {
+    pub(crate) async fn closed(&self) {
         loop {
             if self.is_closed() {
                 return;
@@ -163,7 +163,7 @@ impl RelayTunnelControl {
     }
 
     /// Stop the tunnel and wait for all task-owned QUIC streams to be dropped.
-    pub async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         self.mark_closed();
         let handles = {
             let mut tasks = self.tasks.lock();
@@ -252,7 +252,7 @@ impl MasqueRelaySocket {
     /// Without this, the driver's `Drop` impl fires last and cascades
     /// a cryptic `"endpoint driver future was dropped"` into every
     /// connection accepted through this tunnel.
-    pub fn new(
+    pub(crate) fn new(
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
         relay_public_addr: SocketAddr,
@@ -358,14 +358,6 @@ impl MasqueRelaySocket {
                     Ok(datagram) => {
                         // `datagram.payload` is a zero-copy slice of
                         // the original frame buffer — no clone needed.
-                        let inbound_source = datagram.target;
-                        let inbound_len = datagram.payload.len();
-                        tracing::trace!(
-                            relay = %relay_public_addr,
-                            source = %inbound_source,
-                            len = inbound_len,
-                            "RELAY_TUNNEL[clt]: decoded inbound frame → enqueue for Quinn poll_recv"
-                        );
                         if recv_tx
                             .send((datagram.payload, datagram.target))
                             .await
@@ -507,14 +499,6 @@ impl AsyncUdpSocket for MasqueRelaySocket {
         // of `segment_size` bytes.  Each segment must be sent as its
         // own tunnel frame — the relay server has a per-frame size
         // limit and cannot handle the entire batch as one.
-        tracing::trace!(
-            relay = %self.relay_public_addr,
-            destination = %transmit.destination,
-            len = transmit.contents.len(),
-            segment_size = ?transmit.segment_size,
-            "RELAY_TUNNEL[clt]: try_send → enqueue outbound for relay-server"
-        );
-
         // Per-target MTU enforcement: if a previous PmtuUpdate control
         // frame told us the egress path to this destination caps at
         // `mtu` bytes, drop oversized packets here so they never reach
@@ -598,12 +582,6 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                     recv_meta.ecn = None;
                     recv_meta.dst_ip = None;
                     meta[filled] = recv_meta;
-
-                    tracing::trace!(
-                        source = %source,
-                        len,
-                        "RELAY_TUNNEL: recv from tunnel queue"
-                    );
 
                     filled += 1;
                 }
