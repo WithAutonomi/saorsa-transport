@@ -178,6 +178,12 @@ impl RelayTunnelControl {
     }
 }
 
+fn mark_writer_exit(control: &Weak<RelayTunnelControl>) {
+    if let Some(control) = control.upgrade() {
+        control.mark_closed();
+    }
+}
+
 /// A virtual UDP socket backed entirely by a MASQUE relay tunnel.
 ///
 /// All traffic — both outgoing and incoming — flows through the relay
@@ -385,6 +391,7 @@ impl MasqueRelaySocket {
 
         // Background task: write queued outbound packets to relay stream.
         let writer_capacity = Arc::clone(&send_capacity_freed);
+        let writer_control = Arc::downgrade(&control);
         let writer_handle = tokio::spawn(async move {
             while let Some(encoded) = send_rx.recv().await {
                 // `recv` completing means the channel just freed a
@@ -427,6 +434,7 @@ impl MasqueRelaySocket {
             // of waiting forever.
             drop(send_rx);
             writer_capacity.notify_waiters();
+            mark_writer_exit(&writer_control);
         });
         control.register(writer_handle);
 
@@ -708,7 +716,7 @@ impl UdpPoller for TunnelPoller {
 
 #[cfg(test)]
 mod relay_tunnel_control_tests {
-    use super::RelayTunnelControl;
+    use super::{RelayTunnelControl, mark_writer_exit};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -749,6 +757,15 @@ mod relay_tunnel_control_tests {
 
         control.shutdown().await;
         control.shutdown().await;
+
+        assert!(control.is_closed());
+    }
+
+    #[test]
+    fn writer_exit_marks_tunnel_closed() {
+        let control = RelayTunnelControl::new();
+
+        mark_writer_exit(&Arc::downgrade(&control));
 
         assert!(control.is_closed());
     }

@@ -275,7 +275,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
 use tokio::{
     net::UdpSocket,
-    sync::{Mutex as TokioMutex, mpsc},
+    sync::{Mutex as TokioMutex, mpsc, oneshot},
     time::{sleep, timeout},
 };
 
@@ -361,6 +361,8 @@ pub struct RelaySession {
     pub established_at: std::time::Instant,
     /// Relay server address
     pub relay_addr: SocketAddr,
+    /// Relay-signed proof for this exact allocation, when available.
+    pub allocation_receipt: Option<crate::RelayAllocationReceipt>,
 }
 
 impl RelaySession {
@@ -424,6 +426,7 @@ struct ProactiveRelay {
     handle: PreparedRelay,
     endpoint: Arc<InnerEndpoint>,
     tunnel: Arc<crate::masque::RelayTunnelControl>,
+    allocation_receipt: Option<crate::RelayAllocationReceipt>,
 }
 
 /// Complete proactive-relay lifecycle state.
@@ -445,6 +448,299 @@ impl RelayLifecycleState {
             Self::Published(relay) => Some(relay.handle.public_addr()),
             Self::None | Self::Provisional(_) => None,
         }
+    }
+}
+
+struct RelayHealthSnapshot {
+    relay_addr: SocketAddr,
+    tunnel: Arc<crate::masque::RelayTunnelControl>,
+}
+
+enum RelayLifecycleCommand {
+    BeginPrepare {
+        reply: oneshot::Sender<(u64, Option<ProactiveRelay>)>,
+    },
+    CompletePrepare {
+        generation: u64,
+        relay: ProactiveRelay,
+        reply: oneshot::Sender<Result<(), ProactiveRelay>>,
+    },
+    Publish {
+        prepared: PreparedRelay,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    TakeMatching {
+        prepared: PreparedRelay,
+        reply: oneshot::Sender<Option<ProactiveRelay>>,
+    },
+    TakeCurrent {
+        reply: oneshot::Sender<Option<ProactiveRelay>>,
+    },
+    PublishedAddr {
+        reply: oneshot::Sender<Option<SocketAddr>>,
+    },
+    PublishedHandle {
+        reply: oneshot::Sender<Option<PreparedRelay>>,
+    },
+    Receipt {
+        prepared: PreparedRelay,
+        reply: oneshot::Sender<Option<crate::RelayAllocationReceipt>>,
+    },
+    Health {
+        reply: oneshot::Sender<Option<RelayHealthSnapshot>>,
+    },
+}
+
+/// Serializes proactive-relay state transitions without holding a mutex across
+/// network acquisition or teardown. Slow I/O stays with the caller; this actor
+/// only owns short, deterministic state changes.
+#[derive(Clone)]
+struct RelayLifecycleHandle {
+    commands: mpsc::Sender<RelayLifecycleCommand>,
+    published: Arc<AtomicBool>,
+}
+
+impl RelayLifecycleHandle {
+    fn new() -> Self {
+        let (commands, mut receiver) = mpsc::channel(16);
+        let published = Arc::new(AtomicBool::new(false));
+        let actor_published = Arc::clone(&published);
+        tokio::spawn(async move {
+            let mut generation = 0u64;
+            let mut state = RelayLifecycleState::None;
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    RelayLifecycleCommand::BeginPrepare { reply } => {
+                        generation = generation.wrapping_add(1);
+                        actor_published.store(false, Ordering::Release);
+                        let previous = match std::mem::take(&mut state) {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay) => Some(relay),
+                            RelayLifecycleState::None => None,
+                        };
+                        let _ = reply.send((generation, previous));
+                    }
+                    RelayLifecycleCommand::CompletePrepare {
+                        generation: completed_generation,
+                        relay,
+                        reply,
+                    } => {
+                        if generation == completed_generation
+                            && matches!(state, RelayLifecycleState::None)
+                        {
+                            state = RelayLifecycleState::Provisional(relay);
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let _ = reply.send(Err(relay));
+                        }
+                    }
+                    RelayLifecycleCommand::Publish { prepared, reply } => {
+                        let current = std::mem::take(&mut state);
+                        match current {
+                            RelayLifecycleState::Provisional(relay) if relay.handle == prepared => {
+                                if relay.tunnel.is_closed() {
+                                    state = RelayLifecycleState::Provisional(relay);
+                                    let _ = reply.send(Err(format!(
+                                        "Prepared relay tunnel for {} is closed",
+                                        prepared.public_addr()
+                                    )));
+                                } else {
+                                    state = RelayLifecycleState::Published(relay);
+                                    actor_published.store(true, Ordering::Release);
+                                    let _ = reply.send(Ok(()));
+                                }
+                            }
+                            RelayLifecycleState::Published(relay) if relay.handle == prepared => {
+                                state = RelayLifecycleState::Published(relay);
+                                actor_published.store(true, Ordering::Release);
+                                let _ = reply.send(Ok(()));
+                            }
+                            other => {
+                                state = other;
+                                let _ = reply.send(Err(format!(
+                                    "Prepared relay allocation {} at {} is stale or no longer active",
+                                    prepared.allocation_id,
+                                    prepared.public_addr()
+                                )));
+                            }
+                        }
+                    }
+                    RelayLifecycleCommand::TakeMatching { prepared, reply } => {
+                        let current = std::mem::take(&mut state);
+                        match current {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay)
+                                if relay.handle == prepared =>
+                            {
+                                generation = generation.wrapping_add(1);
+                                actor_published.store(false, Ordering::Release);
+                                let _ = reply.send(Some(relay));
+                            }
+                            other => {
+                                state = other;
+                                let _ = reply.send(None);
+                            }
+                        }
+                    }
+                    RelayLifecycleCommand::TakeCurrent { reply } => {
+                        generation = generation.wrapping_add(1);
+                        actor_published.store(false, Ordering::Release);
+                        let relay = match std::mem::take(&mut state) {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay) => Some(relay),
+                            RelayLifecycleState::None => None,
+                        };
+                        let _ = reply.send(relay);
+                    }
+                    RelayLifecycleCommand::PublishedAddr { reply } => {
+                        let _ = reply.send(state.published_addr());
+                    }
+                    RelayLifecycleCommand::PublishedHandle { reply } => {
+                        let handle = match &state {
+                            RelayLifecycleState::Published(relay) => Some(relay.handle),
+                            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => None,
+                        };
+                        let _ = reply.send(handle);
+                    }
+                    RelayLifecycleCommand::Receipt { prepared, reply } => {
+                        let receipt = match &state {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay)
+                                if relay.handle == prepared =>
+                            {
+                                relay.allocation_receipt.clone()
+                            }
+                            RelayLifecycleState::None
+                            | RelayLifecycleState::Provisional(_)
+                            | RelayLifecycleState::Published(_) => None,
+                        };
+                        let _ = reply.send(receipt);
+                    }
+                    RelayLifecycleCommand::Health { reply } => {
+                        let health = match &state {
+                            RelayLifecycleState::Published(relay) => Some(RelayHealthSnapshot {
+                                relay_addr: relay.handle.public_addr(),
+                                tunnel: Arc::clone(&relay.tunnel),
+                            }),
+                            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => None,
+                        };
+                        let _ = reply.send(health);
+                    }
+                }
+            }
+        });
+        Self {
+            commands,
+            published,
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+
+    async fn begin_prepare(&self) -> Result<(u64, Option<ProactiveRelay>), String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::BeginPrepare { reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())
+    }
+
+    async fn complete_prepare(
+        &self,
+        generation: u64,
+        relay: ProactiveRelay,
+    ) -> Result<Result<(), ProactiveRelay>, String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::CompletePrepare {
+                generation,
+                relay,
+                reply,
+            })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())
+    }
+
+    async fn publish(&self, prepared: PreparedRelay) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::Publish { prepared, reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?
+    }
+
+    async fn take_matching(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Result<Option<ProactiveRelay>, String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::TakeMatching { prepared, reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())
+    }
+
+    async fn take_current(&self) -> Option<ProactiveRelay> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .commands
+            .send(RelayLifecycleCommand::TakeCurrent { reply })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        response.await.ok().flatten()
+    }
+
+    async fn published_addr(&self) -> Option<SocketAddr> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::PublishedAddr { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    async fn published_handle(&self) -> Option<PreparedRelay> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::PublishedHandle { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    async fn receipt(&self, prepared: PreparedRelay) -> Option<crate::RelayAllocationReceipt> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::Receipt { prepared, reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    async fn health(&self) -> Option<RelayHealthSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::Health { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
     }
 }
 
@@ -553,7 +849,7 @@ pub struct NatTraversalEndpoint {
     /// candidate set from OBSERVED_ADDRESS frames.
     bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Current proactive relay allocation and its publication state.
-    relay_lifecycle: Arc<TokioMutex<RelayLifecycleState>>,
+    relay_lifecycle: RelayLifecycleHandle,
     /// Task handles for transport listener tasks
     /// Used for cleanup on shutdown
     transport_listener_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -1724,7 +2020,10 @@ impl NatTraversalEndpoint {
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let mut server = MasqueRelayServer::new(relay_config, local_addr);
+            if let Some((public_key, secret_key)) = config.identity_key.clone() {
+                server.set_allocation_signer(public_key, secret_key);
+            }
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
@@ -1792,7 +2091,7 @@ impl NatTraversalEndpoint {
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            relay_lifecycle: Arc::new(TokioMutex::new(RelayLifecycleState::None)),
+            relay_lifecycle: RelayLifecycleHandle::new(),
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -1977,6 +2276,7 @@ impl NatTraversalEndpoint {
         let relay_server_clone = endpoint.relay_server.clone();
         let advertise = endpoint.advertise_external_addresses;
         let bootstrap_complete_clone = endpoint.bootstrap_complete.clone();
+        let relay_lifecycle = endpoint.relay_lifecycle.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1988,6 +2288,7 @@ impl NatTraversalEndpoint {
                 relay_server_clone,
                 advertise,
                 bootstrap_complete_clone,
+                relay_lifecycle,
             )
             .await;
         });
@@ -2159,7 +2460,10 @@ impl NatTraversalEndpoint {
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
-            let server = MasqueRelayServer::new(relay_config, local_addr);
+            let mut server = MasqueRelayServer::new(relay_config, local_addr);
+            if let Some((public_key, secret_key)) = config.identity_key.clone() {
+                server.set_allocation_signer(public_key, secret_key);
+            }
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
@@ -2227,7 +2531,7 @@ impl NatTraversalEndpoint {
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            relay_lifecycle: Arc::new(TokioMutex::new(RelayLifecycleState::None)),
+            relay_lifecycle: RelayLifecycleHandle::new(),
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -2412,6 +2716,7 @@ impl NatTraversalEndpoint {
         let relay_server_clone = endpoint.relay_server.clone();
         let advertise = endpoint.advertise_external_addresses;
         let bootstrap_complete_clone = endpoint.bootstrap_complete.clone();
+        let relay_lifecycle = endpoint.relay_lifecycle.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2423,6 +2728,7 @@ impl NatTraversalEndpoint {
                 relay_server_clone,
                 advertise,
                 bootstrap_complete_clone,
+                relay_lifecycle,
             )
             .await;
         });
@@ -3642,6 +3948,7 @@ impl NatTraversalEndpoint {
         relay_server: Option<Arc<MasqueRelayServer>>,
         advertise_external_addresses: bool,
         bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
+        relay_lifecycle: RelayLifecycleHandle,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3798,7 +4105,7 @@ impl NatTraversalEndpoint {
             // 2. Send ADD_ADDRESS to all peers for newly discovered addresses
             // (Critical for CGNAT - peers need to know our external address to hole-punch back)
             // Skip entirely for outbound-only clients that don't need to be reachable.
-            if advertise_external_addresses {
+            if advertise_external_addresses && !relay_lifecycle.is_published() {
                 for addr in &new_addresses {
                     broadcast_address_to_peers(&connections, *addr, 100);
                 }
@@ -3852,7 +4159,10 @@ impl NatTraversalEndpoint {
                         // first observer so hole-punch coordination can
                         // start before quorum. See the OBSERVED_ADDRESS
                         // path above for the rationale.
-                        if check.new_observer && advertise_external_addresses {
+                        if check.new_observer
+                            && advertise_external_addresses
+                            && !relay_lifecycle.is_published()
+                        {
                             broadcast_address_to_peers(
                                 &connections,
                                 candidate.address,
@@ -3994,7 +4304,7 @@ impl NatTraversalEndpoint {
 
     /// Get the relay public address after its allocation has been published.
     pub async fn relay_public_addr(&self) -> Option<SocketAddr> {
-        self.relay_lifecycle.lock().await.published_addr()
+        self.relay_lifecycle.published_addr().await
     }
 
     /// Check if the proactive relay session is still alive. Returns true if
@@ -4002,15 +4312,9 @@ impl NatTraversalEndpoint {
     /// Returns false if a relay was established but the underlying QUIC
     /// connection has closed.
     pub async fn is_relay_healthy(&self) -> bool {
-        let lifecycle = self.relay_lifecycle.lock().await;
-        let relay = match &*lifecycle {
-            RelayLifecycleState::Published(relay) => relay,
-            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => {
-                return true;
-            }
+        let Some(relay) = self.relay_lifecycle.health().await else {
+            return true;
         };
-        let relay_addr = relay.handle.public_addr();
-
         if relay.tunnel.is_closed() {
             return false;
         }
@@ -4019,35 +4323,37 @@ impl NatTraversalEndpoint {
         // Other relay sessions may exist but are irrelevant — peers are
         // using relay_addr, so that's the one that must be healthy.
         for entry in self.relay_sessions.iter() {
-            if entry.value().public_address == Some(relay_addr) {
+            if entry.value().public_address == Some(relay.relay_addr) {
                 return entry.value().is_active();
             }
         }
 
         warn!(
             "Relay session for {} is dead — re-establishment required",
-            relay_addr
+            relay.relay_addr
         );
         false
     }
 
     pub(crate) async fn published_relay_handle(&self) -> Option<PreparedRelay> {
-        let lifecycle = self.relay_lifecycle.lock().await;
-        match &*lifecycle {
-            RelayLifecycleState::Published(relay) => Some(relay.handle),
-            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => None,
-        }
+        self.relay_lifecycle.published_handle().await
+    }
+
+    /// Return the relay-signed receipt for a live allocation.
+    ///
+    /// Matching the opaque handle prevents a stale acquisition from obtaining
+    /// a receipt for a newer allocation that reused the same socket address.
+    pub async fn proactive_relay_receipt(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Option<crate::RelayAllocationReceipt> {
+        self.relay_lifecycle.receipt(prepared).await
     }
 
     pub(crate) async fn abort_current_proactive_relay(&self) {
-        let mut lifecycle = self.relay_lifecycle.lock().await;
-        let state = std::mem::take(&mut *lifecycle);
-        match state {
-            RelayLifecycleState::Provisional(relay) | RelayLifecycleState::Published(relay) => {
-                self.teardown_proactive_relay(relay, b"relay allocation aborted")
-                    .await;
-            }
-            RelayLifecycleState::None => {}
+        if let Some(relay) = self.relay_lifecycle.take_current().await {
+            self.teardown_proactive_relay(relay, b"relay allocation aborted")
+                .await;
         }
     }
 
@@ -4072,8 +4378,14 @@ impl NatTraversalEndpoint {
     pub async fn establish_relay_session(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<(Option<SocketAddr>, Option<crate::masque::RawRelayStreams>), NatTraversalError>
-    {
+    ) -> Result<
+        (
+            Option<SocketAddr>,
+            Option<crate::masque::RawRelayStreams>,
+            Option<crate::RelayAllocationReceipt>,
+        ),
+        NatTraversalError,
+    > {
         // Check if we already have an active session to this relay
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
@@ -4083,7 +4395,11 @@ impl NatTraversalEndpoint {
                     public_address = ?session.public_address,
                     "relay session: reusing active CONNECT-UDP session"
                 );
-                return Ok((session.public_address, None));
+                return Ok((
+                    session.public_address,
+                    None,
+                    session.allocation_receipt.clone(),
+                ));
             }
         }
 
@@ -4191,7 +4507,7 @@ impl NatTraversalEndpoint {
         if !response.is_success() {
             let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
             // Distinguish "at capacity" (client should walk to next candidate) from
-            // other failure modes. See ADR-014 in saorsa-core for the 2-client cap
+            // other failure modes. See ADR-016 in saorsa-core for the four-client cap
             // design.
             if response.status == MASQUE_RELAY_FULL_STATUS {
                 return Err(NatTraversalError::RelayAtCapacity { reason });
@@ -4203,6 +4519,7 @@ impl NatTraversalEndpoint {
         }
 
         let public_address = response.proxy_public_address;
+        let allocation_receipt = response.allocation_receipt.clone();
 
         info!(
             "Relay session established with public address: {:?}",
@@ -4222,6 +4539,7 @@ impl NatTraversalEndpoint {
             public_address,
             established_at: std::time::Instant::now(),
             relay_addr,
+            allocation_receipt: allocation_receipt.clone(),
         };
 
         // DashMap provides lock-free .insert()
@@ -4236,7 +4554,7 @@ impl NatTraversalEndpoint {
             }
         }
 
-        Ok((public_address, raw_streams))
+        Ok((public_address, raw_streams, allocation_receipt))
     }
 
     /// Create a fresh QUIC connection to a relay server.
@@ -4272,6 +4590,44 @@ impl NatTraversalEndpoint {
 
         info!("Connected to relay server {}", relay_addr);
         Ok(connection)
+    }
+
+    /// Open one fresh authenticated QUIC connection without registering it in
+    /// any peer, address, or connection-deduplication map.
+    ///
+    /// The returned identity is extracted before this method closes exactly
+    /// the connection it created. This is intentionally separate from normal
+    /// application dialing so a reachability probe can never borrow or tear
+    /// down a live DHT/application connection.
+    pub async fn probe_fresh_authenticated(
+        &self,
+        target: SocketAddr,
+    ) -> Result<Vec<u8>, NatTraversalError> {
+        let endpoint = self.inner_endpoint.as_ref().ok_or_else(|| {
+            NatTraversalError::ConfigError("QUIC endpoint not initialized".to_string())
+        })?;
+        let server_name = target.ip().to_string();
+        let connecting = endpoint.connect(target, &server_name).map_err(|error| {
+            NatTraversalError::ConnectionFailed(format!(
+                "Failed to initiate fresh authenticated probe: {error}"
+            ))
+        })?;
+        let connection = timeout(self.config.coordination_timeout, connecting)
+            .await
+            .map_err(|_| NatTraversalError::Timeout)?
+            .map_err(|error| {
+                NatTraversalError::ConnectionFailed(format!(
+                    "Fresh authenticated probe failed: {error}"
+                ))
+            })?;
+
+        let public_key = Self::extract_public_key_from_connection(&connection);
+        connection.close(crate::VarInt::from_u32(0), b"reachability probe complete");
+        public_key.ok_or_else(|| {
+            NatTraversalError::ConnectionFailed(
+                "Fresh authenticated probe did not expose a peer identity".to_string(),
+            )
+        })
     }
 
     /// Get active relay sessions
@@ -5107,19 +5463,18 @@ impl NatTraversalEndpoint {
         &self,
         bootstrap_addr: SocketAddr,
     ) -> Result<PreparedRelay, NatTraversalError> {
-        let mut lifecycle = self.relay_lifecycle.lock().await;
+        let (generation, previous) = self
+            .relay_lifecycle
+            .begin_prepare()
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?;
 
-        // A new acquisition supersedes any prior allocation. Teardown happens
-        // before the new CONNECT-UDP request so rejected canaries cannot
-        // accumulate relay-server capacity.
-        let previous = std::mem::take(&mut *lifecycle);
-        match previous {
-            RelayLifecycleState::Provisional(previous)
-            | RelayLifecycleState::Published(previous) => {
-                self.teardown_proactive_relay(previous, b"relay superseded")
-                    .await;
-            }
-            RelayLifecycleState::None => {}
+        // A new acquisition supersedes any prior allocation. The actor releases
+        // ownership before teardown, so lifecycle queries and shutdown are not
+        // blocked behind network I/O.
+        if let Some(previous) = previous {
+            self.teardown_proactive_relay(previous, b"relay superseded")
+                .await;
         }
 
         info!(
@@ -5164,7 +5519,8 @@ impl NatTraversalEndpoint {
         })?;
 
         // Acquire the relay only after local validation is complete.
-        let (public_addr, raw_streams) = self.establish_relay_session(bootstrap_addr).await?;
+        let (public_addr, raw_streams, allocation_receipt) =
+            self.establish_relay_session(bootstrap_addr).await?;
         let Some(relay_public_addr) = public_addr else {
             self.remove_matching_relay_session(bootstrap_addr, None, b"invalid relay allocation");
             return Err(NatTraversalError::ConnectionFailed(
@@ -5266,8 +5622,23 @@ impl NatTraversalEndpoint {
             handle,
             endpoint: relay_endpoint,
             tunnel,
+            allocation_receipt,
         };
-        *lifecycle = RelayLifecycleState::Provisional(state);
+        match self
+            .relay_lifecycle
+            .complete_prepare(generation, state)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?
+        {
+            Ok(()) => {}
+            Err(stale) => {
+                self.teardown_proactive_relay(stale, b"relay acquisition superseded")
+                    .await;
+                return Err(NatTraversalError::ConnectionFailed(
+                    "Relay acquisition was superseded before completion".to_string(),
+                ));
+            }
+        }
 
         Ok(handle)
     }
@@ -5280,35 +5651,10 @@ impl NatTraversalEndpoint {
         &self,
         prepared: PreparedRelay,
     ) -> Result<(), NatTraversalError> {
-        let mut lifecycle = self.relay_lifecycle.lock().await;
-        let current = std::mem::take(&mut *lifecycle);
-        let relay = match current {
-            RelayLifecycleState::Provisional(relay) if relay.handle == prepared => relay,
-            RelayLifecycleState::Published(relay) if relay.handle == prepared => {
-                *lifecycle = RelayLifecycleState::Published(relay);
-                return Ok(());
-            }
-            other => {
-                *lifecycle = other;
-                return Err(NatTraversalError::ConnectionFailed(format!(
-                    "Prepared relay allocation {} at {} is stale or no longer active",
-                    prepared.allocation_id,
-                    prepared.public_addr()
-                )));
-            }
-        };
-        if relay.tunnel.is_closed() {
-            *lifecycle = RelayLifecycleState::Provisional(relay);
-            return Err(NatTraversalError::ConnectionFailed(format!(
-                "Prepared relay tunnel for {} is closed",
-                prepared.public_addr()
-            )));
-        }
-
-        // No fallible work follows this assignment. Publication is therefore a
-        // single transactional transition: retries can never observe
-        // `Published` without the address also being visible through the state.
-        *lifecycle = RelayLifecycleState::Published(relay);
+        self.relay_lifecycle
+            .publish(prepared)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?;
 
         // Relay addresses are intentionally not broadcast through the
         // connection-level ADD_ADDRESS extension. A relay allocation belongs
@@ -5333,21 +5679,14 @@ impl NatTraversalEndpoint {
         &self,
         prepared: PreparedRelay,
     ) -> Result<(), NatTraversalError> {
-        let mut lifecycle = self.relay_lifecycle.lock().await;
-        let current = std::mem::take(&mut *lifecycle);
-        match current {
-            RelayLifecycleState::Provisional(relay) | RelayLifecycleState::Published(relay)
-                if relay.handle == prepared =>
-            {
-                self.teardown_proactive_relay(relay, b"relay allocation aborted")
-                    .await;
-            }
-            other => {
-                // A stale abort is intentionally idempotent, but unlike the
-                // former address-only check it cannot tear down a newer relay
-                // that reclaimed the same public socket.
-                *lifecycle = other;
-            }
+        if let Some(relay) = self
+            .relay_lifecycle
+            .take_matching(prepared)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?
+        {
+            self.teardown_proactive_relay(relay, b"relay allocation aborted")
+                .await;
         }
         Ok(())
     }
@@ -7792,6 +8131,10 @@ impl NatTraversalEndpoint {
         addr: SocketAddr,
         candidate: &CandidateAddress,
     ) -> Result<(), NatTraversalError> {
+        if self.relay_lifecycle.is_published() {
+            debug!("Suppressing ADD_ADDRESS candidate advertisement while a relay is published");
+            return Ok(());
+        }
         debug!(
             "Sending candidate advertisement to {}: {}",
             addr, candidate.address

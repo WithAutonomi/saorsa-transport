@@ -258,6 +258,8 @@ pub mod metrics;
 
 /// TURN-style relay protocol for NAT traversal fallback
 pub mod relay;
+mod relay_allocation;
+pub use relay_allocation::{RelayAllocationReceipt, RelayAllocationReceiptError};
 
 /// MASQUE CONNECT-UDP Bind protocol for fully connectable P2P nodes
 pub mod masque;

@@ -275,6 +275,9 @@ pub struct ConnectUdpResponse {
     pub proxy_public_address: Option<SocketAddr>,
     /// Human-readable reason phrase
     pub reason: Option<String>,
+    /// Relay-signed proof that this allocation belongs to the authenticated
+    /// client. Present for successful authenticated bind allocations.
+    pub allocation_receipt: Option<crate::RelayAllocationReceipt>,
     /// Relay-internal: the session id created for a successful CONNECT. NOT part
     /// of the wire format (it is not encoded/decoded); the relay sets it so the
     /// connection handler can start forwarding the *exact* session it created,
@@ -300,6 +303,7 @@ impl ConnectUdpResponse {
             status: Self::STATUS_OK,
             proxy_public_address: public_addr,
             reason: None,
+            allocation_receipt: None,
             session_id: None,
         }
     }
@@ -310,6 +314,7 @@ impl ConnectUdpResponse {
             status,
             proxy_public_address: None,
             reason: Some(reason.into()),
+            allocation_receipt: None,
             session_id: None,
         }
     }
@@ -353,20 +358,23 @@ impl ConnectUdpResponse {
 
     /// Encode the response as wire format
     ///
-    /// Format: [status (2)] [flags (1)] [addr if present]
+    /// Format: [status (2)] [flags (1)] [addr] [reason] [allocation receipt]
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
         // Status code
         buf.put_u16(self.status);
 
-        // Flags: bit 0 = has address, bit 1 = has reason
+        // Flags: bit 0 = has address, bit 1 = has reason, bit 2 = has receipt
         let mut flags: u8 = 0;
         if self.proxy_public_address.is_some() {
             flags |= 0x01;
         }
         if self.reason.is_some() {
             flags |= 0x02;
+        }
+        if self.allocation_receipt.is_some() {
+            flags |= 0x04;
         }
         buf.put_u8(flags);
 
@@ -394,6 +402,14 @@ impl ConnectUdpResponse {
             buf.put_slice(reason_bytes);
         }
 
+        if let Some(receipt) = &self.allocation_receipt {
+            let receipt = receipt.encode();
+            if let Ok(length) = VarInt::from_u64(receipt.len() as u64) {
+                length.encode(&mut buf);
+            }
+            buf.put_slice(&receipt);
+        }
+
         buf.freeze()
     }
 
@@ -407,6 +423,7 @@ impl ConnectUdpResponse {
         let flags = buf.get_u8();
         let has_addr = (flags & 0x01) != 0;
         let has_reason = (flags & 0x02) != 0;
+        let has_receipt = (flags & 0x04) != 0;
 
         let proxy_public_address = if has_addr {
             if buf.remaining() < 1 {
@@ -457,10 +474,31 @@ impl ConnectUdpResponse {
             None
         };
 
+        let allocation_receipt = if has_receipt {
+            let receipt_len = VarInt::decode(buf)
+                .map_err(|_| ConnectError::InvalidResponse("invalid receipt length".into()))?
+                .into_inner() as usize;
+            if buf.remaining() < receipt_len {
+                return Err(ConnectError::InvalidResponse(
+                    "missing allocation receipt".into(),
+                ));
+            }
+            let mut receipt = vec![0; receipt_len];
+            buf.copy_to_slice(&mut receipt);
+            Some(
+                crate::RelayAllocationReceipt::decode(&receipt).map_err(|_| {
+                    ConnectError::InvalidResponse("invalid allocation receipt".into())
+                })?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             status,
             proxy_public_address,
             reason,
+            allocation_receipt,
             // Not part of the wire format; only set by the relay on the response
             // object it returns locally.
             session_id: None,
@@ -566,6 +604,22 @@ mod tests {
         let original = ConnectUdpResponse::success(Some(addr));
         let encoded = original.encode();
         let decoded = ConnectUdpResponse::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_response_roundtrip_with_allocation_receipt() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 9000);
+        let (public_key, secret_key) = crate::generate_ml_dsa_keypair().expect("test identity");
+        let mut original = ConnectUdpResponse::success(Some(addr));
+        original.allocation_receipt = Some(
+            crate::RelayAllocationReceipt::issue(&public_key, &secret_key, [7; 32], addr, 42)
+                .expect("allocation receipt"),
+        );
+
+        let encoded = original.encode();
+        let decoded = ConnectUdpResponse::decode(&mut encoded.clone()).unwrap();
+
         assert_eq!(original, decoded);
     }
 
