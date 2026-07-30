@@ -81,7 +81,7 @@ jobs:
           fi
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.sha }}
           path: |
@@ -194,7 +194,7 @@ jobs:
           kill $FLAME_PID || true
 
       - name: Upload flamegraph
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flamegraph
           path: flamegraph.svg
@@ -238,7 +238,7 @@ jobs:
           fi
 
       - name: Upload valgrind log
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: valgrind-log
           path: valgrind.log
