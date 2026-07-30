@@ -164,6 +164,22 @@ impl RelayTunnelControl {
 
     /// Stop the tunnel and wait for all task-owned QUIC streams to be dropped.
     pub(crate) async fn shutdown(&self) {
+        let handles = self.abort_tasks();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Stop the tunnel without waiting for task cancellation to complete.
+    ///
+    /// This is the cancellation-safe fallback used by relay ownership guards:
+    /// `Drop` cannot await, but it must still ensure the task-owned QUIC stream
+    /// halves are scheduled for prompt release.
+    pub(crate) fn shutdown_now(&self) {
+        drop(self.abort_tasks());
+    }
+
+    fn abort_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         self.mark_closed();
         let handles = {
             let mut tasks = self.tasks.lock();
@@ -172,9 +188,7 @@ impl RelayTunnelControl {
         for handle in &handles {
             handle.abort();
         }
-        for handle in handles {
-            let _ = handle.await;
-        }
+        handles
     }
 }
 
@@ -758,6 +772,29 @@ mod relay_tunnel_control_tests {
         control.shutdown().await;
         control.shutdown().await;
 
+        assert!(control.is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_now_aborts_registered_tasks_without_an_await() {
+        let control = RelayTunnelControl::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = DropMarker(Arc::clone(&dropped));
+        control.register(tokio::spawn(async move {
+            let _marker = marker;
+            std::future::pending::<()>().await;
+        }));
+
+        tokio::task::yield_now().await;
+        control.shutdown_now();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted tunnel task should release its owned stream state");
         assert!(control.is_closed());
     }
 

@@ -427,6 +427,75 @@ struct ProactiveRelay {
     endpoint: Arc<InnerEndpoint>,
     tunnel: Arc<crate::masque::RelayTunnelControl>,
     allocation_receipt: Option<crate::RelayAllocationReceipt>,
+    relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    relay_session_stable_id: usize,
+    cleanup_armed: bool,
+}
+
+impl ProactiveRelay {
+    async fn teardown(mut self, reason: &'static [u8]) {
+        self.endpoint
+            .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        self.tunnel.shutdown().await;
+
+        if tokio::time::timeout(Duration::from_secs(1), self.endpoint.wait_idle())
+            .await
+            .is_err()
+        {
+            debug!(
+                relay_addr = %self.handle.public_addr(),
+                "Timed out draining proactive relay endpoint during teardown"
+            );
+        }
+
+        self.remove_owned_session(reason);
+
+        info!(
+            relay_addr = %self.handle.public_addr(),
+            relay_server = %self.relay_server_addr,
+            allocation_id = self.handle.allocation_id,
+            "Proactive relay torn down"
+        );
+        self.cleanup_armed = false;
+    }
+
+    fn remove_owned_session(&self, reason: &'static [u8]) {
+        let matching_session = self
+            .relay_sessions
+            .get(&self.relay_server_addr)
+            .is_some_and(|session| {
+                session.public_address == Some(self.handle.public_addr())
+                    && session.connection.stable_id() == self.relay_session_stable_id
+            });
+        if !matching_session {
+            return;
+        }
+
+        if let Some((_, session)) = self.relay_sessions.remove(&self.relay_server_addr) {
+            session
+                .connection
+                .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        }
+    }
+}
+
+impl Drop for ProactiveRelay {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        warn!(
+            relay_addr = %self.handle.public_addr(),
+            allocation_id = self.handle.allocation_id,
+            "Relay owner dropped before graceful teardown completed; forcing cleanup"
+        );
+        let reason = b"relay owner dropped";
+        self.endpoint
+            .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        self.tunnel.shutdown_now();
+        self.remove_owned_session(reason);
+    }
 }
 
 /// Complete proactive-relay lifecycle state.
@@ -5471,7 +5540,8 @@ impl NatTraversalEndpoint {
 
         // A new acquisition supersedes any prior allocation. The actor releases
         // ownership before teardown, so lifecycle queries and shutdown are not
-        // blocked behind network I/O.
+        // blocked behind network I/O. The ownership guard forces cleanup if
+        // this future is cancelled before graceful teardown completes.
         if let Some(previous) = previous {
             self.teardown_proactive_relay(previous, b"relay superseded")
                 .await;
@@ -5537,6 +5607,15 @@ impl NatTraversalEndpoint {
                 "Relay did not provide socket".to_string(),
             ));
         };
+        let relay_session_stable_id = self
+            .relay_sessions
+            .get(&bootstrap_addr)
+            .map(|session| session.connection.stable_id())
+            .ok_or_else(|| {
+                NatTraversalError::ConnectionFailed(
+                    "Relay allocation lost its owning control session".to_string(),
+                )
+            })?;
 
         info!(
             "Relay session established, public address: {}",
@@ -5623,6 +5702,9 @@ impl NatTraversalEndpoint {
             endpoint: relay_endpoint,
             tunnel,
             allocation_receipt,
+            relay_sessions: Arc::clone(&self.relay_sessions),
+            relay_session_stable_id,
+            cleanup_armed: true,
         };
         match self
             .relay_lifecycle
@@ -5709,33 +5791,7 @@ impl NatTraversalEndpoint {
     }
 
     async fn teardown_proactive_relay(&self, state: ProactiveRelay, reason: &'static [u8]) {
-        state
-            .endpoint
-            .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
-        state.tunnel.shutdown().await;
-
-        if tokio::time::timeout(Duration::from_secs(1), state.endpoint.wait_idle())
-            .await
-            .is_err()
-        {
-            debug!(
-                relay_addr = %state.handle.public_addr(),
-                "Timed out draining proactive relay endpoint during teardown"
-            );
-        }
-
-        self.remove_matching_relay_session(
-            state.relay_server_addr,
-            Some(state.handle.public_addr()),
-            reason,
-        );
-
-        info!(
-            relay_addr = %state.handle.public_addr(),
-            relay_server = %state.relay_server_addr,
-            allocation_id = state.handle.allocation_id,
-            "Proactive relay torn down"
-        );
+        state.teardown(reason).await;
     }
 
     fn remove_matching_relay_session(
