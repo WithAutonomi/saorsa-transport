@@ -123,6 +123,11 @@ impl RelayTunnelControl {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn detached() -> Arc<Self> {
+        Self::new()
+    }
+
     fn register(&self, handle: tokio::task::JoinHandle<()>) {
         if self.is_closed() {
             handle.abort();

@@ -568,13 +568,14 @@ enum RelayLifecycleState {
     None,
     Provisional(ProactiveRelay),
     Published(ProactiveRelay),
+    Shutdown,
 }
 
 impl RelayLifecycleState {
     fn published_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Published(relay) => Some(relay.handle.public_addr()),
-            Self::None | Self::Provisional(_) => None,
+            Self::None | Self::Provisional(_) | Self::Shutdown => None,
         }
     }
 }
@@ -586,7 +587,7 @@ struct RelayHealthSnapshot {
 
 enum RelayLifecycleCommand {
     BeginPrepare {
-        reply: oneshot::Sender<(u64, Option<ProactiveRelay>)>,
+        reply: oneshot::Sender<Result<(u64, Option<ProactiveRelay>), String>>,
     },
     CompletePrepare {
         generation: u64,
@@ -601,7 +602,7 @@ enum RelayLifecycleCommand {
         prepared: PreparedRelay,
         reply: oneshot::Sender<Option<ProactiveRelay>>,
     },
-    TakeCurrent {
+    Shutdown {
         reply: oneshot::Sender<Option<ProactiveRelay>>,
     },
     PublishedAddr {
@@ -639,14 +640,19 @@ impl RelayLifecycleHandle {
             while let Some(command) = receiver.recv().await {
                 match command {
                     RelayLifecycleCommand::BeginPrepare { reply } => {
-                        generation = generation.wrapping_add(1);
-                        actor_published.store(false, Ordering::Release);
                         let previous = match std::mem::take(&mut state) {
                             RelayLifecycleState::Provisional(relay)
                             | RelayLifecycleState::Published(relay) => Some(relay),
                             RelayLifecycleState::None => None,
+                            RelayLifecycleState::Shutdown => {
+                                state = RelayLifecycleState::Shutdown;
+                                let _ = reply.send(Err("relay lifecycle is shut down".to_string()));
+                                continue;
+                            }
                         };
-                        let _ = reply.send((generation, previous));
+                        generation = generation.wrapping_add(1);
+                        actor_published.store(false, Ordering::Release);
+                        let _ = reply.send(Ok((generation, previous)));
                     }
                     RelayLifecycleCommand::CompletePrepare {
                         generation: completed_generation,
@@ -683,6 +689,10 @@ impl RelayLifecycleHandle {
                                 actor_published.store(true, Ordering::Release);
                                 let _ = reply.send(Ok(()));
                             }
+                            RelayLifecycleState::Shutdown => {
+                                state = RelayLifecycleState::Shutdown;
+                                let _ = reply.send(Err("relay lifecycle is shut down".to_string()));
+                            }
                             other => {
                                 state = other;
                                 let _ = reply.send(Err(format!(
@@ -710,14 +720,15 @@ impl RelayLifecycleHandle {
                             }
                         }
                     }
-                    RelayLifecycleCommand::TakeCurrent { reply } => {
+                    RelayLifecycleCommand::Shutdown { reply } => {
                         generation = generation.wrapping_add(1);
                         actor_published.store(false, Ordering::Release);
-                        let relay = match std::mem::take(&mut state) {
-                            RelayLifecycleState::Provisional(relay)
-                            | RelayLifecycleState::Published(relay) => Some(relay),
-                            RelayLifecycleState::None => None,
-                        };
+                        let relay =
+                            match std::mem::replace(&mut state, RelayLifecycleState::Shutdown) {
+                                RelayLifecycleState::Provisional(relay)
+                                | RelayLifecycleState::Published(relay) => Some(relay),
+                                RelayLifecycleState::None | RelayLifecycleState::Shutdown => None,
+                            };
                         let _ = reply.send(relay);
                     }
                     RelayLifecycleCommand::PublishedAddr { reply } => {
@@ -726,7 +737,9 @@ impl RelayLifecycleHandle {
                     RelayLifecycleCommand::PublishedHandle { reply } => {
                         let handle = match &state {
                             RelayLifecycleState::Published(relay) => Some(relay.handle),
-                            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => None,
+                            RelayLifecycleState::None
+                            | RelayLifecycleState::Provisional(_)
+                            | RelayLifecycleState::Shutdown => None,
                         };
                         let _ = reply.send(handle);
                     }
@@ -740,7 +753,8 @@ impl RelayLifecycleHandle {
                             }
                             RelayLifecycleState::None
                             | RelayLifecycleState::Provisional(_)
-                            | RelayLifecycleState::Published(_) => None,
+                            | RelayLifecycleState::Published(_)
+                            | RelayLifecycleState::Shutdown => None,
                         };
                         let _ = reply.send(receipt);
                     }
@@ -750,7 +764,9 @@ impl RelayLifecycleHandle {
                                 relay_addr: relay.handle.public_addr(),
                                 tunnel: Arc::clone(&relay.tunnel),
                             }),
-                            RelayLifecycleState::None | RelayLifecycleState::Provisional(_) => None,
+                            RelayLifecycleState::None
+                            | RelayLifecycleState::Provisional(_)
+                            | RelayLifecycleState::Shutdown => None,
                         };
                         let _ = reply.send(health);
                     }
@@ -775,7 +791,7 @@ impl RelayLifecycleHandle {
             .map_err(|_| "relay lifecycle actor stopped".to_string())?;
         response
             .await
-            .map_err(|_| "relay lifecycle actor stopped".to_string())
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?
     }
 
     async fn complete_prepare(
@@ -822,11 +838,11 @@ impl RelayLifecycleHandle {
             .map_err(|_| "relay lifecycle actor stopped".to_string())
     }
 
-    async fn take_current(&self) -> Option<ProactiveRelay> {
+    async fn shutdown(&self) -> Option<ProactiveRelay> {
         let (reply, response) = oneshot::channel();
         if self
             .commands
-            .send(RelayLifecycleCommand::TakeCurrent { reply })
+            .send(RelayLifecycleCommand::Shutdown { reply })
             .await
             .is_err()
         {
@@ -4478,13 +4494,6 @@ impl NatTraversalEndpoint {
         self.relay_lifecycle.receipt(prepared).await
     }
 
-    pub(crate) async fn abort_current_proactive_relay(&self) {
-        if let Some(relay) = self.relay_lifecycle.take_current().await {
-            self.teardown_proactive_relay(relay, b"relay allocation aborted")
-                .await;
-        }
-    }
-
     /// Check if relay fallback is available
     pub async fn has_relay_fallback(&self) -> bool {
         match &self.relay_manager {
@@ -6432,7 +6441,10 @@ impl NatTraversalEndpoint {
         self.incoming_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
 
-        self.abort_current_proactive_relay().await;
+        if let Some(relay) = self.relay_lifecycle.shutdown().await {
+            self.teardown_proactive_relay(relay, b"endpoint shutdown")
+                .await;
+        }
 
         // Best-effort UPnP teardown. The endpoint is the sole owner of
         // the service (the discovery manager only holds a read-only
@@ -8454,6 +8466,36 @@ impl crate::TokenStore for DefaultTokenStore {
 mod tests {
     use super::*;
 
+    async fn detached_proactive_relay(public_addr: SocketAddr) -> ProactiveRelay {
+        let endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("test endpoint");
+        let relay_endpoint = Arc::new(endpoint.get_endpoint().expect("transport endpoint").clone());
+        endpoint.shutdown().await.expect("test endpoint shutdown");
+
+        ProactiveRelay {
+            handle: PreparedRelay::new(public_addr),
+            endpoint: relay_endpoint,
+            tunnel: crate::masque::RelayTunnelControl::detached(),
+            allocation_receipt: None,
+            relay_session_owner: RelaySessionOwner {
+                relay_server_addr: "127.0.0.1:1".parse().expect("relay server address"),
+                public_address: Some(public_addr),
+                relay_sessions: Arc::new(dashmap::DashMap::new()),
+                stable_id: usize::MAX,
+                cleanup_armed: false,
+            },
+            cleanup_armed: false,
+        }
+    }
+
     #[test]
     fn prepared_relay_identity_distinguishes_reused_public_address() {
         let public_addr = "203.0.113.7:9000".parse().expect("test address");
@@ -8464,6 +8506,109 @@ mod tests {
         assert_eq!(first, first_copy);
         assert_ne!(first, replacement);
         assert_eq!(first.public_addr(), replacement.public_addr());
+    }
+
+    #[tokio::test]
+    async fn relay_lifecycle_shutdown_rejects_inflight_and_later_commands() {
+        let lifecycle = RelayLifecycleHandle::new();
+        let (generation, previous) = lifecycle.begin_prepare().await.expect("begin prepare");
+        assert!(previous.is_none());
+
+        assert!(
+            lifecycle.shutdown().await.is_none(),
+            "shutdown before completion has no installed relay to drain"
+        );
+
+        let relay =
+            detached_proactive_relay("203.0.113.10:10000".parse().expect("relay public address"))
+                .await;
+        let prepared = relay.handle;
+        let completion = lifecycle
+            .complete_prepare(generation, relay)
+            .await
+            .expect("lifecycle actor");
+        assert!(
+            completion.is_err(),
+            "an acquisition begun before shutdown must not install afterward"
+        );
+        drop(completion);
+
+        let later_begin = lifecycle.begin_prepare().await;
+        assert!(
+            matches!(later_begin, Err(ref error) if error.contains("shut down")),
+            "prepare after shutdown must be rejected"
+        );
+        let later_publish = lifecycle.publish(prepared).await;
+        assert!(
+            matches!(later_publish, Err(ref error) if error.contains("shut down")),
+            "publish after shutdown must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_lifecycle_shutdown_drains_installed_relay_once() {
+        let lifecycle = RelayLifecycleHandle::new();
+        let relay =
+            detached_proactive_relay("203.0.113.11:10001".parse().expect("relay public address"))
+                .await;
+        let prepared = relay.handle;
+        let (generation, previous) = lifecycle.begin_prepare().await.expect("begin prepare");
+        assert!(previous.is_none());
+        let completion = lifecycle
+            .complete_prepare(generation, relay)
+            .await
+            .expect("lifecycle actor");
+        assert!(completion.is_ok(), "relay must install before shutdown");
+        lifecycle
+            .publish(prepared)
+            .await
+            .expect("publish before shutdown");
+        assert!(lifecycle.is_published());
+
+        let drained = lifecycle
+            .shutdown()
+            .await
+            .expect("shutdown must return installed relay");
+        assert_eq!(drained.handle, prepared);
+        drop(drained);
+        assert!(!lifecycle.is_published());
+        assert!(
+            lifecycle.shutdown().await.is_none(),
+            "terminal shutdown must drain at most once"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_shutdown_rejects_relay_prepare_and_publish() {
+        let endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("test endpoint");
+        endpoint.shutdown().await.expect("endpoint shutdown");
+
+        let prepare = endpoint
+            .prepare_proactive_relay("127.0.0.1:9".parse().expect("relay address"))
+            .await;
+        assert!(
+            matches!(prepare, Err(NatTraversalError::ConnectionFailed(ref error)) if error.contains("shut down")),
+            "public prepare path must reject after shutdown without dialing"
+        );
+
+        let publish = endpoint
+            .publish_proactive_relay(PreparedRelay::detached(
+                "203.0.113.12:10002".parse().expect("relay public address"),
+            ))
+            .await;
+        assert!(
+            matches!(publish, Err(NatTraversalError::ConnectionFailed(ref error)) if error.contains("shut down")),
+            "public publish path must reject after shutdown"
+        );
     }
 
     #[tokio::test]
