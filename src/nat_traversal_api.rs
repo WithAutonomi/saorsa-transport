@@ -378,6 +378,86 @@ impl RelaySession {
     }
 }
 
+/// Cancellation-safe ownership of one exact entry in `relay_sessions`.
+///
+/// The guard is armed before the entry is inserted, so every subsequent await
+/// is protected. Ownership can be transferred into [`ProactiveRelay`] or
+/// explicitly disarmed when the session is intentionally left managed by the
+/// endpoint-wide session table.
+struct RelaySessionOwner {
+    relay_server_addr: SocketAddr,
+    public_address: Option<SocketAddr>,
+    relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    stable_id: usize,
+    cleanup_armed: bool,
+}
+
+impl RelaySessionOwner {
+    fn new(
+        relay_server_addr: SocketAddr,
+        public_address: Option<SocketAddr>,
+        relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+        stable_id: usize,
+    ) -> Self {
+        Self {
+            relay_server_addr,
+            public_address,
+            relay_sessions,
+            stable_id,
+            cleanup_armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.cleanup_armed = false;
+    }
+
+    fn remove_owned_session(&mut self, reason: &'static [u8]) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        let public_address = self.public_address;
+        let stable_id = self.stable_id;
+        let removed = self
+            .relay_sessions
+            .remove_if(&self.relay_server_addr, |_, session| {
+                session.public_address == public_address
+                    && session.connection.stable_id() == stable_id
+            });
+
+        if let Some((_, session)) = removed {
+            session
+                .connection
+                .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        }
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for RelaySessionOwner {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        warn!(
+            relay_server = %self.relay_server_addr,
+            relay_addr = ?self.public_address,
+            stable_id = self.stable_id,
+            "Relay session owner dropped before ownership transfer; forcing cleanup"
+        );
+        self.remove_owned_session(b"relay session owner dropped");
+    }
+}
+
+struct EstablishedRelaySession {
+    public_address: Option<SocketAddr>,
+    raw_streams: Option<crate::masque::RawRelayStreams>,
+    allocation_receipt: Option<crate::RelayAllocationReceipt>,
+    owner: RelaySessionOwner,
+}
+
 /// Opaque identity of a prepared proactive relay allocation.
 ///
 /// Callers must pass this exact handle to
@@ -422,13 +502,11 @@ impl PreparedRelay {
 
 /// Resources owned by one proactive relay allocation.
 struct ProactiveRelay {
-    relay_server_addr: SocketAddr,
     handle: PreparedRelay,
     endpoint: Arc<InnerEndpoint>,
     tunnel: Arc<crate::masque::RelayTunnelControl>,
     allocation_receipt: Option<crate::RelayAllocationReceipt>,
-    relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
-    relay_session_stable_id: usize,
+    relay_session_owner: RelaySessionOwner,
     cleanup_armed: bool,
 }
 
@@ -448,34 +526,15 @@ impl ProactiveRelay {
             );
         }
 
-        self.remove_owned_session(reason);
+        self.relay_session_owner.remove_owned_session(reason);
 
         info!(
             relay_addr = %self.handle.public_addr(),
-            relay_server = %self.relay_server_addr,
+            relay_server = %self.relay_session_owner.relay_server_addr,
             allocation_id = self.handle.allocation_id,
             "Proactive relay torn down"
         );
         self.cleanup_armed = false;
-    }
-
-    fn remove_owned_session(&self, reason: &'static [u8]) {
-        let matching_session = self
-            .relay_sessions
-            .get(&self.relay_server_addr)
-            .is_some_and(|session| {
-                session.public_address == Some(self.handle.public_addr())
-                    && session.connection.stable_id() == self.relay_session_stable_id
-            });
-        if !matching_session {
-            return;
-        }
-
-        if let Some((_, session)) = self.relay_sessions.remove(&self.relay_server_addr) {
-            session
-                .connection
-                .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
-        }
     }
 }
 
@@ -494,7 +553,7 @@ impl Drop for ProactiveRelay {
         self.endpoint
             .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
         self.tunnel.shutdown_now();
-        self.remove_owned_session(reason);
+        self.relay_session_owner.remove_owned_session(reason);
     }
 }
 
@@ -4455,20 +4514,44 @@ impl NatTraversalEndpoint {
         ),
         NatTraversalError,
     > {
+        let EstablishedRelaySession {
+            public_address,
+            raw_streams,
+            allocation_receipt,
+            owner,
+        } = self.establish_owned_relay_session(relay_addr).await?;
+        owner.disarm();
+        Ok((public_address, raw_streams, allocation_receipt))
+    }
+
+    async fn establish_owned_relay_session(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<EstablishedRelaySession, NatTraversalError> {
         // Check if we already have an active session to this relay
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
+                let public_address = session.public_address;
+                let allocation_receipt = session.allocation_receipt.clone();
+                let stable_id = session.connection.stable_id();
                 debug!(
                     relay = %relay_addr,
-                    public_address = ?session.public_address,
+                    public_address = ?public_address,
                     "relay session: reusing active CONNECT-UDP session"
                 );
-                return Ok((
-                    session.public_address,
-                    None,
-                    session.allocation_receipt.clone(),
-                ));
+                drop(session);
+                return Ok(EstablishedRelaySession {
+                    public_address,
+                    raw_streams: None,
+                    allocation_receipt,
+                    owner: RelaySessionOwner::new(
+                        relay_addr,
+                        public_address,
+                        Arc::clone(&self.relay_sessions),
+                        stable_id,
+                    ),
+                });
             }
         }
 
@@ -4602,7 +4685,16 @@ impl NatTraversalEndpoint {
             recv_stream,
         });
 
-        // Store the session
+        // Arm ownership before publishing the session into the map. There are
+        // no suspension points between these operations, and every later await
+        // is protected by the guard.
+        let stable_id = connection.stable_id();
+        let owner = RelaySessionOwner::new(
+            relay_addr,
+            public_address,
+            Arc::clone(&self.relay_sessions),
+            stable_id,
+        );
         let session = RelaySession {
             connection,
             public_address,
@@ -4623,7 +4715,12 @@ impl NatTraversalEndpoint {
             }
         }
 
-        Ok((public_address, raw_streams, allocation_receipt))
+        Ok(EstablishedRelaySession {
+            public_address,
+            raw_streams,
+            allocation_receipt,
+            owner,
+        })
     }
 
     /// Create a fresh QUIC connection to a relay server.
@@ -5589,33 +5686,22 @@ impl NatTraversalEndpoint {
         })?;
 
         // Acquire the relay only after local validation is complete.
-        let (public_addr, raw_streams, allocation_receipt) =
-            self.establish_relay_session(bootstrap_addr).await?;
+        let EstablishedRelaySession {
+            public_address: public_addr,
+            raw_streams,
+            allocation_receipt,
+            owner: relay_session_owner,
+        } = self.establish_owned_relay_session(bootstrap_addr).await?;
         let Some(relay_public_addr) = public_addr else {
-            self.remove_matching_relay_session(bootstrap_addr, None, b"invalid relay allocation");
             return Err(NatTraversalError::ConnectionFailed(
                 "Relay did not provide public address".to_string(),
             ));
         };
         let Some(raw_streams) = raw_streams else {
-            self.remove_matching_relay_session(
-                bootstrap_addr,
-                Some(relay_public_addr),
-                b"relay allocation missing streams",
-            );
             return Err(NatTraversalError::ConnectionFailed(
                 "Relay did not provide socket".to_string(),
             ));
         };
-        let relay_session_stable_id = self
-            .relay_sessions
-            .get(&bootstrap_addr)
-            .map(|session| session.connection.stable_id())
-            .ok_or_else(|| {
-                NatTraversalError::ConnectionFailed(
-                    "Relay allocation lost its owning control session".to_string(),
-                )
-            })?;
 
         info!(
             "Relay session established, public address: {}",
@@ -5641,11 +5727,6 @@ impl NatTraversalEndpoint {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 tunnel.shutdown().await;
-                self.remove_matching_relay_session(
-                    bootstrap_addr,
-                    Some(relay_public_addr),
-                    b"relay endpoint creation failed",
-                );
                 return Err(NatTraversalError::ConnectionFailed(format!(
                     "Failed to create relay endpoint: {error}"
                 )));
@@ -5697,13 +5778,11 @@ impl NatTraversalEndpoint {
         self.spawn_relay_endpoint_accept_loop(Arc::clone(&relay_endpoint), relay_public_addr);
 
         let state = ProactiveRelay {
-            relay_server_addr: bootstrap_addr,
             handle,
             endpoint: relay_endpoint,
             tunnel,
             allocation_receipt,
-            relay_sessions: Arc::clone(&self.relay_sessions),
-            relay_session_stable_id,
+            relay_session_owner,
             cleanup_armed: true,
         };
         match self
@@ -5792,27 +5871,6 @@ impl NatTraversalEndpoint {
 
     async fn teardown_proactive_relay(&self, state: ProactiveRelay, reason: &'static [u8]) {
         state.teardown(reason).await;
-    }
-
-    fn remove_matching_relay_session(
-        &self,
-        relay_server_addr: SocketAddr,
-        public_addr: Option<SocketAddr>,
-        reason: &'static [u8],
-    ) {
-        let matching_session = self
-            .relay_sessions
-            .get(&relay_server_addr)
-            .is_some_and(|session| session.public_address == public_addr);
-        if !matching_session {
-            return;
-        }
-
-        if let Some((_, session)) = self.relay_sessions.remove(&relay_server_addr) {
-            session
-                .connection
-                .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
-        }
     }
 
     /// Spawn an accept loop for the relay endpoint.
@@ -8406,6 +8464,83 @@ mod tests {
         assert_eq!(first, first_copy);
         assert_ne!(first, replacement);
         assert_eq!(first.public_addr(), replacement.public_addr());
+    }
+
+    #[tokio::test]
+    async fn relay_session_owner_only_removes_its_exact_session() {
+        let endpoint_config = || NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+            ..Default::default()
+        };
+        let server = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("server endpoint");
+        let client = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("client endpoint");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server transport endpoint")
+            .local_addr()
+            .expect("server address");
+        let server_name = server_addr.ip().to_string();
+
+        let original = client
+            .connect_to(&server_name, server_addr)
+            .await
+            .expect("original connection");
+        let replacement = client
+            .connect_to(&server_name, server_addr)
+            .await
+            .expect("replacement connection");
+        assert_ne!(original.stable_id(), replacement.stable_id());
+
+        let public_addr = Some("203.0.113.7:9000".parse().expect("public address"));
+        let sessions = Arc::new(dashmap::DashMap::new());
+        sessions.insert(
+            server_addr,
+            RelaySession {
+                connection: original.clone(),
+                public_address: public_addr,
+                established_at: std::time::Instant::now(),
+                relay_addr: server_addr,
+                allocation_receipt: None,
+            },
+        );
+        let stale_owner = RelaySessionOwner::new(
+            server_addr,
+            public_addr,
+            Arc::clone(&sessions),
+            original.stable_id(),
+        );
+
+        sessions.insert(
+            server_addr,
+            RelaySession {
+                connection: replacement.clone(),
+                public_address: public_addr,
+                established_at: std::time::Instant::now(),
+                relay_addr: server_addr,
+                allocation_receipt: None,
+            },
+        );
+        drop(stale_owner);
+
+        let current = sessions.get(&server_addr).expect("replacement retained");
+        assert_eq!(current.connection.stable_id(), replacement.stable_id());
+        drop(current);
+
+        let replacement_owner = RelaySessionOwner::new(
+            server_addr,
+            public_addr,
+            Arc::clone(&sessions),
+            replacement.stable_id(),
+        );
+        drop(replacement_owner);
+        assert!(sessions.is_empty(), "exact owner must remove its session");
+
+        client.shutdown().await.expect("client shutdown");
+        server.shutdown().await.expect("server shutdown");
     }
 
     #[test]
