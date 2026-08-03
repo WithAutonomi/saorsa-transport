@@ -6410,9 +6410,9 @@ impl NatTraversalEndpoint {
         None
     }
 
-    /// Derive the canonical 32-byte peer fingerprint (`AUTONOMI_PEER_ID_V2`)
-    /// from a connection's authenticated ML-DSA-65 identity, or `None` if the
-    /// peer is not PQC-authenticated.
+    /// Derive the overlay-compatible 32-byte peer ID used by relay allocation
+    /// receipts from a connection's authenticated ML-DSA-65 identity, or
+    /// `None` if the peer is not PQC-authenticated.
     ///
     /// This keys relay-port reservations to a cryptographic identity rather
     /// than an ephemeral socket address. The identity comes solely from the
@@ -6421,9 +6421,7 @@ impl NatTraversalEndpoint {
         let spki = Self::extract_public_key_from_connection(connection)?;
         let public_key =
             crate::crypto::raw_public_keys::pqc::extract_public_key_from_spki(&spki).ok()?;
-        Some(crate::crypto::raw_public_keys::pqc::fingerprint_public_key(
-            &public_key,
-        ))
+        Some(crate::relay_receipt_peer_id(&public_key))
     }
 
     /// Extract the raw SPKI bytes from a connection's TLS identity.

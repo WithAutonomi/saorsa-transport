@@ -15,11 +15,20 @@ use thiserror::Error;
 use crate::crypto::pqc::MlDsaOperations;
 use crate::crypto::pqc::ml_dsa::MlDsa65;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
-use crate::crypto::raw_public_keys::pqc::fingerprint_public_key;
 
 const RECEIPT_VERSION: u8 = 1;
 const RECEIPT_DOMAIN: &[u8] = b"SAORSA_RELAY_ALLOCATION_V1";
 const RECEIPT_LIFETIME_SECS: u64 = 24 * 60 * 60;
+
+/// Derive the overlay peer identity bound into relay allocation receipts.
+///
+/// The DHT identifies peers as `BLAKE3(raw ML-DSA public key)`. Transport's
+/// internal `AUTONOMI_PEER_ID_V2` fingerprint uses a separate domain and must
+/// not leak into this cross-layer receipt, otherwise a valid allocation can
+/// never match the requester's DHT identity during canary verification.
+pub fn relay_receipt_peer_id(public_key: &MlDsaPublicKey) -> [u8; 32] {
+    *blake3::hash(public_key.as_bytes()).as_bytes()
+}
 
 /// A relay-signed binding between an authenticated client and one allocation.
 ///
@@ -112,7 +121,7 @@ impl RelayAllocationReceipt {
         allocation_id: u64,
     ) -> Result<Self, RelayAllocationReceiptError> {
         let now = unix_time_secs(SystemTime::now())?;
-        let relayer_peer_id = fingerprint_public_key(relayer_public_key);
+        let relayer_peer_id = relay_receipt_peer_id(relayer_public_key);
         let mut receipt = Self {
             version: RECEIPT_VERSION,
             target_peer_id,
@@ -158,7 +167,7 @@ impl RelayAllocationReceipt {
 
         let public_key = MlDsaPublicKey::from_bytes(&self.relayer_public_key)
             .map_err(|_| RelayAllocationReceiptError::InvalidCryptoMaterial)?;
-        if fingerprint_public_key(&public_key) != self.relayer_peer_id {
+        if relay_receipt_peer_id(&public_key) != self.relayer_peer_id {
             return Err(RelayAllocationReceiptError::RelayerMismatch);
         }
         let signature = MlDsaSignature::from_bytes(&self.signature)
@@ -336,9 +345,19 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
+    fn receipt_peer_id_uses_overlay_identity_derivation() {
+        let (public_key, _) = generate_ml_dsa_keypair().expect("keypair");
+
+        assert_eq!(
+            relay_receipt_peer_id(&public_key),
+            *blake3::hash(public_key.as_bytes()).as_bytes()
+        );
+    }
+
+    #[test]
     fn receipt_verifies_only_for_exact_binding() {
         let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keypair");
-        let relayer = fingerprint_public_key(&public_key);
+        let relayer = relay_receipt_peer_id(&public_key);
         let target = [7; 32];
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12_345));
         let receipt = RelayAllocationReceipt::issue(&public_key, &secret_key, target, addr, 42)
@@ -362,7 +381,7 @@ mod tests {
     #[test]
     fn tampering_invalidates_signature() {
         let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keypair");
-        let relayer = fingerprint_public_key(&public_key);
+        let relayer = relay_receipt_peer_id(&public_key);
         let target = [7; 32];
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12_345));
         let mut receipt = RelayAllocationReceipt::issue(&public_key, &secret_key, target, addr, 42)
@@ -378,7 +397,7 @@ mod tests {
     #[test]
     fn receipt_expires_at_its_signed_deadline() {
         let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keypair");
-        let relayer = fingerprint_public_key(&public_key);
+        let relayer = relay_receipt_peer_id(&public_key);
         let target = [7; 32];
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12_345));
         let receipt = RelayAllocationReceipt::issue(&public_key, &secret_key, target, addr, 42)
