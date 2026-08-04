@@ -2731,7 +2731,7 @@ impl P2pEndpoint {
         );
 
         // Step 1: Establish relay session (control plane handshake)
-        let (public_addr, raw_streams, _allocation_receipt) = self
+        let (public_addr, raw_streams) = self
             .inner
             .establish_relay_session(relay_addr)
             .await
@@ -3488,14 +3488,6 @@ impl P2pEndpoint {
     ) -> Result<(), EndpointError> {
         self.inner.abort_proactive_relay(prepared).await?;
         Ok(())
-    }
-
-    /// Return the relay-signed receipt for a live proactive allocation.
-    pub async fn proactive_relay_receipt(
-        &self,
-        prepared: PreparedRelay,
-    ) -> Option<crate::RelayAllocationReceipt> {
-        self.inner.proactive_relay_receipt(prepared).await
     }
 
     /// Perform a fresh, isolated authenticated reachability probe.

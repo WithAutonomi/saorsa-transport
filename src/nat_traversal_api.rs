@@ -361,8 +361,6 @@ pub struct RelaySession {
     pub established_at: std::time::Instant,
     /// Relay server address
     pub relay_addr: SocketAddr,
-    /// Relay-signed proof for this exact allocation, when available.
-    pub allocation_receipt: Option<crate::RelayAllocationReceipt>,
 }
 
 impl RelaySession {
@@ -454,7 +452,6 @@ impl Drop for RelaySessionOwner {
 struct EstablishedRelaySession {
     public_address: Option<SocketAddr>,
     raw_streams: Option<crate::masque::RawRelayStreams>,
-    allocation_receipt: Option<crate::RelayAllocationReceipt>,
     owner: RelaySessionOwner,
 }
 
@@ -505,7 +502,6 @@ struct ProactiveRelay {
     handle: PreparedRelay,
     endpoint: Arc<InnerEndpoint>,
     tunnel: Arc<crate::masque::RelayTunnelControl>,
-    allocation_receipt: Option<crate::RelayAllocationReceipt>,
     relay_session_owner: RelaySessionOwner,
     cleanup_armed: bool,
 }
@@ -610,10 +606,6 @@ enum RelayLifecycleCommand {
     },
     PublishedHandle {
         reply: oneshot::Sender<Option<PreparedRelay>>,
-    },
-    Receipt {
-        prepared: PreparedRelay,
-        reply: oneshot::Sender<Option<crate::RelayAllocationReceipt>>,
     },
     Health {
         reply: oneshot::Sender<Option<RelayHealthSnapshot>>,
@@ -743,21 +735,6 @@ impl RelayLifecycleHandle {
                         };
                         let _ = reply.send(handle);
                     }
-                    RelayLifecycleCommand::Receipt { prepared, reply } => {
-                        let receipt = match &state {
-                            RelayLifecycleState::Provisional(relay)
-                            | RelayLifecycleState::Published(relay)
-                                if relay.handle == prepared =>
-                            {
-                                relay.allocation_receipt.clone()
-                            }
-                            RelayLifecycleState::None
-                            | RelayLifecycleState::Provisional(_)
-                            | RelayLifecycleState::Published(_)
-                            | RelayLifecycleState::Shutdown => None,
-                        };
-                        let _ = reply.send(receipt);
-                    }
                     RelayLifecycleCommand::Health { reply } => {
                         let health = match &state {
                             RelayLifecycleState::Published(relay) => Some(RelayHealthSnapshot {
@@ -864,15 +841,6 @@ impl RelayLifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(RelayLifecycleCommand::PublishedHandle { reply })
-            .await
-            .ok()?;
-        response.await.ok().flatten()
-    }
-
-    async fn receipt(&self, prepared: PreparedRelay) -> Option<crate::RelayAllocationReceipt> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(RelayLifecycleCommand::Receipt { prepared, reply })
             .await
             .ok()?;
         response.await.ok().flatten()
@@ -2164,10 +2132,7 @@ impl NatTraversalEndpoint {
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
-            let mut server = MasqueRelayServer::new(relay_config, local_addr);
-            if let Some((public_key, secret_key)) = config.identity_key.clone() {
-                server.set_allocation_signer(public_key, secret_key);
-            }
+            let server = MasqueRelayServer::new(relay_config, local_addr);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
@@ -2604,10 +2569,7 @@ impl NatTraversalEndpoint {
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
-            let mut server = MasqueRelayServer::new(relay_config, local_addr);
-            if let Some((public_key, secret_key)) = config.identity_key.clone() {
-                server.set_allocation_signer(public_key, secret_key);
-            }
+            let server = MasqueRelayServer::new(relay_config, local_addr);
             info!(
                 "Created MASQUE relay server on {} (symmetric P2P node)",
                 local_addr
@@ -4483,17 +4445,6 @@ impl NatTraversalEndpoint {
         self.relay_lifecycle.published_handle().await
     }
 
-    /// Return the relay-signed receipt for a live allocation.
-    ///
-    /// Matching the opaque handle prevents a stale acquisition from obtaining
-    /// a receipt for a newer allocation that reused the same socket address.
-    pub async fn proactive_relay_receipt(
-        &self,
-        prepared: PreparedRelay,
-    ) -> Option<crate::RelayAllocationReceipt> {
-        self.relay_lifecycle.receipt(prepared).await
-    }
-
     /// Check if relay fallback is available
     pub async fn has_relay_fallback(&self) -> bool {
         match &self.relay_manager {
@@ -4515,22 +4466,15 @@ impl NatTraversalEndpoint {
     pub async fn establish_relay_session(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<
-        (
-            Option<SocketAddr>,
-            Option<crate::masque::RawRelayStreams>,
-            Option<crate::RelayAllocationReceipt>,
-        ),
-        NatTraversalError,
-    > {
+    ) -> Result<(Option<SocketAddr>, Option<crate::masque::RawRelayStreams>), NatTraversalError>
+    {
         let EstablishedRelaySession {
             public_address,
             raw_streams,
-            allocation_receipt,
             owner,
         } = self.establish_owned_relay_session(relay_addr).await?;
         owner.disarm();
-        Ok((public_address, raw_streams, allocation_receipt))
+        Ok((public_address, raw_streams))
     }
 
     async fn establish_owned_relay_session(
@@ -4542,7 +4486,6 @@ impl NatTraversalEndpoint {
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
                 let public_address = session.public_address;
-                let allocation_receipt = session.allocation_receipt.clone();
                 let stable_id = session.connection.stable_id();
                 debug!(
                     relay = %relay_addr,
@@ -4553,7 +4496,6 @@ impl NatTraversalEndpoint {
                 return Ok(EstablishedRelaySession {
                     public_address,
                     raw_streams: None,
-                    allocation_receipt,
                     owner: RelaySessionOwner::new(
                         relay_addr,
                         public_address,
@@ -4680,7 +4622,6 @@ impl NatTraversalEndpoint {
         }
 
         let public_address = response.proxy_public_address;
-        let allocation_receipt = response.allocation_receipt.clone();
 
         info!(
             "Relay session established with public address: {:?}",
@@ -4709,7 +4650,6 @@ impl NatTraversalEndpoint {
             public_address,
             established_at: std::time::Instant::now(),
             relay_addr,
-            allocation_receipt: allocation_receipt.clone(),
         };
 
         // DashMap provides lock-free .insert()
@@ -4727,7 +4667,6 @@ impl NatTraversalEndpoint {
         Ok(EstablishedRelaySession {
             public_address,
             raw_streams,
-            allocation_receipt,
             owner,
         })
     }
@@ -5698,7 +5637,6 @@ impl NatTraversalEndpoint {
         let EstablishedRelaySession {
             public_address: public_addr,
             raw_streams,
-            allocation_receipt,
             owner: relay_session_owner,
         } = self.establish_owned_relay_session(bootstrap_addr).await?;
         let Some(relay_public_addr) = public_addr else {
@@ -5790,7 +5728,6 @@ impl NatTraversalEndpoint {
             handle,
             endpoint: relay_endpoint,
             tunnel,
-            allocation_receipt,
             relay_session_owner,
             cleanup_armed: true,
         };
@@ -6410,9 +6347,9 @@ impl NatTraversalEndpoint {
         None
     }
 
-    /// Derive the overlay-compatible 32-byte peer ID used by relay allocation
-    /// receipts from a connection's authenticated ML-DSA-65 identity, or
-    /// `None` if the peer is not PQC-authenticated.
+    /// Derive the overlay-compatible 32-byte peer ID from a connection's
+    /// authenticated ML-DSA-65 identity, or `None` if the peer is not
+    /// PQC-authenticated.
     ///
     /// This keys relay-port reservations to a cryptographic identity rather
     /// than an ephemeral socket address. The identity comes solely from the
@@ -6421,7 +6358,7 @@ impl NatTraversalEndpoint {
         let spki = Self::extract_public_key_from_connection(connection)?;
         let public_key =
             crate::crypto::raw_public_keys::pqc::extract_public_key_from_spki(&spki).ok()?;
-        Some(crate::relay_receipt_peer_id(&public_key))
+        Some(*blake3::hash(public_key.as_bytes()).as_bytes())
     }
 
     /// Extract the raw SPKI bytes from a connection's TLS identity.
@@ -8482,7 +8419,6 @@ mod tests {
             handle: PreparedRelay::new(public_addr),
             endpoint: relay_endpoint,
             tunnel: crate::masque::RelayTunnelControl::detached(),
-            allocation_receipt: None,
             relay_session_owner: RelaySessionOwner {
                 relay_server_addr: "127.0.0.1:1".parse().expect("relay server address"),
                 public_address: Some(public_addr),
@@ -8647,7 +8583,6 @@ mod tests {
                 public_address: public_addr,
                 established_at: std::time::Instant::now(),
                 relay_addr: server_addr,
-                allocation_receipt: None,
             },
         );
         let stale_owner = RelaySessionOwner::new(
@@ -8664,7 +8599,6 @@ mod tests {
                 public_address: public_addr,
                 established_at: std::time::Instant::now(),
                 relay_addr: server_addr,
-                allocation_receipt: None,
             },
         );
         drop(stale_owner);

@@ -55,7 +55,6 @@ use crate::masque::{
 };
 use crate::relay::error::{RelayError, RelayResult, SessionErrorKind};
 use crate::upnp::{UpnpConfig, UpnpMappingService};
-use crate::{MlDsaPublicKey, MlDsaSecretKey, RelayAllocationReceipt};
 
 /// Interval at which both sides of a relay stream send a zero-length
 /// keepalive frame.  Keeps the NAT conntrack entry alive (default
@@ -577,9 +576,6 @@ pub struct MasqueRelayServer {
     /// When set, the server refuses inbound clients whose source IP matches
     /// one of our current upstream relays (see [`IpPolicy`]).
     ip_policy: Option<Arc<IpPolicy>>,
-    /// Identity used to sign allocations for third-party reachability
-    /// witnesses. It is the same identity presented by this endpoint in TLS.
-    allocation_signer: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
 }
 
 impl std::fmt::Debug for MasqueRelayServer {
@@ -620,7 +616,6 @@ impl MasqueRelayServer {
                 .map(|_| Mutex::new(()))
                 .collect(),
             ip_policy: None,
-            allocation_signer: None,
         }
     }
 
@@ -694,17 +689,7 @@ impl MasqueRelayServer {
                 .map(|_| Mutex::new(()))
                 .collect(),
             ip_policy: None,
-            allocation_signer: None,
         }
-    }
-
-    /// Configure the endpoint identity used to sign relay allocations.
-    pub fn set_allocation_signer(
-        &mut self,
-        public_key: MlDsaPublicKey,
-        secret_key: MlDsaSecretKey,
-    ) {
-        self.allocation_signer = Some((public_key, secret_key));
     }
 
     /// Enable or disable relay serving.
@@ -1090,31 +1075,6 @@ impl MasqueRelayServer {
 
         // Create new session with the bound socket
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let allocation_receipt = match (&self.allocation_signer, peer_id) {
-            (Some((public_key, secret_key)), Some(target_peer_id)) => {
-                match RelayAllocationReceipt::issue(
-                    public_key,
-                    secret_key,
-                    target_peer_id,
-                    advertised_address,
-                    session_id,
-                ) {
-                    Ok(receipt) => Some(receipt),
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            client = %client_addr,
-                            "Failed to sign relay allocation"
-                        );
-                        return Ok(ConnectUdpResponse::error(
-                            500,
-                            "Failed to sign relay allocation",
-                        ));
-                    }
-                }
-            }
-            _ => None,
-        };
         let mut session = RelaySession::new(
             session_id,
             self.config.session_config.clone(),
@@ -1167,7 +1127,6 @@ impl MasqueRelayServer {
         // session rather than re-looking-up by client address (which races with a
         // same-address reconnect). Not part of the wire format.
         let mut response = ConnectUdpResponse::success(Some(advertised_address));
-        response.allocation_receipt = allocation_receipt;
         response.session_id = Some(session_id);
         Ok(response)
     }
