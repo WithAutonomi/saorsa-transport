@@ -2944,6 +2944,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "aws-lc-rs",
+ "base64",
  "blake3",
  "btleplug",
  "bytes",
