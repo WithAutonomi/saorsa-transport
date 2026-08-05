@@ -16,6 +16,9 @@
 //! ```text
 //! /ip4/<ipv4>/udp/<port>/quic
 //! /ip6/<ipv6>/udp/<port>/quic
+//! /ip4/<ipv4>/udp/<port>/quic-v1/webtransport/certhash/<multihash>
+//! /ip6/<ipv6>/udp/<port>/quic-v1/webtransport/certhash/<multihash>
+//! /dns/<hostname>/udp/<port>/quic-v1/webtransport/certhash/<multihash>
 //! /ip4/<ipv4>/tcp/<port>
 //! /ip6/<ipv6>/tcp/<port>
 //! /ip4/<ipv4>/udp/<port>
@@ -34,16 +37,26 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+const SHA2_256_MULTIHASH_CODE: u8 = 0x12;
+const SHA2_256_MULTIHASH_LENGTH: u8 = 32;
+
+/// Maximum number of overlapping certificate pins carried by one WebTransport address.
+pub const MAX_WEBTRANSPORT_CERTIFICATE_HASHES: usize = 2;
 
 /// Transport type identifier for routing and capability matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportType {
     /// QUIC over UDP — primary Saorsa transport
     Quic,
+    /// Browser-compatible WebTransport over HTTP/3 and QUIC v1
+    WebTransport,
     /// Plain TCP
     Tcp,
     /// Raw UDP (no QUIC)
@@ -70,6 +83,7 @@ impl fmt::Display for TransportType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quic => write!(f, "QUIC"),
+            Self::WebTransport => write!(f, "WebTransport"),
             Self::Tcp => write!(f, "TCP"),
             Self::Udp => write!(f, "UDP"),
             Self::Bluetooth => write!(f, "Bluetooth"),
@@ -81,6 +95,231 @@ impl fmt::Display for TransportType {
             Self::I2p => write!(f, "I2P"),
             Self::Yggdrasil => write!(f, "Yggdrasil"),
         }
+    }
+}
+
+/// Host component of a browser-compatible WebTransport multiaddress.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WebTransportHost {
+    /// Literal IPv4 address, encoded with the `/ip4` protocol.
+    Ip4(Ipv4Addr),
+    /// Literal IPv6 address, encoded with the `/ip6` protocol.
+    Ip6(Ipv6Addr),
+    /// DNS hostname with no requested address family.
+    Dns(String),
+    /// DNS hostname that must resolve to IPv4.
+    Dns4(String),
+    /// DNS hostname that must resolve to IPv6.
+    Dns6(String),
+}
+
+impl WebTransportHost {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Ip4(_) | Self::Ip6(_) => Ok(()),
+            Self::Dns(hostname) | Self::Dns4(hostname) | Self::Dns6(hostname) => {
+                validate_dns_name(hostname)
+            }
+        }
+    }
+
+    fn protocol(&self) -> &'static str {
+        match self {
+            Self::Ip4(_) => "ip4",
+            Self::Ip6(_) => "ip6",
+            Self::Dns(_) => "dns",
+            Self::Dns4(_) => "dns4",
+            Self::Dns6(_) => "dns6",
+        }
+    }
+
+    fn value(&self) -> String {
+        match self {
+            Self::Ip4(ip) => ip.to_string(),
+            Self::Ip6(ip) => ip.to_string(),
+            Self::Dns(hostname) | Self::Dns4(hostname) | Self::Dns6(hostname) => {
+                hostname.to_ascii_lowercase()
+            }
+        }
+    }
+
+    /// Return the literal IP address, or `None` for DNS hosts.
+    #[must_use]
+    pub fn as_ip_addr(&self) -> Option<IpAddr> {
+        match self {
+            Self::Ip4(ip) => Some(IpAddr::V4(*ip)),
+            Self::Ip6(ip) => Some(IpAddr::V6(*ip)),
+            Self::Dns(_) | Self::Dns4(_) | Self::Dns6(_) => None,
+        }
+    }
+
+    /// Return a hostname suitable for an HTTPS URL authority.
+    #[must_use]
+    pub fn url_host(&self) -> String {
+        match self {
+            Self::Ip4(ip) => ip.to_string(),
+            Self::Ip6(ip) => format!("[{ip}]"),
+            Self::Dns(hostname) | Self::Dns4(hostname) | Self::Dns6(hostname) => {
+                hostname.to_ascii_lowercase()
+            }
+        }
+    }
+}
+
+/// A SHA-256 leaf-certificate digest encoded as a multiaddr `certhash` value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebTransportCertificateHash([u8; 32]);
+
+impl WebTransportCertificateHash {
+    /// Construct a certificate hash from a SHA-256 digest.
+    #[must_use]
+    pub const fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    /// Return the raw SHA-256 digest used by the WebTransport API.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for WebTransportCertificateHash {
+    fn from(digest: [u8; 32]) -> Self {
+        Self::new(digest)
+    }
+}
+
+impl fmt::Display for WebTransportCertificateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut multihash = [0_u8; 34];
+        multihash[0] = SHA2_256_MULTIHASH_CODE;
+        multihash[1] = SHA2_256_MULTIHASH_LENGTH;
+        multihash[2..].copy_from_slice(&self.0);
+        write!(f, "u{}", URL_SAFE_NO_PAD.encode(multihash))
+    }
+}
+
+impl fmt::Debug for WebTransportCertificateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WebTransportCertificateHash")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl FromStr for WebTransportCertificateHash {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let encoded = value
+            .strip_prefix('u')
+            .ok_or_else(|| anyhow!("Certificate multihash must use base64url multibase ('u')"))?;
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow!("Certificate multihash is not valid unpadded base64url"))?;
+        if decoded.len() != 34
+            || decoded[0] != SHA2_256_MULTIHASH_CODE
+            || decoded[1] != SHA2_256_MULTIHASH_LENGTH
+        {
+            return Err(anyhow!(
+                "Certificate multihash must contain a 32-byte SHA-256 digest"
+            ));
+        }
+        let digest: [u8; 32] = decoded[2..]
+            .try_into()
+            .map_err(|_| anyhow!("Certificate multihash digest has the wrong length"))?;
+        Ok(Self(digest))
+    }
+}
+
+/// Validated WebTransport endpoint carried by [`TransportAddr`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WebTransportAddr {
+    host: WebTransportHost,
+    port: u16,
+    certificate_hashes: Vec<WebTransportCertificateHash>,
+}
+
+impl WebTransportAddr {
+    /// Construct an endpoint with one current pin and an optional next pin.
+    pub fn new(
+        host: WebTransportHost,
+        port: u16,
+        certificate_hashes: Vec<WebTransportCertificateHash>,
+    ) -> Result<Self> {
+        let host = match host {
+            WebTransportHost::Dns(hostname) => WebTransportHost::Dns(hostname.to_ascii_lowercase()),
+            WebTransportHost::Dns4(hostname) => {
+                WebTransportHost::Dns4(hostname.to_ascii_lowercase())
+            }
+            WebTransportHost::Dns6(hostname) => {
+                WebTransportHost::Dns6(hostname.to_ascii_lowercase())
+            }
+            ip_host => ip_host,
+        };
+        host.validate()?;
+        if port == 0 {
+            return Err(anyhow!("WebTransport UDP port must not be zero"));
+        }
+        if !(1..=MAX_WEBTRANSPORT_CERTIFICATE_HASHES).contains(&certificate_hashes.len()) {
+            return Err(anyhow!(
+                "WebTransport address must contain between 1 and {} certificate hashes",
+                MAX_WEBTRANSPORT_CERTIFICATE_HASHES
+            ));
+        }
+        if certificate_hashes.len() == 2 && certificate_hashes[0] == certificate_hashes[1] {
+            return Err(anyhow!(
+                "WebTransport address contains duplicate certificate hashes"
+            ));
+        }
+        Ok(Self {
+            host,
+            port,
+            certificate_hashes,
+        })
+    }
+
+    /// Host advertised to browser clients.
+    #[must_use]
+    pub const fn host(&self) -> &WebTransportHost {
+        &self.host
+    }
+
+    /// UDP port used by HTTP/3 and QUIC v1.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Current and optional next SHA-256 certificate pins.
+    #[must_use]
+    pub fn certificate_hashes(&self) -> &[WebTransportCertificateHash] {
+        &self.certificate_hashes
+    }
+
+    /// Socket address when the host is a literal IP address.
+    #[must_use]
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.host
+            .as_ip_addr()
+            .map(|ip| SocketAddr::new(ip, self.port))
+    }
+}
+
+impl fmt::Display for WebTransportAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "/{}/{}/udp/{}/quic-v1/webtransport",
+            self.host.protocol(),
+            self.host.value(),
+            self.port
+        )?;
+        for hash in &self.certificate_hashes {
+            write!(f, "/certhash/{hash}")?;
+        }
+        Ok(())
     }
 }
 
@@ -133,6 +372,12 @@ impl Default for LoRaParams {
 pub enum TransportAddr {
     /// QUIC over UDP (primary Saorsa transport).
     Quic(SocketAddr),
+
+    /// Browser-compatible WebTransport over HTTP/3 and QUIC v1.
+    ///
+    /// This is an advertised endpoint descriptor. Native Saorsa QUIC dialing
+    /// does not treat it as a directly dialable [`TransportAddr`].
+    WebTransport(WebTransportAddr),
 
     /// Plain TCP.
     Tcp(SocketAddr),
@@ -208,6 +453,7 @@ impl TransportAddr {
     pub fn transport_type(&self) -> TransportType {
         match self {
             Self::Quic(_) => TransportType::Quic,
+            Self::WebTransport(_) => TransportType::WebTransport,
             Self::Tcp(_) => TransportType::Tcp,
             Self::Udp(_) => TransportType::Udp,
             Self::Bluetooth { .. } => TransportType::Bluetooth,
@@ -260,8 +506,8 @@ impl TransportAddr {
         matches!(self, Self::Broadcast { .. })
     }
 
-    /// Returns the socket address for IP-based transports (`Quic`, `Tcp`, `Udp`),
-    /// `None` for non-IP transports.
+    /// Returns the socket address for native IP transports (`Quic`, `Tcp`, `Udp`).
+    /// Advertised WebTransport endpoints and non-IP transports return `None`.
     pub fn as_socket_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Quic(a) | Self::Tcp(a) | Self::Udp(a) => Some(*a),
@@ -273,6 +519,7 @@ impl TransportAddr {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Quic(_) => "quic",
+            Self::WebTransport(_) => "webtransport",
             Self::Tcp(_) => "tcp",
             Self::Udp(_) => "udp",
             Self::Bluetooth { .. } => "bluetooth",
@@ -297,6 +544,22 @@ impl TransportAddr {
     pub fn to_synthetic_socket_addr(&self) -> SocketAddr {
         match self {
             Self::Quic(addr) | Self::Tcp(addr) | Self::Udp(addr) => *addr,
+            Self::WebTransport(address) => address.socket_addr().unwrap_or_else(|| {
+                let mut hasher = DefaultHasher::new();
+                address.hash(&mut hasher);
+                let hash = hasher.finish();
+                let addr = Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0x000b,
+                    (hash >> 48) as u16,
+                    (hash >> 32) as u16,
+                    (hash >> 16) as u16,
+                    hash as u16,
+                    0,
+                );
+                SocketAddr::new(IpAddr::V6(addr), address.port())
+            }),
             Self::Bluetooth { mac, channel } => {
                 let addr = Ipv6Addr::new(
                     0x2001,
@@ -411,6 +674,7 @@ impl TransportAddr {
             Self::Broadcast { transport_type } => {
                 let type_code = match transport_type {
                     TransportType::Quic => 0x0000,
+                    TransportType::WebTransport => 0x000b,
                     TransportType::Tcp => 0x0009,
                     TransportType::Udp => 0x000A,
                     TransportType::Bluetooth => 0x0007,
@@ -442,6 +706,7 @@ impl fmt::Display for TransportAddr {
                 IpAddr::V4(ip) => write!(f, "/ip4/{}/udp/{}/quic", ip, addr.port()),
                 IpAddr::V6(ip) => write!(f, "/ip6/{}/udp/{}/quic", ip, addr.port()),
             },
+            Self::WebTransport(address) => write!(f, "{address}"),
             Self::Tcp(addr) => match addr.ip() {
                 IpAddr::V4(ip) => write!(f, "/ip4/{}/tcp/{}", ip, addr.port()),
                 IpAddr::V6(ip) => write!(f, "/ip6/{}/tcp/{}", ip, addr.port()),
@@ -493,6 +758,7 @@ impl fmt::Display for TransportAddr {
             Self::Broadcast { transport_type } => {
                 let kind = match transport_type {
                     TransportType::Quic => "quic",
+                    TransportType::WebTransport => "webtransport",
                     TransportType::Tcp => "tcp",
                     TransportType::Udp => "udp",
                     TransportType::Bluetooth => "bluetooth",
@@ -518,6 +784,7 @@ impl fmt::Debug for TransportAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quic(addr) => write!(f, "Quic({addr})"),
+            Self::WebTransport(address) => write!(f, "WebTransport({address})"),
             Self::Tcp(addr) => write!(f, "Tcp({addr})"),
             Self::Udp(addr) => write!(f, "Udp({addr})"),
             Self::Bluetooth { mac, channel } => {
@@ -568,6 +835,7 @@ impl FromStr for TransportAddr {
 
         match parts[0] {
             "ip4" | "ip6" => parse_ip_addr(&parts, s),
+            "dns" | "dns4" | "dns6" => parse_dns_webtransport(&parts, s),
             "bt" => parse_bluetooth(&parts, s),
             "ble" => parse_ble(&parts, s),
             "lora" => parse_lora(&parts, s),
@@ -623,6 +891,12 @@ fn parse_ip_addr(parts: &[&str], original: &str) -> Result<TransportAddr> {
                     ));
                 }
                 Ok(TransportAddr::Quic(addr))
+            } else if parts.len() >= 7 && parts[4] == "quic-v1" {
+                let host = match ip {
+                    IpAddr::V4(ip) => WebTransportHost::Ip4(ip),
+                    IpAddr::V6(ip) => WebTransportHost::Ip6(ip),
+                };
+                parse_webtransport(host, port, &parts[4..], original)
             } else if parts.len() == 4 {
                 Ok(TransportAddr::Udp(addr))
             } else {
@@ -635,6 +909,82 @@ fn parse_ip_addr(parts: &[&str], original: &str) -> Result<TransportAddr> {
             original
         )),
     }
+}
+
+/// Parse `/dns*/<host>/udp/<port>/quic-v1/webtransport/certhash/...`.
+fn parse_dns_webtransport(parts: &[&str], original: &str) -> Result<TransportAddr> {
+    if parts.len() < 7 || parts[2] != "udp" {
+        return Err(anyhow!("Invalid DNS WebTransport address: {}", original));
+    }
+    let host = match parts[0] {
+        "dns" => WebTransportHost::Dns(parts[1].to_ascii_lowercase()),
+        "dns4" => WebTransportHost::Dns4(parts[1].to_ascii_lowercase()),
+        "dns6" => WebTransportHost::Dns6(parts[1].to_ascii_lowercase()),
+        _ => return Err(anyhow!("Invalid DNS protocol in: {}", original)),
+    };
+    let port: u16 = parts[3]
+        .parse()
+        .map_err(|_| anyhow!("Invalid port: {}", parts[3]))?;
+    parse_webtransport(host, port, &parts[4..], original)
+}
+
+fn parse_webtransport(
+    host: WebTransportHost,
+    port: u16,
+    suffix: &[&str],
+    original: &str,
+) -> Result<TransportAddr> {
+    if !original.starts_with('/') || original.ends_with('/') || original.contains("//") {
+        return Err(anyhow!(
+            "WebTransport address must use canonical slash delimiters: {}",
+            original
+        ));
+    }
+    if suffix.len() < 4 || suffix[0] != "quic-v1" || suffix[1] != "webtransport" {
+        return Err(anyhow!(
+            "WebTransport address must contain /quic-v1/webtransport: {}",
+            original
+        ));
+    }
+    let hash_parts = &suffix[2..];
+    if hash_parts.len() % 2 != 0 {
+        return Err(anyhow!("Incomplete WebTransport certhash in: {}", original));
+    }
+    let mut certificate_hashes = Vec::with_capacity(hash_parts.len() / 2);
+    for pair in hash_parts.chunks_exact(2) {
+        if pair[0] != "certhash" {
+            return Err(anyhow!(
+                "Unexpected WebTransport address component '{}' in: {}",
+                pair[0],
+                original
+            ));
+        }
+        certificate_hashes.push(pair[1].parse::<WebTransportCertificateHash>()?);
+    }
+    Ok(TransportAddr::WebTransport(WebTransportAddr::new(
+        host,
+        port,
+        certificate_hashes,
+    )?))
+}
+
+fn validate_dns_name(hostname: &str) -> Result<()> {
+    if hostname.is_empty() || hostname.len() > 253 || !hostname.is_ascii() {
+        return Err(anyhow!("Invalid WebTransport DNS hostname: {}", hostname));
+    }
+    for label in hostname.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(anyhow!("Invalid WebTransport DNS hostname: {}", hostname));
+        }
+    }
+    Ok(())
 }
 
 /// Parse `/bt/<MAC>/rfcomm/<channel>`.
@@ -769,6 +1119,7 @@ fn parse_broadcast(parts: &[&str], original: &str) -> Result<TransportAddr> {
     }
     let transport_type = match parts[1] {
         "quic" => TransportType::Quic,
+        "webtransport" => TransportType::WebTransport,
         "tcp" => TransportType::Tcp,
         "udp" => TransportType::Udp,
         "bluetooth" => TransportType::Bluetooth,
@@ -992,6 +1343,86 @@ mod tests {
     }
 
     #[test]
+    fn test_display_roundtrip_webtransport_with_overlapping_hashes() {
+        let current = WebTransportCertificateHash::new([0x11; 32]);
+        let next = WebTransportCertificateHash::new([0x22; 32]);
+        let endpoint = WebTransportAddr::new(
+            WebTransportHost::Ip4(Ipv4Addr::LOCALHOST),
+            443,
+            vec![current, next],
+        )
+        .unwrap();
+        let addr = TransportAddr::WebTransport(endpoint.clone());
+
+        let encoded = addr.to_string();
+        assert_eq!(encoded.matches("/certhash/").count(), 2);
+        assert_eq!(
+            encoded,
+            format!(
+                "/ip4/127.0.0.1/udp/443/quic-v1/webtransport/certhash/{current}/certhash/{next}"
+            )
+        );
+        assert_eq!(encoded.parse::<TransportAddr>().unwrap(), addr);
+        assert_eq!(
+            endpoint.socket_addr(),
+            Some("127.0.0.1:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_display_roundtrip_dns_webtransport() {
+        let hash = WebTransportCertificateHash::new([0x33; 32]);
+        let encoded = format!("/dns/Node.Example/udp/443/quic-v1/webtransport/certhash/{hash}");
+
+        let parsed = encoded.parse::<TransportAddr>().unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            format!("/dns/node.example/udp/443/quic-v1/webtransport/certhash/{hash}")
+        );
+        let TransportAddr::WebTransport(endpoint) = parsed else {
+            panic!("expected WebTransport address");
+        };
+        assert_eq!(endpoint.host().url_host(), "node.example");
+        assert_eq!(endpoint.socket_addr(), None);
+        let canonical = WebTransportAddr::new(
+            WebTransportHost::Dns("NODE.EXAMPLE".to_string()),
+            443,
+            vec![hash],
+        )
+        .unwrap();
+        assert_eq!(canonical.host(), endpoint.host());
+    }
+
+    #[test]
+    fn test_webtransport_rejects_invalid_pins_and_address_components() {
+        let hash = WebTransportCertificateHash::new([0x44; 32]);
+        let duplicate =
+            format!("/ip4/127.0.0.1/udp/443/quic-v1/webtransport/certhash/{hash}/certhash/{hash}");
+
+        assert!(duplicate.parse::<TransportAddr>().is_err());
+        assert!(
+            "/ip4/127.0.0.1/udp/443/quic-v1/webtransport"
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            "/ip4/127.0.0.1/udp/0/quic-v1/webtransport/certhash/uAA"
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            format!("/ip4/127.0.0.1/udp/443/quic-v1/webtransport/certhash/{hash}/")
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            format!("/dns/bad_host/udp/443/quic-v1/webtransport/certhash/{hash}")
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_display_roundtrip_bluetooth() {
         let addr = TransportAddr::Bluetooth {
             mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -1072,6 +1503,7 @@ mod tests {
     #[test]
     fn test_transport_type_display() {
         assert_eq!(format!("{}", TransportType::Quic), "QUIC");
+        assert_eq!(format!("{}", TransportType::WebTransport), "WebTransport");
         assert_eq!(format!("{}", TransportType::Tcp), "TCP");
         assert_eq!(format!("{}", TransportType::Udp), "UDP");
         assert_eq!(format!("{}", TransportType::Bluetooth), "Bluetooth");
