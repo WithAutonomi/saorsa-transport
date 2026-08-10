@@ -353,7 +353,7 @@ impl ConnectUdpResponse {
 
     /// Encode the response as wire format
     ///
-    /// Format: [status (2)] [flags (1)] [addr if present]
+    /// Format: [status (2)] [flags (1)] [addr] [reason]
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
@@ -407,6 +407,11 @@ impl ConnectUdpResponse {
         let flags = buf.get_u8();
         let has_addr = (flags & 0x01) != 0;
         let has_reason = (flags & 0x02) != 0;
+        if flags & !0x03 != 0 {
+            return Err(ConnectError::InvalidResponse(
+                "unsupported response flags".into(),
+            ));
+        }
 
         let proxy_public_address = if has_addr {
             if buf.remaining() < 1 {

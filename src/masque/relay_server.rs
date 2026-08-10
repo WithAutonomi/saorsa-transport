@@ -32,7 +32,7 @@
 //! ```
 
 use bytes::Bytes;
-use parking_lot::RwLock as ParkingRwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -474,6 +474,20 @@ struct Reservation {
     released_at: Instant,
 }
 
+/// RAII lease keeping a relay's parent QUIC connection out of ordinary
+/// peer-table pruning for the lifetime of one CONNECT-UDP forwarding stream.
+pub(crate) struct RelayControlConnectionGuard {
+    server: Arc<MasqueRelayServer>,
+    stable_id: usize,
+}
+
+impl Drop for RelayControlConnectionGuard {
+    fn drop(&mut self) {
+        self.server
+            .unprotect_relay_control_connection(self.stable_id);
+    }
+}
+
 /// MASQUE Relay Server
 ///
 /// Manages multiple relay sessions and coordinates datagram forwarding
@@ -526,6 +540,14 @@ pub struct MasqueRelayServer {
     /// aborting its reader/writer tasks, so the socket is exclusively owned by the
     /// time it can be leased.
     forwarding: RwLock<HashMap<u64, ForwardingControl>>,
+    /// QUIC connections currently carrying one or more CONNECT-UDP forwarding
+    /// streams, keyed by Quinn's stable connection id.
+    ///
+    /// Ordinary peer-table maintenance must not force-close these connections:
+    /// doing so destroys an otherwise healthy, canary-verified relay. Values are
+    /// reference counts because one authenticated connection may carry multiple
+    /// relay streams.
+    relay_control_connections: ParkingMutex<HashMap<usize, usize>>,
     /// Mutex stripes serializing concurrent CONNECTs from the same authenticated
     /// identity (ADR-011), indexed by the first fingerprint byte. Length is
     /// `RELAY_PEER_LOCK_STRIPES`.
@@ -589,6 +611,7 @@ impl MasqueRelayServer {
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
             forwarding: RwLock::new(HashMap::new()),
+            relay_control_connections: ParkingMutex::new(HashMap::new()),
             peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
                 .collect(),
@@ -661,6 +684,7 @@ impl MasqueRelayServer {
             upnp_mappings: RwLock::new(HashMap::new()),
             reservations: RwLock::new(HashMap::new()),
             forwarding: RwLock::new(HashMap::new()),
+            relay_control_connections: ParkingMutex::new(HashMap::new()),
             peer_locks: (0..RELAY_PEER_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
                 .collect(),
@@ -679,6 +703,40 @@ impl MasqueRelayServer {
             tracing::info!("Relay serving enabled — accepting relay reservation requests");
         } else {
             tracing::info!("Relay serving disabled — rejecting relay reservation requests");
+        }
+    }
+
+    /// Protect a QUIC connection from ordinary peer-table pruning while it
+    /// carries a live CONNECT-UDP forwarding stream.
+    pub(crate) fn protect_relay_control_connection(
+        self: &Arc<Self>,
+        stable_id: usize,
+    ) -> RelayControlConnectionGuard {
+        let mut protected = self.relay_control_connections.lock();
+        *protected.entry(stable_id).or_insert(0) += 1;
+        drop(protected);
+        RelayControlConnectionGuard {
+            server: Arc::clone(self),
+            stable_id,
+        }
+    }
+
+    /// Whether `stable_id` currently carries a live CONNECT-UDP stream.
+    pub(crate) fn is_relay_control_connection(&self, stable_id: usize) -> bool {
+        self.relay_control_connections
+            .lock()
+            .get(&stable_id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    fn unprotect_relay_control_connection(&self, stable_id: usize) {
+        let mut protected = self.relay_control_connections.lock();
+        let Some(count) = protected.get_mut(&stable_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            protected.remove(&stable_id);
         }
     }
 
@@ -1321,12 +1379,6 @@ impl MasqueRelayServer {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, source)) => {
                             let payload = Bytes::copy_from_slice(&buf[..len]);
-                            tracing::trace!(
-                                session_id,
-                                source = %source,
-                                len,
-                                "RELAY_TUNNEL[srv]: dgram-loop dir1 recv UDP → forwarding to relay-client"
-                            );
 
                             // Encode as uncompressed datagram (includes source address
                             // so client can decode without context registration)
@@ -1394,24 +1446,10 @@ impl MasqueRelayServer {
                             };
                             match resolved {
                                 Some((target, payload)) => {
-                                    tracing::trace!(
-                                        session_id,
-                                        target = %target,
-                                        len = payload.len(),
-                                        "RELAY_TUNNEL[srv]: dgram-loop dir2 recv from relay-client → sendto target"
-                                    );
                                     server2.stats.record_bytes(payload.len() as u64);
                                     server2.stats.record_datagram();
                                     match socket2.send_to(&payload, target).await {
-                                        Ok(n) => {
-                                            tracing::trace!(
-                                                session_id,
-                                                target = %target,
-                                                len = payload.len(),
-                                                sent = n,
-                                                "RELAY_TUNNEL[srv]: dgram-loop dir2 sendto OK"
-                                            );
-                                        }
+                                        Ok(_) => {}
                                         Err(e) => {
                                             tracing::warn!(
                                                 session_id,
@@ -1553,10 +1591,6 @@ impl MasqueRelayServer {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
                         let payload = Bytes::copy_from_slice(&buf[..len]);
-                        tracing::trace!(
-                            session_id, source = %source, len,
-                            "RELAY_TUNNEL[srv]: stream-loop dir1 recv UDP → forwarding to relay-client"
-                        );
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
                         let encoded = datagram.encode();
@@ -1717,26 +1751,14 @@ impl MasqueRelayServer {
                     let mut cursor = Bytes::from(frame_buf);
                     match UncompressedDatagram::decode(&mut cursor) {
                         Ok(datagram) => {
-                            tracing::trace!(
-                                session_id, target = %datagram.target,
-                                len = datagram.payload.len(),
-                                "RELAY_TUNNEL[srv]: stream-loop dir2 recv from relay-client → sendto target"
-                            );
                             stats2.record_bytes(datagram.payload.len() as u64);
                             stats2.record_datagram();
                             let target = datagram.target;
                             let payload_len = datagram.payload.len();
                             match socket2.send_to(&datagram.payload, target).await {
-                                Ok(n) => {
+                                Ok(_) => {
                                     // Confirmed forwarded to the third-party target.
                                     stats2.record_forwarded_to_target(payload_len as u64, 1);
-                                    tracing::trace!(
-                                        session_id,
-                                        target = %target,
-                                        len = payload_len,
-                                        sent = n,
-                                        "RELAY_TUNNEL[srv]: stream-loop dir2 sendto OK"
-                                    );
                                 }
                                 Err(e) if is_message_too_large(&e) => {
                                     // Path-MTU exceeded.  Emit a PmtuUpdate
@@ -2225,6 +2247,25 @@ pub struct SessionInfo {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_control_connection_protection_is_reference_counted() {
+        let server = Arc::new(MasqueRelayServer::new(
+            MasqueRelayConfig::default(),
+            test_addr(9000),
+        ));
+        let stable_id = 42;
+
+        assert!(!server.is_relay_control_connection(stable_id));
+        let first = server.protect_relay_control_connection(stable_id);
+        let second = server.protect_relay_control_connection(stable_id);
+        assert!(server.is_relay_control_connection(stable_id));
+
+        drop(first);
+        assert!(server.is_relay_control_connection(stable_id));
+        drop(second);
+        assert!(!server.is_relay_control_connection(stable_id));
+    }
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn test_addr(port: u16) -> SocketAddr {

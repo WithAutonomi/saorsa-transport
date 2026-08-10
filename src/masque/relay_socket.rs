@@ -45,7 +45,8 @@ use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -98,6 +99,108 @@ pub struct RawRelayStreams {
     pub send_stream: crate::high_level::SendStream,
     /// Receive half of the relay QUIC stream.
     pub recv_stream: crate::high_level::RecvStream,
+}
+
+/// Owns the background tasks and CONNECT-UDP streams backing a relay socket.
+///
+/// Calling [`shutdown`](Self::shutdown) aborts and joins every tunnel task.
+/// Aborting the reader and writer tasks drops their QUIC stream halves, which
+/// promptly tells the relay server to close the associated MASQUE session and
+/// release its capacity slot. Shutdown is idempotent.
+#[derive(Debug)]
+pub(crate) struct RelayTunnelControl {
+    tasks: PlMutex<Vec<tokio::task::JoinHandle<()>>>,
+    closed: Notify,
+    is_closed: AtomicBool,
+}
+
+impl RelayTunnelControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tasks: PlMutex::new(Vec::new()),
+            closed: Notify::new(),
+            is_closed: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached() -> Arc<Self> {
+        Self::new()
+    }
+
+    fn register(&self, handle: tokio::task::JoinHandle<()>) {
+        if self.is_closed() {
+            handle.abort();
+            return;
+        }
+
+        let mut tasks = self.tasks.lock();
+        if self.is_closed() {
+            handle.abort();
+        } else {
+            tasks.push(handle);
+        }
+    }
+
+    fn mark_closed(&self) {
+        if !self.is_closed.swap(true, Ordering::AcqRel) {
+            self.closed.notify_waiters();
+        }
+    }
+
+    /// Returns whether the tunnel has failed or has been explicitly shut down.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+
+    /// Wait until the tunnel reader exits or shutdown is requested.
+    pub(crate) async fn closed(&self) {
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            let notified = self.closed.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Stop the tunnel and wait for all task-owned QUIC streams to be dropped.
+    pub(crate) async fn shutdown(&self) {
+        let handles = self.abort_tasks();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Stop the tunnel without waiting for task cancellation to complete.
+    ///
+    /// This is the cancellation-safe fallback used by relay ownership guards:
+    /// `Drop` cannot await, but it must still ensure the task-owned QUIC stream
+    /// halves are scheduled for prompt release.
+    pub(crate) fn shutdown_now(&self) {
+        drop(self.abort_tasks());
+    }
+
+    fn abort_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.mark_closed();
+        let handles = {
+            let mut tasks = self.tasks.lock();
+            std::mem::take(&mut *tasks)
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
+    }
+}
+
+fn mark_writer_exit(control: &Weak<RelayTunnelControl>) {
+    if let Some(control) = control.upgrade() {
+        control.mark_closed();
+    }
 }
 
 /// A virtual UDP socket backed entirely by a MASQUE relay tunnel.
@@ -166,24 +269,24 @@ impl MasqueRelaySocket {
     /// - A keepalive ticker that injects zero-length frames so the
     ///   NAT conntrack entry stays alive on idle connections.
     ///
-    /// Returns the socket alongside a [`Notify`] that fires exactly once
-    /// when the reader task exits (tunnel failure).  Callers that own the
-    /// backing endpoint should use this to trigger a **graceful** close
+    /// Returns the socket alongside a [`RelayTunnelControl`] that reports
+    /// tunnel failure and provides explicit teardown. Callers that own the
+    /// backing endpoint should use it to trigger a **graceful** close
     /// — `Endpoint::close(code, reason)` sends CONNECTION_CLOSE frames
     /// to every connection before the endpoint driver future is dropped.
     /// Without this, the driver's `Drop` impl fires last and cascades
     /// a cryptic `"endpoint driver future was dropped"` into every
     /// connection accepted through this tunnel.
-    pub fn new(
+    pub(crate) fn new(
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
         relay_public_addr: SocketAddr,
         _relay_server_addr: SocketAddr,
         original_socket: Arc<dyn AsyncUdpSocket>,
-    ) -> (Arc<Self>, Arc<Notify>) {
+    ) -> (Arc<Self>, Arc<RelayTunnelControl>) {
         let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(SEND_QUEUE_CAPACITY);
         let (recv_tx, recv_rx) = mpsc::channel::<(Bytes, SocketAddr)>(RECV_QUEUE_CAPACITY);
-        let closed = Arc::new(Notify::new());
+        let control = RelayTunnelControl::new();
         let send_capacity_freed = Arc::new(Notify::new());
 
         let target_mtu: Arc<DashMap<SocketAddr, u16>> = Arc::new(DashMap::new());
@@ -201,8 +304,8 @@ impl MasqueRelaySocket {
         // Background task: read length-prefixed frames from relay stream
         // and forward decoded (payload, source) pairs to `poll_recv`.
         // Holds the payload as `Bytes` throughout — no Vec round-trip.
-        let closed_reader = Arc::clone(&closed);
-        tokio::spawn(async move {
+        let weak_control: Weak<RelayTunnelControl> = Arc::downgrade(&control);
+        let reader_handle = tokio::spawn(async move {
             loop {
                 let mut len_buf = [0u8; 4];
                 if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
@@ -280,14 +383,6 @@ impl MasqueRelaySocket {
                     Ok(datagram) => {
                         // `datagram.payload` is a zero-copy slice of
                         // the original frame buffer — no clone needed.
-                        let inbound_source = datagram.target;
-                        let inbound_len = datagram.payload.len();
-                        tracing::trace!(
-                            relay = %relay_public_addr,
-                            source = %inbound_source,
-                            len = inbound_len,
-                            "RELAY_TUNNEL[clt]: decoded inbound frame → enqueue for Quinn poll_recv"
-                        );
                         if recv_tx
                             .send((datagram.payload, datagram.target))
                             .await
@@ -305,17 +400,18 @@ impl MasqueRelaySocket {
             // Dropping `recv_tx` here wakes any pending `poll_recv`
             // with Poll::Ready(None), signalling end-of-stream.
             //
-            // Signal any watcher waiting on the close notification so it
-            // can initiate a graceful endpoint close BEFORE the driver's
-            // `Drop` fires.  `notify_waiters` wakes every current waiter
-            // exactly once; subsequent waits see `Pending`, which is
-            // fine — the shutdown only needs to run once.
-            closed_reader.notify_waiters();
+            // Signal the owner before the endpoint driver is dropped so it
+            // can gracefully close connections accepted through the tunnel.
+            if let Some(control) = weak_control.upgrade() {
+                control.mark_closed();
+            }
         });
+        control.register(reader_handle);
 
         // Background task: write queued outbound packets to relay stream.
         let writer_capacity = Arc::clone(&send_capacity_freed);
-        tokio::spawn(async move {
+        let writer_control = Arc::downgrade(&control);
+        let writer_handle = tokio::spawn(async move {
             while let Some(encoded) = send_rx.recv().await {
                 // `recv` completing means the channel just freed a
                 // slot.  Wake any poller parked on full-queue
@@ -357,7 +453,9 @@ impl MasqueRelaySocket {
             // of waiting forever.
             drop(send_rx);
             writer_capacity.notify_waiters();
+            mark_writer_exit(&writer_control);
         });
+        control.register(writer_handle);
 
         // Background task: periodic keepalive pings.
         // Sends a zero-length frame through the writer channel to keep
@@ -365,7 +463,7 @@ impl MasqueRelaySocket {
         // connection.  The writer encodes it as a 4-byte `[0,0,0,0]`
         // length prefix with no payload; the relay server skips it.
         let keepalive_tx = send_tx;
-        tokio::spawn(async move {
+        let keepalive_handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(RELAY_KEEPALIVE_INTERVAL);
             tick.tick().await; // skip immediate first tick
             loop {
@@ -377,8 +475,9 @@ impl MasqueRelaySocket {
                 }
             }
         });
+        control.register(keepalive_handle);
 
-        (socket, closed)
+        (socket, control)
     }
 
     /// Remaining capacity in the outbound send channel.  Exposed for
@@ -427,14 +526,6 @@ impl AsyncUdpSocket for MasqueRelaySocket {
         // of `segment_size` bytes.  Each segment must be sent as its
         // own tunnel frame — the relay server has a per-frame size
         // limit and cannot handle the entire batch as one.
-        tracing::trace!(
-            relay = %self.relay_public_addr,
-            destination = %transmit.destination,
-            len = transmit.contents.len(),
-            segment_size = ?transmit.segment_size,
-            "RELAY_TUNNEL[clt]: try_send → enqueue outbound for relay-server"
-        );
-
         // Per-target MTU enforcement: if a previous PmtuUpdate control
         // frame told us the egress path to this destination caps at
         // `mtu` bytes, drop oversized packets here so they never reach
@@ -518,12 +609,6 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                     recv_meta.ecn = None;
                     recv_meta.dst_ip = None;
                     meta[filled] = recv_meta;
-
-                    tracing::trace!(
-                        source = %source,
-                        len,
-                        "RELAY_TUNNEL: recv from tunnel queue"
-                    );
 
                     filled += 1;
                 }
@@ -645,5 +730,85 @@ impl UdpPoller for TunnelPoller {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_tunnel_control_tests {
+    use super::{RelayTunnelControl, mark_writer_exit};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_registered_tasks_and_wakes_waiters() {
+        let control = RelayTunnelControl::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = DropMarker(Arc::clone(&dropped));
+        control.register(tokio::spawn(async move {
+            let _marker = marker;
+            std::future::pending::<()>().await;
+        }));
+
+        let waiter_control = Arc::clone(&control);
+        let waiter = tokio::spawn(async move {
+            waiter_control.closed().await;
+        });
+
+        control.shutdown().await;
+        let waiter_result = waiter.await;
+
+        assert!(waiter_result.is_ok());
+        assert!(control.is_closed());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        let control = RelayTunnelControl::new();
+
+        control.shutdown().await;
+        control.shutdown().await;
+
+        assert!(control.is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_now_aborts_registered_tasks_without_an_await() {
+        let control = RelayTunnelControl::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = DropMarker(Arc::clone(&dropped));
+        control.register(tokio::spawn(async move {
+            let _marker = marker;
+            std::future::pending::<()>().await;
+        }));
+
+        tokio::task::yield_now().await;
+        control.shutdown_now();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted tunnel task should release its owned stream state");
+        assert!(control.is_closed());
+    }
+
+    #[test]
+    fn writer_exit_marks_tunnel_closed() {
+        let control = RelayTunnelControl::new();
+
+        mark_writer_exit(&Arc::downgrade(&control));
+
+        assert!(control.is_closed());
     }
 }

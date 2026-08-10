@@ -650,35 +650,20 @@ impl LinkTransport for P2pLinkTransport {
             endpoint,
             |endpoint| async move {
                 // Wait for an incoming connection
-                if let Some(peer_conn) = endpoint.accept().await {
+                if let Some((peer_conn, conn)) = endpoint.accept_with_connection().await {
                     // Extract SocketAddr from TransportAddr
                     let socket_addr = peer_conn
                         .remote_addr
                         .as_socket_addr()
                         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
-                    // Get the underlying QUIC connection by address
-                    match endpoint.get_quic_connection(&socket_addr).await {
-                        Ok(Some(conn)) => {
-                            // Extract peer public key from TLS identity
-                            let public_key = conn
-                                .peer_identity()
-                                .and_then(|id| id.downcast::<Vec<u8>>().ok())
-                                .map(|boxed| *boxed);
-                            let link_conn = P2pLinkConn::new(conn, public_key, socket_addr);
-                            Some((Ok(link_conn), endpoint))
-                        }
-                        Ok(None) => {
-                            // Connection not found, try again
-                            Some((
-                                Err(LinkError::ConnectionFailed(
-                                    "Connection not found".to_string(),
-                                )),
-                                endpoint,
-                            ))
-                        }
-                        Err(e) => Some((Err(LinkError::ConnectionFailed(e.to_string())), endpoint)),
-                    }
+                    // rustls exposes the authenticated identity as a
+                    // certificate vector whose first entry is the RFC 7250
+                    // ML-DSA SPKI, not as a bare `Vec<u8>`.
+                    let public_key =
+                        crate::p2p_endpoint::extract_public_key_bytes_from_connection(&conn);
+                    let link_conn = P2pLinkConn::new(conn, public_key, socket_addr);
+                    Some((Ok(link_conn), endpoint))
                 } else {
                     // Endpoint is shutting down
                     None
@@ -725,11 +710,8 @@ impl LinkTransport for P2pLinkTransport {
                 .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?
                 .ok_or_else(|| LinkError::ConnectionFailed("Connection not found".to_string()))?;
 
-            // Extract peer public key from TLS identity
-            let public_key = conn
-                .peer_identity()
-                .and_then(|id| id.downcast::<Vec<u8>>().ok())
-                .map(|boxed| *boxed);
+            // Preserve the identity authenticated by this exact connection.
+            let public_key = crate::p2p_endpoint::extract_public_key_bytes_from_connection(&conn);
 
             Ok(P2pLinkConn::new(conn, public_key, connected_addr))
         })
@@ -1439,6 +1421,54 @@ mod tests {
         assert_eq!(state.protocols.len(), 1);
         assert_eq!(state.protocols[0], ProtocolId::DEFAULT);
         assert!(state.capabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_uses_the_authoritative_connection_handle() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid bind address");
+        let server_endpoint = Arc::new(
+            P2pEndpoint::new(
+                P2pConfig::builder()
+                    .bind_addr(bind_addr)
+                    .build()
+                    .expect("valid server config"),
+            )
+            .await
+            .expect("server endpoint"),
+        );
+        let server_addr = server_endpoint.local_addr().expect("server address");
+        let server = P2pLinkTransport::from_endpoint(Arc::clone(&server_endpoint));
+        let client = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(bind_addr)
+                .build()
+                .expect("valid client config"),
+        )
+        .await
+        .expect("client endpoint");
+
+        let mut incoming = server.accept(ProtocolId::DEFAULT);
+        client
+            .connect(server_addr)
+            .await
+            .expect("client connection");
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), incoming.next())
+            .await
+            .expect("accept timed out")
+            .expect("accept stream ended")
+            .expect("accepted connection");
+
+        assert_eq!(
+            accepted.remote_addr().ip(),
+            client.local_addr().unwrap().ip()
+        );
+        assert!(
+            accepted.peer_public_key().is_some(),
+            "accepted handle must retain its authenticated identity"
+        );
+
+        client.shutdown().await;
+        server_endpoint.shutdown().await;
     }
 
     // =========================================================================

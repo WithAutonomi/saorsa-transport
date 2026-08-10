@@ -275,7 +275,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
 use tokio::{
     net::UdpSocket,
-    sync::{Mutex as TokioMutex, mpsc},
+    sync::{Mutex as TokioMutex, mpsc, oneshot},
     time::{sleep, timeout},
 };
 
@@ -376,6 +376,486 @@ impl RelaySession {
     }
 }
 
+/// Cancellation-safe ownership of one exact entry in `relay_sessions`.
+///
+/// The guard is armed before the entry is inserted, so every subsequent await
+/// is protected. Ownership can be transferred into [`ProactiveRelay`] or
+/// explicitly disarmed when the session is intentionally left managed by the
+/// endpoint-wide session table.
+struct RelaySessionOwner {
+    relay_server_addr: SocketAddr,
+    public_address: Option<SocketAddr>,
+    relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    stable_id: usize,
+    cleanup_armed: bool,
+}
+
+impl RelaySessionOwner {
+    fn new(
+        relay_server_addr: SocketAddr,
+        public_address: Option<SocketAddr>,
+        relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+        stable_id: usize,
+    ) -> Self {
+        Self {
+            relay_server_addr,
+            public_address,
+            relay_sessions,
+            stable_id,
+            cleanup_armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.cleanup_armed = false;
+    }
+
+    fn remove_owned_session(&mut self, reason: &'static [u8]) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        let public_address = self.public_address;
+        let stable_id = self.stable_id;
+        let removed = self
+            .relay_sessions
+            .remove_if(&self.relay_server_addr, |_, session| {
+                session.public_address == public_address
+                    && session.connection.stable_id() == stable_id
+            });
+
+        if let Some((_, session)) = removed {
+            session
+                .connection
+                .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        }
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for RelaySessionOwner {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        warn!(
+            relay_server = %self.relay_server_addr,
+            relay_addr = ?self.public_address,
+            stable_id = self.stable_id,
+            "Relay session owner dropped before ownership transfer; forcing cleanup"
+        );
+        self.remove_owned_session(b"relay session owner dropped");
+    }
+}
+
+struct EstablishedRelaySession {
+    public_address: Option<SocketAddr>,
+    raw_streams: Option<crate::masque::RawRelayStreams>,
+    owner: RelaySessionOwner,
+}
+
+/// Opaque identity of a prepared proactive relay allocation.
+///
+/// Callers must pass this exact handle to
+/// [`NatTraversalEndpoint::publish_proactive_relay`] or
+/// [`NatTraversalEndpoint::abort_proactive_relay`]. The allocation id prevents
+/// a late canary verdict from acting on a newer allocation that reused the same
+/// stable relay address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedRelay {
+    public_addr: SocketAddr,
+    allocation_id: u64,
+}
+
+static NEXT_RELAY_ALLOCATION_ID: AtomicU64 = AtomicU64::new(0);
+
+impl PreparedRelay {
+    fn new(public_addr: SocketAddr) -> Self {
+        Self {
+            public_addr,
+            allocation_id: NEXT_RELAY_ALLOCATION_ID
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+        }
+    }
+
+    /// Public address allocated for this provisional relay.
+    pub fn public_addr(self) -> SocketAddr {
+        self.public_addr
+    }
+
+    /// Create an independent handle for a mock relay allocation.
+    ///
+    /// This supports implementations of relay-establishment abstractions in
+    /// downstream tests. It cannot publish or abort an endpoint allocation
+    /// because its opaque identity does not match that endpoint's current
+    /// handle.
+    #[doc(hidden)]
+    pub fn detached(public_addr: SocketAddr) -> Self {
+        Self::new(public_addr)
+    }
+}
+
+/// Resources owned by one proactive relay allocation.
+struct ProactiveRelay {
+    handle: PreparedRelay,
+    endpoint: Arc<InnerEndpoint>,
+    tunnel: Arc<crate::masque::RelayTunnelControl>,
+    relay_session_owner: RelaySessionOwner,
+    cleanup_armed: bool,
+}
+
+impl ProactiveRelay {
+    async fn teardown(mut self, reason: &'static [u8]) {
+        self.endpoint
+            .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        self.tunnel.shutdown().await;
+
+        if tokio::time::timeout(Duration::from_secs(1), self.endpoint.wait_idle())
+            .await
+            .is_err()
+        {
+            debug!(
+                relay_addr = %self.handle.public_addr(),
+                "Timed out draining proactive relay endpoint during teardown"
+            );
+        }
+
+        self.relay_session_owner.remove_owned_session(reason);
+
+        info!(
+            relay_addr = %self.handle.public_addr(),
+            relay_server = %self.relay_session_owner.relay_server_addr,
+            allocation_id = self.handle.allocation_id,
+            "Proactive relay torn down"
+        );
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for ProactiveRelay {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        warn!(
+            relay_addr = %self.handle.public_addr(),
+            allocation_id = self.handle.allocation_id,
+            "Relay owner dropped before graceful teardown completed; forcing cleanup"
+        );
+        let reason = b"relay owner dropped";
+        self.endpoint
+            .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+        self.tunnel.shutdown_now();
+        self.relay_session_owner.remove_owned_session(reason);
+    }
+}
+
+/// Complete proactive-relay lifecycle state.
+///
+/// Keeping visibility and owned resources in one enum makes publication a
+/// single, infallible state transition rather than a sequence of updates across
+/// independent mutexes and atomics.
+#[derive(Default)]
+enum RelayLifecycleState {
+    #[default]
+    None,
+    Provisional(ProactiveRelay),
+    Published(ProactiveRelay),
+    Shutdown,
+}
+
+impl RelayLifecycleState {
+    fn published_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Published(relay) => Some(relay.handle.public_addr()),
+            Self::None | Self::Provisional(_) | Self::Shutdown => None,
+        }
+    }
+}
+
+struct RelayHealthSnapshot {
+    relay_addr: SocketAddr,
+    tunnel: Arc<crate::masque::RelayTunnelControl>,
+}
+
+enum RelayLifecycleCommand {
+    BeginPrepare {
+        reply: oneshot::Sender<Result<(u64, Option<ProactiveRelay>), String>>,
+    },
+    CompletePrepare {
+        generation: u64,
+        relay: ProactiveRelay,
+        reply: oneshot::Sender<Result<(), ProactiveRelay>>,
+    },
+    Publish {
+        prepared: PreparedRelay,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    TakeMatching {
+        prepared: PreparedRelay,
+        reply: oneshot::Sender<Option<ProactiveRelay>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<Option<ProactiveRelay>>,
+    },
+    PublishedAddr {
+        reply: oneshot::Sender<Option<SocketAddr>>,
+    },
+    PublishedHandle {
+        reply: oneshot::Sender<Option<PreparedRelay>>,
+    },
+    Health {
+        reply: oneshot::Sender<Option<RelayHealthSnapshot>>,
+    },
+}
+
+/// Serializes proactive-relay state transitions without holding a mutex across
+/// network acquisition or teardown. Slow I/O stays with the caller; this actor
+/// only owns short, deterministic state changes.
+#[derive(Clone)]
+struct RelayLifecycleHandle {
+    commands: mpsc::Sender<RelayLifecycleCommand>,
+    published: Arc<AtomicBool>,
+}
+
+impl RelayLifecycleHandle {
+    fn new() -> Self {
+        let (commands, mut receiver) = mpsc::channel(16);
+        let published = Arc::new(AtomicBool::new(false));
+        let actor_published = Arc::clone(&published);
+        tokio::spawn(async move {
+            let mut generation = 0u64;
+            let mut state = RelayLifecycleState::None;
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    RelayLifecycleCommand::BeginPrepare { reply } => {
+                        let previous = match std::mem::take(&mut state) {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay) => Some(relay),
+                            RelayLifecycleState::None => None,
+                            RelayLifecycleState::Shutdown => {
+                                state = RelayLifecycleState::Shutdown;
+                                let _ = reply.send(Err("relay lifecycle is shut down".to_string()));
+                                continue;
+                            }
+                        };
+                        generation = generation.wrapping_add(1);
+                        actor_published.store(false, Ordering::Release);
+                        let _ = reply.send(Ok((generation, previous)));
+                    }
+                    RelayLifecycleCommand::CompletePrepare {
+                        generation: completed_generation,
+                        relay,
+                        reply,
+                    } => {
+                        if generation == completed_generation
+                            && matches!(state, RelayLifecycleState::None)
+                        {
+                            state = RelayLifecycleState::Provisional(relay);
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let _ = reply.send(Err(relay));
+                        }
+                    }
+                    RelayLifecycleCommand::Publish { prepared, reply } => {
+                        let current = std::mem::take(&mut state);
+                        match current {
+                            RelayLifecycleState::Provisional(relay) if relay.handle == prepared => {
+                                if relay.tunnel.is_closed() {
+                                    state = RelayLifecycleState::Provisional(relay);
+                                    let _ = reply.send(Err(format!(
+                                        "Prepared relay tunnel for {} is closed",
+                                        prepared.public_addr()
+                                    )));
+                                } else {
+                                    state = RelayLifecycleState::Published(relay);
+                                    actor_published.store(true, Ordering::Release);
+                                    let _ = reply.send(Ok(()));
+                                }
+                            }
+                            RelayLifecycleState::Published(relay) if relay.handle == prepared => {
+                                state = RelayLifecycleState::Published(relay);
+                                actor_published.store(true, Ordering::Release);
+                                let _ = reply.send(Ok(()));
+                            }
+                            RelayLifecycleState::Shutdown => {
+                                state = RelayLifecycleState::Shutdown;
+                                let _ = reply.send(Err("relay lifecycle is shut down".to_string()));
+                            }
+                            other => {
+                                state = other;
+                                let _ = reply.send(Err(format!(
+                                    "Prepared relay allocation {} at {} is stale or no longer active",
+                                    prepared.allocation_id,
+                                    prepared.public_addr()
+                                )));
+                            }
+                        }
+                    }
+                    RelayLifecycleCommand::TakeMatching { prepared, reply } => {
+                        let current = std::mem::take(&mut state);
+                        match current {
+                            RelayLifecycleState::Provisional(relay)
+                            | RelayLifecycleState::Published(relay)
+                                if relay.handle == prepared =>
+                            {
+                                generation = generation.wrapping_add(1);
+                                actor_published.store(false, Ordering::Release);
+                                let _ = reply.send(Some(relay));
+                            }
+                            other => {
+                                state = other;
+                                let _ = reply.send(None);
+                            }
+                        }
+                    }
+                    RelayLifecycleCommand::Shutdown { reply } => {
+                        generation = generation.wrapping_add(1);
+                        actor_published.store(false, Ordering::Release);
+                        let relay =
+                            match std::mem::replace(&mut state, RelayLifecycleState::Shutdown) {
+                                RelayLifecycleState::Provisional(relay)
+                                | RelayLifecycleState::Published(relay) => Some(relay),
+                                RelayLifecycleState::None | RelayLifecycleState::Shutdown => None,
+                            };
+                        let _ = reply.send(relay);
+                    }
+                    RelayLifecycleCommand::PublishedAddr { reply } => {
+                        let _ = reply.send(state.published_addr());
+                    }
+                    RelayLifecycleCommand::PublishedHandle { reply } => {
+                        let handle = match &state {
+                            RelayLifecycleState::Published(relay) => Some(relay.handle),
+                            RelayLifecycleState::None
+                            | RelayLifecycleState::Provisional(_)
+                            | RelayLifecycleState::Shutdown => None,
+                        };
+                        let _ = reply.send(handle);
+                    }
+                    RelayLifecycleCommand::Health { reply } => {
+                        let health = match &state {
+                            RelayLifecycleState::Published(relay) => Some(RelayHealthSnapshot {
+                                relay_addr: relay.handle.public_addr(),
+                                tunnel: Arc::clone(&relay.tunnel),
+                            }),
+                            RelayLifecycleState::None
+                            | RelayLifecycleState::Provisional(_)
+                            | RelayLifecycleState::Shutdown => None,
+                        };
+                        let _ = reply.send(health);
+                    }
+                }
+            }
+        });
+        Self {
+            commands,
+            published,
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+
+    async fn begin_prepare(&self) -> Result<(u64, Option<ProactiveRelay>), String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::BeginPrepare { reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?
+    }
+
+    async fn complete_prepare(
+        &self,
+        generation: u64,
+        relay: ProactiveRelay,
+    ) -> Result<Result<(), ProactiveRelay>, String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::CompletePrepare {
+                generation,
+                relay,
+                reply,
+            })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())
+    }
+
+    async fn publish(&self, prepared: PreparedRelay) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::Publish { prepared, reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?
+    }
+
+    async fn take_matching(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Result<Option<ProactiveRelay>, String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::TakeMatching { prepared, reply })
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "relay lifecycle actor stopped".to_string())
+    }
+
+    async fn shutdown(&self) -> Option<ProactiveRelay> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .commands
+            .send(RelayLifecycleCommand::Shutdown { reply })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        response.await.ok().flatten()
+    }
+
+    async fn published_addr(&self) -> Option<SocketAddr> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::PublishedAddr { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    async fn published_handle(&self) -> Option<PreparedRelay> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::PublishedHandle { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    async fn health(&self) -> Option<RelayHealthSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayLifecycleCommand::Health { reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+}
+
 /// Event from the constrained engine with transport address context
 ///
 /// This wrapper adds the transport address to engine events so that P2pEndpoint
@@ -472,8 +952,6 @@ pub struct NatTraversalEndpoint {
     /// one handler running even when both the accept-side and dial-side
     /// spawn paths fire for it. Shared across all spawn sites.
     relay_handler_connections: Arc<dashmap::DashSet<usize>>,
-    /// Whether symmetric NAT relay setup has been attempted (one-shot)
-    relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
     /// Flipped once the external bootstrap phase is over (set by
     /// `P2pEndpoint::connect_known_peers` right before it broadcasts
     /// `P2pEvent::BootstrapStatus`). While false, the discovery polling
@@ -482,16 +960,8 @@ pub struct NatTraversalEndpoint {
     /// bootstrap window is the only time we care about growing the local
     /// candidate set from OBSERVED_ADDRESS frames.
     bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
-    /// Relay address to re-advertise to new peers (set after proactive relay setup)
-    relay_public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
-    /// Monotonic generation for proactive relay state.
-    ///
-    /// Incremented whenever relay state is established or reset. Any
-    /// advertise/re-advertise path that snapshots a relay address also carries
-    /// this generation and drops work if a newer relay state superseded it.
-    relay_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Peers already advertised the relay address to
-    relay_advertised_peers: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
+    /// Current proactive relay allocation and its publication state.
+    relay_lifecycle: RelayLifecycleHandle,
     /// Task handles for transport listener tasks
     /// Used for cleanup on shutdown
     transport_listener_handles: Arc<ParkingMutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -1729,13 +2199,8 @@ impl NatTraversalEndpoint {
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
-            relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
-            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            relay_advertised_peers: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            relay_lifecycle: RelayLifecycleHandle::new(),
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -1917,10 +2382,10 @@ impl NatTraversalEndpoint {
         let connections_clone = endpoint.connections.clone();
 
         let local_session_id = DiscoverySessionId::Local;
-        let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let relay_server_clone = endpoint.relay_server.clone();
         let advertise = endpoint.advertise_external_addresses;
         let bootstrap_complete_clone = endpoint.bootstrap_complete.clone();
+        let relay_lifecycle = endpoint.relay_lifecycle.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1929,10 +2394,10 @@ impl NatTraversalEndpoint {
                 connections_clone,
                 event_callback_for_poll,
                 local_session_id,
-                relay_setup_attempted_clone,
                 relay_server_clone,
                 advertise,
                 bootstrap_complete_clone,
+                relay_lifecycle,
             )
             .await;
         });
@@ -2171,13 +2636,8 @@ impl NatTraversalEndpoint {
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
             relay_server_config: Arc::new(std::sync::Mutex::new(relay_server_config)),
             relay_handler_connections: Arc::new(dashmap::DashSet::new()),
-            relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bootstrap_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
-            relay_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            relay_advertised_peers: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            relay_lifecycle: RelayLifecycleHandle::new(),
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -2359,10 +2819,10 @@ impl NatTraversalEndpoint {
         let connections_clone = endpoint.connections.clone();
 
         let local_session_id = DiscoverySessionId::Local;
-        let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let relay_server_clone = endpoint.relay_server.clone();
         let advertise = endpoint.advertise_external_addresses;
         let bootstrap_complete_clone = endpoint.bootstrap_complete.clone();
+        let relay_lifecycle = endpoint.relay_lifecycle.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2371,10 +2831,10 @@ impl NatTraversalEndpoint {
                 connections_clone,
                 event_callback_for_poll,
                 local_session_id,
-                relay_setup_attempted_clone,
                 relay_server_clone,
                 advertise,
                 bootstrap_complete_clone,
+                relay_lifecycle,
             )
             .await;
         });
@@ -3478,6 +3938,13 @@ impl NatTraversalEndpoint {
                                             addr, request
                                         );
 
+                                        // This connection now carries relay traffic and
+                                        // must not be force-closed by ordinary peer-table
+                                        // pruning. The RAII guard releases protection on
+                                        // every exit path, including allocation failures.
+                                        let _relay_control_guard =
+                                            server.protect_relay_control_connection(stable_id);
+
                                         // Handle the request via relay server
                                         match server
                                             .handle_connect_request(&request, addr, peer_id)
@@ -3584,10 +4051,10 @@ impl NatTraversalEndpoint {
         connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         local_session_id: DiscoverySessionId,
-        relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         advertise_external_addresses: bool,
         bootstrap_complete: Arc<std::sync::atomic::AtomicBool>,
+        relay_lifecycle: RelayLifecycleHandle,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3743,11 +4210,8 @@ impl NatTraversalEndpoint {
 
             // 2. Send ADD_ADDRESS to all peers for newly discovered addresses
             // (Critical for CGNAT - peers need to know our external address to hole-punch back)
-            // Skip if relay is active — only the relay address should be advertised.
             // Skip entirely for outbound-only clients that don't need to be reachable.
-            if advertise_external_addresses
-                && !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if advertise_external_addresses && !relay_lifecycle.is_published() {
                 for addr in &new_addresses {
                     broadcast_address_to_peers(&connections, *addr, 100);
                 }
@@ -3801,7 +4265,10 @@ impl NatTraversalEndpoint {
                         // first observer so hole-punch coordination can
                         // start before quorum. See the OBSERVED_ADDRESS
                         // path above for the rationale.
-                        if check.new_observer && advertise_external_addresses {
+                        if check.new_observer
+                            && advertise_external_addresses
+                            && !relay_lifecycle.is_published()
+                        {
                             broadcast_address_to_peers(
                                 &connections,
                                 candidate.address,
@@ -3941,72 +4408,41 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Get the relay public address, if a proactive relay has been established.
-    pub fn relay_public_addr(&self) -> Option<SocketAddr> {
-        self.relay_public_addr.lock().ok().and_then(|g| *g)
-    }
-
-    fn current_relay_generation(&self) -> u64 {
-        self.relay_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn next_relay_generation(&self) -> u64 {
-        self.relay_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .wrapping_add(1)
-    }
-
-    fn relay_generation_matches(&self, generation: u64, relay_addr: SocketAddr) -> bool {
-        self.current_relay_generation() == generation
-            && self.relay_public_addr.lock().ok().and_then(|g| *g) == Some(relay_addr)
+    /// Get the relay public address after its allocation has been published.
+    pub async fn relay_public_addr(&self) -> Option<SocketAddr> {
+        self.relay_lifecycle.published_addr().await
     }
 
     /// Check if the proactive relay session is still alive. Returns true if
     /// no relay was established (nothing to monitor) or the relay is healthy.
     /// Returns false if a relay was established but the underlying QUIC
     /// connection has closed.
-    pub fn is_relay_healthy(&self) -> bool {
-        let relay_addr = match self.relay_public_addr.lock().ok().and_then(|g| *g) {
-            Some(addr) => addr,
-            None => return true, // No relay — nothing to monitor
+    pub async fn is_relay_healthy(&self) -> bool {
+        let Some(relay) = self.relay_lifecycle.health().await else {
+            return true;
         };
+        if relay.tunnel.is_closed() {
+            return false;
+        }
 
         // Check the specific session for the advertised relay address.
         // Other relay sessions may exist but are irrelevant — peers are
         // using relay_addr, so that's the one that must be healthy.
         for entry in self.relay_sessions.iter() {
-            if entry.value().public_address == Some(relay_addr) {
+            if entry.value().public_address == Some(relay.relay_addr) {
                 return entry.value().is_active();
             }
         }
 
-        // No matching session found
         warn!(
-            "Relay session for {} is dead — resetting for re-establishment",
-            relay_addr
+            "Relay session for {} is dead — re-establishment required",
+            relay.relay_addr
         );
         false
     }
 
-    /// Reset relay state so the next poll cycle can re-establish. Called when
-    /// the relay session is detected as dead.
-    pub fn reset_relay_state(&self) {
-        let generation = self.next_relay_generation();
-        self.relay_setup_attempted
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut addr) = self.relay_public_addr.lock() {
-            *addr = None;
-        }
-        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
-            peers.clear();
-        }
-        // Remove dead sessions
-        self.relay_sessions.retain(|_, session| session.is_active());
-        info!(
-            generation,
-            "Relay state reset — will re-establish on next poll cycle"
-        );
+    pub(crate) async fn published_relay_handle(&self) -> Option<PreparedRelay> {
+        self.relay_lifecycle.published_handle().await
     }
 
     /// Check if relay fallback is available
@@ -4032,16 +4468,41 @@ impl NatTraversalEndpoint {
         relay_addr: SocketAddr,
     ) -> Result<(Option<SocketAddr>, Option<crate::masque::RawRelayStreams>), NatTraversalError>
     {
+        let EstablishedRelaySession {
+            public_address,
+            raw_streams,
+            owner,
+        } = self.establish_owned_relay_session(relay_addr).await?;
+        owner.disarm();
+        Ok((public_address, raw_streams))
+    }
+
+    async fn establish_owned_relay_session(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<EstablishedRelaySession, NatTraversalError> {
         // Check if we already have an active session to this relay
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
+                let public_address = session.public_address;
+                let stable_id = session.connection.stable_id();
                 debug!(
                     relay = %relay_addr,
-                    public_address = ?session.public_address,
+                    public_address = ?public_address,
                     "relay session: reusing active CONNECT-UDP session"
                 );
-                return Ok((session.public_address, None));
+                drop(session);
+                return Ok(EstablishedRelaySession {
+                    public_address,
+                    raw_streams: None,
+                    owner: RelaySessionOwner::new(
+                        relay_addr,
+                        public_address,
+                        Arc::clone(&self.relay_sessions),
+                        stable_id,
+                    ),
+                });
             }
         }
 
@@ -4052,36 +4513,17 @@ impl NatTraversalEndpoint {
             "relay session: establishing CONNECT-UDP Bind session"
         );
 
-        // Prefer reusing an existing peer connection to the relay.
-        // The relay server's handle_relay_requests is spawned for each ACCEPTED
-        // connection, so using the existing connection ensures a handler is
-        // already listening for bidi streams.
-        let connection = if let Some(existing) = self.connections.get(&relay_addr) {
-            if existing.close_reason().is_none() {
-                info!(
-                    relay = %relay_addr,
-                    stable_id = existing.stable_id(),
-                    "relay session: reusing existing peer connection to relay"
-                );
-                existing.clone()
-            } else {
-                // Existing connection is dead — fall back to creating a new one
-                debug!(
-                    relay = %relay_addr,
-                    close_reason = ?existing.close_reason(),
-                    "relay session: existing peer connection is closed; cold-dialing relay"
-                );
-                drop(existing);
-                self.connect_new_to_relay(relay_addr).await?
-            }
-        } else {
-            // No existing connection — create one
-            debug!(
-                relay = %relay_addr,
-                "relay session: no existing peer connection; cold-dialing relay"
-            );
-            self.connect_new_to_relay(relay_addr).await?
-        };
+        // A relay allocation owns its parent QUIC connection. Borrowing an
+        // ordinary DHT connection made relay lifetime depend on routing-table
+        // pruning: removing that peer also destroyed an otherwise healthy,
+        // canary-verified CONNECT-UDP stream. The relay server protects this
+        // dedicated connection from its own peer-table pruning while the
+        // forwarding stream is live.
+        debug!(
+            relay = %relay_addr,
+            "relay session: creating dedicated control connection"
+        );
+        let connection = self.connect_new_to_relay(relay_addr).await?;
 
         // Cap on the end-to-end CONNECT-UDP handshake (open_bi → write
         // request → read_exact response). Without a cap, reusing a peer
@@ -4168,7 +4610,7 @@ impl NatTraversalEndpoint {
         if !response.is_success() {
             let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
             // Distinguish "at capacity" (client should walk to next candidate) from
-            // other failure modes. See ADR-014 in saorsa-core for the 2-client cap
+            // other failure modes. See ADR-016 in saorsa-core for the four-client cap
             // design.
             if response.status == MASQUE_RELAY_FULL_STATUS {
                 return Err(NatTraversalError::RelayAtCapacity { reason });
@@ -4193,7 +4635,16 @@ impl NatTraversalEndpoint {
             recv_stream,
         });
 
-        // Store the session
+        // Arm ownership before publishing the session into the map. There are
+        // no suspension points between these operations, and every later await
+        // is protected by the guard.
+        let stable_id = connection.stable_id();
+        let owner = RelaySessionOwner::new(
+            relay_addr,
+            public_address,
+            Arc::clone(&self.relay_sessions),
+            stable_id,
+        );
         let session = RelaySession {
             connection,
             public_address,
@@ -4213,7 +4664,11 @@ impl NatTraversalEndpoint {
             }
         }
 
-        Ok((public_address, raw_streams))
+        Ok(EstablishedRelaySession {
+            public_address,
+            raw_streams,
+            owner,
+        })
     }
 
     /// Create a fresh QUIC connection to a relay server.
@@ -4249,6 +4704,44 @@ impl NatTraversalEndpoint {
 
         info!("Connected to relay server {}", relay_addr);
         Ok(connection)
+    }
+
+    /// Open one fresh authenticated QUIC connection without registering it in
+    /// any peer, address, or connection-deduplication map.
+    ///
+    /// The returned identity is extracted before this method closes exactly
+    /// the connection it created. This is intentionally separate from normal
+    /// application dialing so a reachability probe can never borrow or tear
+    /// down a live DHT/application connection.
+    pub async fn probe_fresh_authenticated(
+        &self,
+        target: SocketAddr,
+    ) -> Result<Vec<u8>, NatTraversalError> {
+        let endpoint = self.inner_endpoint.as_ref().ok_or_else(|| {
+            NatTraversalError::ConfigError("QUIC endpoint not initialized".to_string())
+        })?;
+        let server_name = target.ip().to_string();
+        let connecting = endpoint.connect(target, &server_name).map_err(|error| {
+            NatTraversalError::ConnectionFailed(format!(
+                "Failed to initiate fresh authenticated probe: {error}"
+            ))
+        })?;
+        let connection = timeout(self.config.coordination_timeout, connecting)
+            .await
+            .map_err(|_| NatTraversalError::Timeout)?
+            .map_err(|error| {
+                NatTraversalError::ConnectionFailed(format!(
+                    "Fresh authenticated probe failed: {error}"
+                ))
+            })?;
+
+        let public_key = Self::extract_public_key_from_connection(&connection);
+        connection.close(crate::VarInt::from_u32(0), b"reachability probe complete");
+        public_key.ok_or_else(|| {
+            NatTraversalError::ConnectionFailed(
+                "Fresh authenticated probe did not expose a peer identity".to_string(),
+            )
+        })
     }
 
     /// Get active relay sessions
@@ -4741,6 +5234,20 @@ impl NatTraversalEndpoint {
         Ok(None)
     }
 
+    /// Whether the currently tracked connection at `addr` carries a live
+    /// CONNECT-UDP forwarding stream.
+    pub(crate) fn is_relay_control_connection(&self, addr: &SocketAddr) -> bool {
+        let Some(server) = self.relay_server.as_ref() else {
+            return false;
+        };
+        socket_addr_variants(*addr).into_iter().any(|candidate| {
+            self.connections.get(&candidate).is_some_and(|connection| {
+                connection.close_reason().is_none()
+                    && server.is_relay_control_connection(connection.stable_id())
+            })
+        })
+    }
+
     /// Get the receiver for accepted connection addresses.
     /// The P2pEndpoint's incoming_connection_forwarder uses this to register
     /// accepted connections in connected_peers.
@@ -4911,6 +5418,20 @@ impl NatTraversalEndpoint {
                     continue;
                 }
             }
+            if expected_stable_id.is_none()
+                && self.relay_server.as_ref().is_some_and(|server| {
+                    server.is_relay_control_connection(entry.value().stable_id())
+                })
+                && entry.value().close_reason().is_none()
+            {
+                info!(
+                    stable_id = entry.value().stable_id(),
+                    peer = %candidate,
+                    "remove_connection: keeping live relay control connection"
+                );
+                drop(entry);
+                continue;
+            }
 
             if entry.value().close_reason().is_none() {
                 // Force the connection shut so its Quinn resources are
@@ -5040,7 +5561,7 @@ impl NatTraversalEndpoint {
         is_symmetric
     }
 
-    /// Set up a proactive relay as a supplementary inbound path.
+    /// Prepare a proactive relay as a supplementary inbound path.
     ///
     /// Establishes a MASQUE relay session with `bootstrap_addr`, creates
     /// a **second** Quinn endpoint backed by the relay tunnel socket,
@@ -5048,34 +5569,36 @@ impl NatTraversalEndpoint {
     /// original UDP socket are never touched — direct connections
     /// continue to work exactly as before.
     ///
-    /// Peers that connect to the relay-allocated address land on the
-    /// relay endpoint.  Accepted connections are inserted into the
-    /// shared `connections` DashMap so the rest of the stack sees them
-    /// identically to direct connections.
-    pub async fn setup_proactive_relay(
+    /// The returned allocation is provisional: it can accept canary
+    /// connections but is not exposed by [`relay_public_addr`](Self::relay_public_addr)
+    /// Relay addresses are never sent through connection-level `ADD_ADDRESS`;
+    /// the authenticated upper layer publishes them after activation.
+    pub async fn prepare_proactive_relay(
         &self,
         bootstrap_addr: SocketAddr,
-    ) -> Result<SocketAddr, NatTraversalError> {
+    ) -> Result<PreparedRelay, NatTraversalError> {
+        let (generation, previous) = self
+            .relay_lifecycle
+            .begin_prepare()
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?;
+
+        // A new acquisition supersedes any prior allocation. The actor releases
+        // ownership before teardown, so lifecycle queries and shutdown are not
+        // blocked behind network I/O. The ownership guard forces cleanup if
+        // this future is cancelled before graceful teardown completes.
+        if let Some(previous) = previous {
+            self.teardown_proactive_relay(previous, b"relay superseded")
+                .await;
+        }
+
         info!(
-            "Setting up proactive relay via bootstrap {} for symmetric NAT",
+            "Preparing proactive relay via bootstrap {} for symmetric NAT",
             bootstrap_addr
         );
 
-        // Step 1: Establish relay session with bootstrap
-        let (public_addr, raw_streams) = self.establish_relay_session(bootstrap_addr).await?;
-        let relay_public_addr = public_addr.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed("Relay did not provide public address".to_string())
-        })?;
-        let raw_streams = raw_streams.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed("Relay did not provide socket".to_string())
-        })?;
-
-        info!(
-            "Relay session established, public address: {}",
-            relay_public_addr
-        );
-
-        // Step 2: Get the main endpoint's original socket (kept alive so the
+        // Validate every local prerequisite before acquiring scarce capacity
+        // from the relay server.
         // relay connection's own QUIC traffic — which flows over the real UDP
         // socket — continues to work).
         let main_endpoint = self.inner_endpoint.as_ref().ok_or_else(|| {
@@ -5085,22 +5608,6 @@ impl NatTraversalEndpoint {
         let original_socket = main_endpoint.current_socket().map_err(|e| {
             NatTraversalError::ConnectionFailed(format!("Failed to get original socket: {e}",))
         })?;
-
-        // Step 3: Build a tunnel-only relay socket and a second Quinn
-        // endpoint.  The main endpoint is never touched.
-        //
-        // `closed_notify` fires when the relay reader task exits because
-        // its QUIC stream failed.  A watcher spawned below uses this to
-        // call `Endpoint::close(...)` on the relay endpoint BEFORE the
-        // driver's Drop fires — connections get a clean CONNECTION_CLOSE
-        // instead of the "endpoint driver future was dropped" cascade.
-        let (relay_socket, closed_notify) = crate::masque::MasqueRelaySocket::new(
-            raw_streams.send_stream,
-            raw_streams.recv_stream,
-            relay_public_addr,
-            bootstrap_addr,
-            original_socket,
-        );
 
         let server_config = self
             .relay_server_config
@@ -5126,39 +5633,68 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("No async runtime available".to_string())
         })?;
 
-        let relay_endpoint = InnerEndpoint::new_with_abstract_socket(
+        // Acquire the relay only after local validation is complete.
+        let EstablishedRelaySession {
+            public_address: public_addr,
+            raw_streams,
+            owner: relay_session_owner,
+        } = self.establish_owned_relay_session(bootstrap_addr).await?;
+        let Some(relay_public_addr) = public_addr else {
+            return Err(NatTraversalError::ConnectionFailed(
+                "Relay did not provide public address".to_string(),
+            ));
+        };
+        let Some(raw_streams) = raw_streams else {
+            return Err(NatTraversalError::ConnectionFailed(
+                "Relay did not provide socket".to_string(),
+            ));
+        };
+
+        info!(
+            "Relay session established, public address: {}",
+            relay_public_addr
+        );
+
+        // Build a tunnel-only relay socket and a second Quinn endpoint. The
+        // main endpoint remains untouched.
+        let (relay_socket, tunnel) = crate::masque::MasqueRelaySocket::new(
+            raw_streams.send_stream,
+            raw_streams.recv_stream,
+            relay_public_addr,
+            bootstrap_addr,
+            original_socket,
+        );
+
+        let relay_endpoint = match InnerEndpoint::new_with_abstract_socket(
             EndpointConfig::default(),
             server_config,
             relay_socket,
             runtime,
-        )
-        .map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!("Failed to create relay endpoint: {e}"))
-        })?;
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tunnel.shutdown().await;
+                return Err(NatTraversalError::ConnectionFailed(format!(
+                    "Failed to create relay endpoint: {error}"
+                )));
+            }
+        };
 
         info!("Relay endpoint created (relay addr: {})", relay_public_addr);
 
-        let relay_generation = self.next_relay_generation();
-        self.relay_setup_attempted
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut addr) = self.relay_public_addr.lock() {
-            *addr = Some(relay_public_addr);
-        }
-        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
-            peers.clear();
-        }
+        let handle = PreparedRelay::new(relay_public_addr);
         info!(
-            relay_generation,
+            allocation_id = handle.allocation_id,
             relay_addr = %relay_public_addr,
-            "Proactive relay generation established"
+            "Proactive relay allocation prepared"
         );
 
         // Share the relay endpoint between the accept loop and the
         // graceful-close watcher.
         let relay_endpoint = Arc::new(relay_endpoint);
 
-        // Spawn the tunnel-death watcher: when the MASQUE reader task
-        // signals the `Notify`, explicitly close the relay endpoint with a
+        // Spawn the tunnel-death watcher: when the MASQUE reader task exits,
+        // explicitly close the relay endpoint with a
         // meaningful application-level error code.  `Endpoint::close`
         // dispatches a `ConnectionEvent::Close` to every active connection
         // on the endpoint — they emit CONNECTION_CLOSE and shut down
@@ -5167,17 +5703,20 @@ impl NatTraversalEndpoint {
         // cascading errors.  Dropping `relay_endpoint` after `close()` is
         // safe — `EndpointRef::drop` only decrements a refcount.
         {
-            let relay_endpoint = Arc::clone(&relay_endpoint);
+            let relay_endpoint = Arc::downgrade(&relay_endpoint);
+            let tunnel = Arc::clone(&tunnel);
             tokio::spawn(async move {
-                closed_notify.notified().await;
+                tunnel.closed().await;
                 info!(
                     "MASQUE tunnel for relay {} died — closing relay endpoint gracefully",
                     relay_public_addr
                 );
-                relay_endpoint.close(
-                    crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE),
-                    b"relay tunnel lost",
-                );
+                if let Some(relay_endpoint) = relay_endpoint.upgrade() {
+                    relay_endpoint.close(
+                        crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE),
+                        b"relay tunnel lost",
+                    );
+                }
             });
         }
 
@@ -5185,41 +5724,99 @@ impl NatTraversalEndpoint {
         // accepted connections into the shared connections DashMap.
         self.spawn_relay_endpoint_accept_loop(Arc::clone(&relay_endpoint), relay_public_addr);
 
-        // Step 5: Advertise the relay address to all connected peers
-        let mut advertised = 0;
-        for entry in self.connections.iter() {
-            if !self.relay_generation_matches(relay_generation, relay_public_addr) {
-                debug!(
-                    relay_generation,
-                    relay_addr = %relay_public_addr,
-                    "Skipping stale relay advertisement after relay generation changed"
-                );
-                break;
-            }
-            let conn = entry.value().clone();
-            match conn.send_nat_address_advertisement(relay_public_addr, 100) {
-                Ok(_) => {
-                    advertised += 1;
-                    if let Ok(mut peers) = self.relay_advertised_peers.lock() {
-                        peers.insert(*entry.key());
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to advertise relay address to {}: {}",
-                        entry.key(),
-                        e
-                    );
-                }
+        let state = ProactiveRelay {
+            handle,
+            endpoint: relay_endpoint,
+            tunnel,
+            relay_session_owner,
+            cleanup_armed: true,
+        };
+        match self
+            .relay_lifecycle
+            .complete_prepare(generation, state)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?
+        {
+            Ok(()) => {}
+            Err(stale) => {
+                self.teardown_proactive_relay(stale, b"relay acquisition superseded")
+                    .await;
+                return Err(NatTraversalError::ConnectionFailed(
+                    "Relay acquisition was superseded before completion".to_string(),
+                ));
             }
         }
 
-        info!(
-            "Advertised relay address {} to {} peers",
-            relay_public_addr, advertised
-        );
+        Ok(handle)
+    }
 
-        Ok(relay_public_addr)
+    /// Activate a prepared proactive relay after its external canary succeeds.
+    ///
+    /// The opaque allocation identity is checked against the current state so
+    /// a late canary verdict cannot publish a superseded allocation.
+    pub async fn publish_proactive_relay(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Result<(), NatTraversalError> {
+        self.relay_lifecycle
+            .publish(prepared)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?;
+
+        // Relay addresses are intentionally not broadcast through the
+        // connection-level ADD_ADDRESS extension. A relay allocation belongs
+        // to the upper-layer peer identity, not to every existing transport
+        // path. Broadcasting it here causes all connected peers to validate
+        // the fresh relay endpoint at once, competing with real and canary
+        // handshakes. Saorsa-core publishes the canary-verified address through
+        // its authenticated, sequenced PublishAddressSet path instead.
+        info!(
+            allocation_id = prepared.allocation_id,
+            relay_addr = %prepared.public_addr(),
+            "Activated canary-verified proactive relay"
+        );
+        Ok(())
+    }
+
+    /// Abort a prepared or published proactive relay.
+    ///
+    /// A mismatched or already-removed handle is treated as a stale,
+    /// idempotent abort and leaves the current allocation untouched.
+    pub async fn abort_proactive_relay(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Result<(), NatTraversalError> {
+        if let Some(relay) = self
+            .relay_lifecycle
+            .take_matching(prepared)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?
+        {
+            self.teardown_proactive_relay(relay, b"relay allocation aborted")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Legacy eager setup: prepare and immediately publish.
+    ///
+    /// Canary-gated callers should use [`prepare_proactive_relay`](Self::prepare_proactive_relay)
+    /// followed by either [`publish_proactive_relay`](Self::publish_proactive_relay)
+    /// or [`abort_proactive_relay`](Self::abort_proactive_relay).
+    pub async fn setup_proactive_relay(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<SocketAddr, NatTraversalError> {
+        let prepared = self.prepare_proactive_relay(relay_addr).await?;
+        if let Err(error) = self.publish_proactive_relay(prepared).await {
+            let _ = self.abort_proactive_relay(prepared).await;
+            return Err(error);
+        }
+        Ok(prepared.public_addr())
+    }
+
+    async fn teardown_proactive_relay(&self, state: ProactiveRelay, reason: &'static [u8]) {
+        state.teardown(reason).await;
     }
 
     /// Spawn an accept loop for the relay endpoint.
@@ -5750,9 +6347,9 @@ impl NatTraversalEndpoint {
         None
     }
 
-    /// Derive the canonical 32-byte peer fingerprint (`AUTONOMI_PEER_ID_V2`)
-    /// from a connection's authenticated ML-DSA-65 identity, or `None` if the
-    /// peer is not PQC-authenticated.
+    /// Derive the overlay-compatible 32-byte peer ID from a connection's
+    /// authenticated ML-DSA-65 identity, or `None` if the peer is not
+    /// PQC-authenticated.
     ///
     /// This keys relay-port reservations to a cryptographic identity rather
     /// than an ephemeral socket address. The identity comes solely from the
@@ -5761,9 +6358,7 @@ impl NatTraversalEndpoint {
         let spki = Self::extract_public_key_from_connection(connection)?;
         let public_key =
             crate::crypto::raw_public_keys::pqc::extract_public_key_from_spki(&spki).ok()?;
-        Some(crate::crypto::raw_public_keys::pqc::fingerprint_public_key(
-            &public_key,
-        ))
+        Some(*blake3::hash(public_key.as_bytes()).as_bytes())
     }
 
     /// Extract the raw SPKI bytes from a connection's TLS identity.
@@ -5780,6 +6375,11 @@ impl NatTraversalEndpoint {
         self.shutdown.store(true, Ordering::Relaxed);
         self.incoming_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
+
+        if let Some(relay) = self.relay_lifecycle.shutdown().await {
+            self.teardown_proactive_relay(relay, b"endpoint shutdown")
+                .await;
+        }
 
         // Best-effort UPnP teardown. The endpoint is the sole owner of
         // the service (the discovery manager only holds a read-only
@@ -6587,69 +7187,10 @@ impl NatTraversalEndpoint {
         // `reachability::driver`, which calls `setup_proactive_relay`
         // unconditionally after bootstrap via the transport handle.
         //
-        // This function is retained for the re-advertise pass below,
-        // which pushes a previously-acquired relay address to peers
-        // that connected after initial setup.
-        //
         // The deleted auto-setup block walked bootstrap nodes and called
         // `setup_proactive_relay` directly from this event loop; the new
         // acquisition driver in saorsa-core performs the same walk
         // through the XOR-closest set of the DHT instead.
-
-        // Re-advertise relay address to peers that connected after initial setup
-        {
-            let relay_addr = self.relay_public_addr.lock().ok().and_then(|g| *g);
-            if let Some(relay_addr) = relay_addr {
-                let relay_generation = self.current_relay_generation();
-                let unadvertised: Vec<SocketAddr> = {
-                    let advertised = self
-                        .relay_advertised_peers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    self.connections
-                        .iter()
-                        .filter(|e| {
-                            !advertised.contains(e.key()) && e.value().close_reason().is_none()
-                        })
-                        .map(|e| *e.key())
-                        .collect()
-                };
-                if !unadvertised.is_empty() {
-                    info!(
-                        "Relay re-advertise: {} new peers to notify about {}",
-                        unadvertised.len(),
-                        relay_addr
-                    );
-                }
-                for peer_addr in unadvertised {
-                    if !self.relay_generation_matches(relay_generation, relay_addr) {
-                        debug!(
-                            relay_generation,
-                            relay_addr = %relay_addr,
-                            "Relay re-advertise: dropping stale generation"
-                        );
-                        break;
-                    }
-                    if let Some(mut entry) = self.connections.get_mut(&peer_addr) {
-                        match entry
-                            .value_mut()
-                            .send_nat_address_advertisement(relay_addr, 100)
-                        {
-                            Ok(_) => {
-                                info!(
-                                    "Re-advertised relay {} to new peer {}",
-                                    relay_addr, peer_addr
-                                );
-                                if let Ok(mut a) = self.relay_advertised_peers.lock() {
-                                    a.insert(peer_addr);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-            }
-        }
 
         Ok(())
     }
@@ -7651,16 +8192,10 @@ impl NatTraversalEndpoint {
         addr: SocketAddr,
         candidate: &CandidateAddress,
     ) -> Result<(), NatTraversalError> {
-        // After relay setup, suppress automatic candidate advertisements.
-        // The relay address is the only reachable address for this node;
-        // advertising NATted addresses would overwrite it in peers' DHTs.
-        if self
-            .relay_setup_attempted
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.relay_lifecycle.is_published() {
+            debug!("Suppressing ADD_ADDRESS candidate advertisement while a relay is published");
             return Ok(());
         }
-
         debug!(
             "Sending candidate advertisement to {}: {}",
             addr, candidate.address
@@ -7865,6 +8400,225 @@ impl crate::TokenStore for DefaultTokenStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    async fn detached_proactive_relay(public_addr: SocketAddr) -> ProactiveRelay {
+        let endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("test endpoint");
+        let relay_endpoint = Arc::new(endpoint.get_endpoint().expect("transport endpoint").clone());
+        endpoint.shutdown().await.expect("test endpoint shutdown");
+
+        ProactiveRelay {
+            handle: PreparedRelay::new(public_addr),
+            endpoint: relay_endpoint,
+            tunnel: crate::masque::RelayTunnelControl::detached(),
+            relay_session_owner: RelaySessionOwner {
+                relay_server_addr: "127.0.0.1:1".parse().expect("relay server address"),
+                public_address: Some(public_addr),
+                relay_sessions: Arc::new(dashmap::DashMap::new()),
+                stable_id: usize::MAX,
+                cleanup_armed: false,
+            },
+            cleanup_armed: false,
+        }
+    }
+
+    #[test]
+    fn prepared_relay_identity_distinguishes_reused_public_address() {
+        let public_addr = "203.0.113.7:9000".parse().expect("test address");
+        let first = PreparedRelay::detached(public_addr);
+        let first_copy = first;
+        let replacement = PreparedRelay::detached(public_addr);
+
+        assert_eq!(first, first_copy);
+        assert_ne!(first, replacement);
+        assert_eq!(first.public_addr(), replacement.public_addr());
+    }
+
+    #[tokio::test]
+    async fn relay_lifecycle_shutdown_rejects_inflight_and_later_commands() {
+        let lifecycle = RelayLifecycleHandle::new();
+        let (generation, previous) = lifecycle.begin_prepare().await.expect("begin prepare");
+        assert!(previous.is_none());
+
+        assert!(
+            lifecycle.shutdown().await.is_none(),
+            "shutdown before completion has no installed relay to drain"
+        );
+
+        let relay =
+            detached_proactive_relay("203.0.113.10:10000".parse().expect("relay public address"))
+                .await;
+        let prepared = relay.handle;
+        let completion = lifecycle
+            .complete_prepare(generation, relay)
+            .await
+            .expect("lifecycle actor");
+        assert!(
+            completion.is_err(),
+            "an acquisition begun before shutdown must not install afterward"
+        );
+        drop(completion);
+
+        let later_begin = lifecycle.begin_prepare().await;
+        assert!(
+            matches!(later_begin, Err(ref error) if error.contains("shut down")),
+            "prepare after shutdown must be rejected"
+        );
+        let later_publish = lifecycle.publish(prepared).await;
+        assert!(
+            matches!(later_publish, Err(ref error) if error.contains("shut down")),
+            "publish after shutdown must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_lifecycle_shutdown_drains_installed_relay_once() {
+        let lifecycle = RelayLifecycleHandle::new();
+        let relay =
+            detached_proactive_relay("203.0.113.11:10001".parse().expect("relay public address"))
+                .await;
+        let prepared = relay.handle;
+        let (generation, previous) = lifecycle.begin_prepare().await.expect("begin prepare");
+        assert!(previous.is_none());
+        let completion = lifecycle
+            .complete_prepare(generation, relay)
+            .await
+            .expect("lifecycle actor");
+        assert!(completion.is_ok(), "relay must install before shutdown");
+        lifecycle
+            .publish(prepared)
+            .await
+            .expect("publish before shutdown");
+        assert!(lifecycle.is_published());
+
+        let drained = lifecycle
+            .shutdown()
+            .await
+            .expect("shutdown must return installed relay");
+        assert_eq!(drained.handle, prepared);
+        drop(drained);
+        assert!(!lifecycle.is_published());
+        assert!(
+            lifecycle.shutdown().await.is_none(),
+            "terminal shutdown must drain at most once"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_shutdown_rejects_relay_prepare_and_publish() {
+        let endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("test endpoint");
+        endpoint.shutdown().await.expect("endpoint shutdown");
+
+        let prepare = endpoint
+            .prepare_proactive_relay("127.0.0.1:9".parse().expect("relay address"))
+            .await;
+        assert!(
+            matches!(prepare, Err(NatTraversalError::ConnectionFailed(ref error)) if error.contains("shut down")),
+            "public prepare path must reject after shutdown without dialing"
+        );
+
+        let publish = endpoint
+            .publish_proactive_relay(PreparedRelay::detached(
+                "203.0.113.12:10002".parse().expect("relay public address"),
+            ))
+            .await;
+        assert!(
+            matches!(publish, Err(NatTraversalError::ConnectionFailed(ref error)) if error.contains("shut down")),
+            "public publish path must reject after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_session_owner_only_removes_its_exact_session() {
+        let endpoint_config = || NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+            ..Default::default()
+        };
+        let server = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("server endpoint");
+        let client = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("client endpoint");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server transport endpoint")
+            .local_addr()
+            .expect("server address");
+        let server_name = server_addr.ip().to_string();
+
+        let original = client
+            .connect_to(&server_name, server_addr)
+            .await
+            .expect("original connection");
+        let replacement = client
+            .connect_to(&server_name, server_addr)
+            .await
+            .expect("replacement connection");
+        assert_ne!(original.stable_id(), replacement.stable_id());
+
+        let public_addr = Some("203.0.113.7:9000".parse().expect("public address"));
+        let sessions = Arc::new(dashmap::DashMap::new());
+        sessions.insert(
+            server_addr,
+            RelaySession {
+                connection: original.clone(),
+                public_address: public_addr,
+                established_at: std::time::Instant::now(),
+                relay_addr: server_addr,
+            },
+        );
+        let stale_owner = RelaySessionOwner::new(
+            server_addr,
+            public_addr,
+            Arc::clone(&sessions),
+            original.stable_id(),
+        );
+
+        sessions.insert(
+            server_addr,
+            RelaySession {
+                connection: replacement.clone(),
+                public_address: public_addr,
+                established_at: std::time::Instant::now(),
+                relay_addr: server_addr,
+            },
+        );
+        drop(stale_owner);
+
+        let current = sessions.get(&server_addr).expect("replacement retained");
+        assert_eq!(current.connection.stable_id(), replacement.stable_id());
+        drop(current);
+
+        let replacement_owner = RelaySessionOwner::new(
+            server_addr,
+            public_addr,
+            Arc::clone(&sessions),
+            replacement.stable_id(),
+        );
+        drop(replacement_owner);
+        assert!(sessions.is_empty(), "exact owner must remove its session");
+
+        client.shutdown().await.expect("client shutdown");
+        server.shutdown().await.expect("server shutdown");
+    }
 
     #[test]
     fn test_nat_traversal_config_default() {
