@@ -1896,6 +1896,13 @@ impl ConfigValidator for NatTraversalConfig {
             ));
         }
 
+        // Keep-alive intervals are operator-configurable, so the invariants the
+        // defaults satisfy have to hold for supplied values too.
+        self.timeouts
+            .nat_traversal
+            .validate_keep_alive()
+            .map_err(ConfigValidationError::ValueOutOfRange)?;
+
         Ok(())
     }
 }
@@ -3389,6 +3396,68 @@ impl NatTraversalEndpoint {
 
     // Private implementation methods
 
+    /// Resolve the `(dial, accept)` QUIC keep-alive intervals for an endpoint.
+    #[cfg(not(feature = "egress-experiment"))]
+    fn keep_alive_intervals(config: &NatTraversalConfig) -> (Option<Duration>, Option<Duration>) {
+        (
+            config.timeouts.nat_traversal.dial_keep_alive_interval,
+            config.timeouts.nat_traversal.accept_keep_alive_interval,
+        )
+    }
+
+    /// Resolve the `(dial, accept)` QUIC keep-alive intervals for an endpoint.
+    ///
+    /// TEMPORARY (feature `egress-experiment`): lets one process host a
+    /// mixed-cadence fleet so the A/B harness can measure what an un-upgraded
+    /// peer costs. This is the only place the experiment changes behaviour, and
+    /// the `compile_error!` below stops it reaching a release build.
+    /// `SAORSA_KA_EXPERIMENT`:
+    ///
+    /// - `patched` (or unset) — use the configured intervals.
+    /// - `baseline` — restore the pre-change wiring exactly: dial 5 s,
+    ///   accept = `retry_interval`.
+    /// - `mixed:<n>` — baseline when `bind_port % n == 0`, patched otherwise.
+    ///   Requires a resolved bind address; with none, every endpoint reads as
+    ///   port 0 and therefore as baseline, so the harness always sets one.
+    ///
+    /// An unrecognised value is a hard error rather than a silent fallback: a
+    /// typo would otherwise mislabel a whole arm's measurements.
+    #[cfg(feature = "egress-experiment")]
+    fn keep_alive_intervals(config: &NatTraversalConfig) -> (Option<Duration>, Option<Duration>) {
+        let patched = (
+            config.timeouts.nat_traversal.dial_keep_alive_interval,
+            config.timeouts.nat_traversal.accept_keep_alive_interval,
+        );
+        let baseline = (
+            Some(Duration::from_secs(5)),
+            Some(config.timeouts.nat_traversal.retry_interval),
+        );
+        let arm = match std::env::var("SAORSA_KA_EXPERIMENT") {
+            Ok(v) => v,
+            Err(_) => return patched,
+        };
+        match arm.split_once(':') {
+            Some(("mixed", n)) => {
+                let modulus: u16 = n.parse().unwrap_or_else(|_| {
+                    panic!("SAORSA_KA_EXPERIMENT=mixed:<n> needs an integer n, got {n:?}")
+                });
+                let modulus = modulus.max(1);
+                let port = config.bind_addr.map_or_else(
+                    || panic!("SAORSA_KA_EXPERIMENT=mixed:<n> needs a resolved bind address"),
+                    |a| a.port(),
+                );
+                if port % modulus == 0 {
+                    baseline
+                } else {
+                    patched
+                }
+            }
+            _ if arm == "baseline" => baseline,
+            _ if arm == "patched" => patched,
+            _ => panic!("unrecognised SAORSA_KA_EXPERIMENT={arm:?}"),
+        }
+    }
+
     /// Create a QUIC endpoint with NAT traversal configured (async version)
     ///
     /// v0.13.0: role parameter removed - all nodes are symmetric P2P nodes.
@@ -3410,6 +3479,8 @@ impl NatTraversalEndpoint {
         use std::sync::Arc;
 
         const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
+
+        let (dial_keep_alive, accept_keep_alive) = Self::keep_alive_intervals(config);
 
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
         let server_config = {
@@ -3458,9 +3529,15 @@ impl NatTraversalEndpoint {
             // Configure transport parameters for NAT traversal
             let mut transport_config = TransportConfig::default();
             transport_config.enable_address_discovery(true);
-            transport_config
-                .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            // Accepting side. Defaults to `None`: only one side of a connection
+            // needs keep-alive enabled for it to be preserved, and the dialling
+            // side supplies it. This used to be pinned to the NAT
+            // `retry_interval`, which is a different concern entirely.
+            transport_config.keep_alive_interval(accept_keep_alive);
+            transport_config.max_idle_timeout(Some(
+                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
+                    .into(),
+            ));
 
             // Tune QUIC flow-control windows from max_message_size
             let window = varint_from_max_message_size(config.max_message_size);
@@ -3544,8 +3621,14 @@ impl NatTraversalEndpoint {
             // Configure transport parameters for NAT traversal
             let mut transport_config = TransportConfig::default();
             transport_config.enable_address_discovery(true);
-            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            // Dialling side. This is the keep-alive that holds idle connections
+            // (and any NAT binding on either side) open; the accepting side's
+            // ACK response gives the other direction the same cadence.
+            transport_config.keep_alive_interval(dial_keep_alive);
+            transport_config.max_idle_timeout(Some(
+                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
+                    .into(),
+            ));
 
             // Tune QUIC flow-control windows from max_message_size
             let window = varint_from_max_message_size(config.max_message_size);

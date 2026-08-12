@@ -219,6 +219,33 @@ impl PacketBuilder {
             None => return,
         };
 
+        // TEMPORARY (egress keep-alive experiment): attribute the real wire
+        // size, before it is zeroed below for congestion accounting.
+        #[cfg(feature = "egress-metrics")]
+        {
+            use crate::egress_metrics as em;
+            let wire_size = size as u64;
+            if space_id != SpaceId::Data {
+                conn.stats.egress.handshake_bytes_tx += wire_size;
+                conn.stats.egress.handshake_packets_tx += 1;
+                em::add(&em::HANDSHAKE_BYTES_TX, wire_size);
+                em::add(&em::HANDSHAKE_PACKETS_TX, 1);
+            }
+            if sent.is_ack_only(&conn.streams) {
+                conn.stats.egress.ack_only_bytes_tx += wire_size;
+                conn.stats.egress.ack_only_packets_tx += 1;
+                em::add(&em::ACK_ONLY_BYTES_TX, wire_size);
+                em::add(&em::ACK_ONLY_PACKETS_TX, 1);
+            }
+            let stream_bytes: u64 = sent
+                .stream_frames
+                .iter()
+                .map(|f| f.offsets.end.saturating_sub(f.offsets.start))
+                .sum();
+            conn.stats.egress.stream_payload_bytes_tx += stream_bytes;
+            em::add(&em::STREAM_PAYLOAD_BYTES_TX, stream_bytes);
+        }
+
         let size = match padded || ack_eliciting {
             true => size as u16,
             false => 0,

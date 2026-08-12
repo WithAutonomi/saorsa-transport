@@ -63,6 +63,20 @@ arbitrary = ["dep:arbitrary"]
 # Internal QUIC logging
 __qlog = ["dep:qlog"]
 
+# TEMPORARY (egress keep-alive experiment, not for release): per-connection
+# byte attribution counters — handshake bytes, ACK-only datagrams, STREAM
+# payload bytes. Observation only: enabling this does NOT change any transport
+# behaviour.
+egress-metrics = []
+
+# TEMPORARY (egress keep-alive experiment, not for release): lets
+# SAORSA_KA_EXPERIMENT override the keep-alive intervals at runtime so one
+# process can host a mixed-cadence fleet. This DOES change transport
+# behaviour and is deliberately a separate feature from `egress-metrics` so
+# `--all-features` on a release build cannot silently pick it up — see the
+# `compile_error!` guard in nat_traversal_api.rs.
+egress-experiment = ["egress-metrics"]
+
 # Zero-cost tracing system
 trace = []
 trace-full = ["trace"]

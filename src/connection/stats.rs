@@ -178,6 +178,26 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Per-connection egress byte attribution.
+///
+/// TEMPORARY: gated behind the `egress-metrics` feature for the keep-alive
+/// experiment. Not compiled into production builds.
+#[cfg(feature = "egress-metrics")]
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct EgressStats {
+    /// Bytes sent in Initial and Handshake packet number spaces.
+    pub handshake_bytes_tx: u64,
+    /// Packets sent in Initial and Handshake packet number spaces.
+    pub handshake_packets_tx: u64,
+    /// Bytes sent in packets carrying only ACK frames.
+    pub ack_only_bytes_tx: u64,
+    /// Packets sent carrying only ACK frames.
+    pub ack_only_packets_tx: u64,
+    /// STREAM frame payload bytes put on the wire, retransmissions included.
+    pub stream_payload_bytes_tx: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -194,6 +214,9 @@ pub struct ConnectionStats {
     pub path: PathStats,
     /// Statistics about application datagrams dropped due to receive buffer overflow
     pub datagram_drops: DatagramDropStats,
+    /// TEMPORARY egress byte attribution for the keep-alive experiment.
+    #[cfg(feature = "egress-metrics")]
+    pub egress: EgressStats,
 }
 
 /// Aggregated statistics about dropped application datagrams

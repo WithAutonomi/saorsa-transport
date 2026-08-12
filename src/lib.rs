@@ -173,6 +173,18 @@ pub mod node_event;
 pub mod config;
 /// QUIC connection state machine and management
 pub mod connection;
+/// TEMPORARY process-wide egress attribution counters (keep-alive experiment)
+#[cfg(feature = "egress-metrics")]
+pub mod egress_metrics;
+// The `egress-experiment` feature makes keep-alive intervals settable from the
+// environment at runtime. That is a test-harness affordance and must never be
+// compiled into a shipped binary, so fail the build rather than rely on a
+// comment saying so. `debug_assertions` is off in release profiles.
+#[cfg(all(feature = "egress-experiment", not(debug_assertions)))]
+compile_error!(
+    "feature `egress-experiment` changes keep-alive behaviour from the environment \
+     and must not be enabled in a release build"
+);
 /// QUIC endpoint for accepting and initiating connections
 pub mod endpoint;
 /// QUIC frame types and encoding/decoding

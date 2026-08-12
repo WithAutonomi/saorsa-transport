@@ -1371,6 +1371,12 @@ impl Connection {
     fn account_udp_transmit(&mut self, datagrams: u64, bytes: usize) {
         self.path.total_sent = self.path.total_sent.saturating_add(bytes as u64);
         self.stats.udp_tx.on_sent(datagrams, bytes);
+        #[cfg(feature = "egress-metrics")]
+        {
+            use crate::egress_metrics as em;
+            em::add(&em::UDP_TX_DATAGRAMS, datagrams);
+            em::add(&em::UDP_TX_BYTES, bytes as u64);
+        }
     }
 
     /// Send PUNCH_ME_NOW for coordination if necessary
@@ -1738,6 +1744,12 @@ impl Connection {
 
                 self.stats.udp_rx.datagrams += 1;
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
+                #[cfg(feature = "egress-metrics")]
+                {
+                    use crate::egress_metrics as em;
+                    em::add(&em::UDP_RX_DATAGRAMS, 1);
+                    em::add(&em::UDP_RX_BYTES, first_decode.len() as u64);
+                }
                 let data_len = first_decode.len();
 
                 self.handle_decode(now, remote, ecn, first_decode);
@@ -1749,6 +1761,11 @@ impl Connection {
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
+                    #[cfg(feature = "egress-metrics")]
+                    crate::egress_metrics::add(
+                        &crate::egress_metrics::UDP_RX_BYTES,
+                        data.len() as u64,
+                    );
                     self.handle_coalesced(now, remote, ecn, data);
                 }
 
@@ -1805,6 +1822,15 @@ impl Connection {
                     self.endpoint_events.push_back(EndpointEventInner::Drained);
                 }
                 Timer::Idle => {
+                    // TEMPORARY (keep-alive experiment): a connection dying of
+                    // idle timeout is the only mechanism by which a longer
+                    // keep-alive could break anything. Count and log it so the
+                    // question is answered directly rather than statistically.
+                    #[cfg(feature = "egress-metrics")]
+                    {
+                        crate::egress_metrics::add(&crate::egress_metrics::IDLE_TIMEOUT_CLOSES, 1);
+                        tracing::warn!("KA-IDLE-TIMEOUT-CLOSE");
+                    }
                     self.kill(ConnectionError::TimedOut);
                 }
                 Timer::KeepAlive => {
@@ -2418,6 +2444,12 @@ impl Connection {
             self.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
+            #[cfg(feature = "egress-metrics")]
+            {
+                use crate::egress_metrics as em;
+                em::add(&em::LOST_PACKETS, lost_packets.len() as u64);
+                em::add(&em::LOST_BYTES, size_of_lost_packets);
+            }
             trace!(
                 "packets lost: {:?}, bytes lost: {}",
                 lost_packets, size_of_lost_packets
@@ -4105,6 +4137,8 @@ impl Connection {
             encode_or_close!(frame::FrameType::PING.try_encode(buf), "PING");
             sent.non_retransmits = true;
             self.stats.frame_tx.ping += 1;
+            #[cfg(feature = "egress-metrics")]
+            crate::egress_metrics::add(&crate::egress_metrics::PING_TX, 1);
         }
 
         // IMMEDIATE_ACK
