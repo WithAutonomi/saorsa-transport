@@ -104,7 +104,7 @@ indexmap = "2.0"
 lru-slab = "0.1.2"
 
 # Bootstrap cache dependencies
-dirs = "5.0"
+dirs = "6.0"
 
 # Platform keychain/keyring for secure credential storage
 keyring = "3"
