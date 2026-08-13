@@ -60,9 +60,13 @@ pub struct NatTraversalTimeouts {
     pub accept_keep_alive_interval: Option<Duration>,
 }
 
-/// Default keep-alive interval for dialled connections (15 s).
+/// Default keep-alive interval for dialled connections (10 s).
+///
+/// Tracks the shipped default on `fix/keepalive-dial-accept-split` so the A/B
+/// harness measures the cadence that actually ships. The rationale for 10 s
+/// over 15 s is NAT mapping headroom; see ADR-012 on that branch.
 fn default_dial_keep_alive_interval() -> Option<Duration> {
-    Some(Duration::from_secs(15))
+    Some(Duration::from_secs(10))
 }
 
 /// Default keep-alive interval for accepted connections (disabled).
