@@ -28,7 +28,7 @@ const BASELINE_DIAL: Option<Duration> = Some(Duration::from_secs(5));
 const BASELINE_ACCEPT: Option<Duration> = Some(Duration::from_secs(2));
 
 /// Post-change wiring.
-const PATCHED_DIAL: Option<Duration> = Some(Duration::from_secs(15));
+const PATCHED_DIAL: Option<Duration> = Some(Duration::from_secs(10));
 const PATCHED_ACCEPT: Option<Duration> = None;
 
 /// IPv4 + UDP header bytes, added per datagram to turn QUIC payload bytes into
