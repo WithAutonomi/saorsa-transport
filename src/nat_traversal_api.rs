@@ -3458,9 +3458,16 @@ impl NatTraversalEndpoint {
             // Configure transport parameters for NAT traversal
             let mut transport_config = TransportConfig::default();
             transport_config.enable_address_discovery(true);
-            transport_config
-                .keep_alive_interval(Some(config.timeouts.nat_traversal.retry_interval));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            // Accepting side: no keep-alive. Only one side of a connection needs
+            // one — a keep-alive is ack-eliciting, so the peer answers it and
+            // both idle timers reset — and the dialling peer supplies it. This
+            // used to be `retry_interval`, which is the NAT *retry* cadence and
+            // an unrelated concern that happens to live in the same struct.
+            transport_config.keep_alive_interval(None);
+            transport_config.max_idle_timeout(Some(
+                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
+                    .into(),
+            ));
 
             // Tune QUIC flow-control windows from max_message_size
             let window = varint_from_max_message_size(config.max_message_size);
@@ -3544,8 +3551,17 @@ impl NatTraversalEndpoint {
             // Configure transport parameters for NAT traversal
             let mut transport_config = TransportConfig::default();
             transport_config.enable_address_discovery(true);
-            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-            transport_config.max_idle_timeout(Some(crate::VarInt::from_u32(30000).into()));
+            // Dialling side: the only keep-alive on the connection. The peer's
+            // ACK is an outbound packet there too, so both directions put a
+            // packet on the wire roughly once per interval — roughly, because
+            // the timer re-arms on receive as well as send, so each cycle drifts
+            // out by about a round trip.
+            transport_config
+                .keep_alive_interval(Some(crate::config::nat_timeouts::DIAL_KEEP_ALIVE_INTERVAL));
+            transport_config.max_idle_timeout(Some(
+                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
+                    .into(),
+            ));
 
             // Tune QUIC flow-control windows from max_message_size
             let window = varint_from_max_message_size(config.max_message_size);
@@ -7371,7 +7387,8 @@ impl NatTraversalEndpoint {
                         // Wake the connection driver immediately so the queued
                         // PUNCH_ME_NOW frame is transmitted without waiting for
                         // the next keep-alive or scheduled poll. Without this,
-                        // idle connections delay transmission by up to 15s.
+                        // idle connections delay transmission by up to one
+                        // keep-alive interval.
                         conn.wake_transmit();
                         info!(
                             "Successfully queued PUNCH_ME_NOW for relay to {}",

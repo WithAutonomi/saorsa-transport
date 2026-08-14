@@ -35,6 +35,36 @@ pub struct NatTraversalTimeouts {
     pub session_timeout: Duration,
 }
 
+/// QUIC keep-alive interval for connections this node dials.
+///
+/// Only the dialling side sends keep-alives. One side is enough: a keep-alive
+/// is ack-eliciting, so the peer answers it, both idle timers reset, and each
+/// side puts a packet on the wire once per interval — which is also what
+/// refreshes a NAT mapping for that five-tuple.
+///
+/// 10 s rather than the 5 s + 2 s pair it replaces. Because any traffic resets
+/// both timers, the old arrangement ran at whichever interval was shorter, so
+/// the effective cadence was the accepting side's 2 s and the interval is the
+/// only real lever on idle egress. Measured on a 25-node testnet, moving to
+/// 10 s takes idle egress from 29.8 to 6.1 B/s per connection endpoint.
+///
+/// The constraint on going further is NAT mapping lifetime, not the QUIC idle
+/// timeout: RFC 4787 requires two minutes but 20-30 s middleboxes are reported
+/// in the field, and if a mapping lapses the keep-alive is dropped before it
+/// can provoke the ACK that would have refreshed it. 10 s is deliberately below
+/// RFC 8085's 15 s floor for general-Internet keep-alives, for that reason.
+pub(crate) const DIAL_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// `max_idle_timeout` applied to every QUIC connection this crate creates.
+///
+/// Named here so the two endpoint configuration sites cannot drift apart, and
+/// so the keep-alive above has something to be read against.
+///
+/// Crate-private on purpose: these are internal wiring values, not API. The
+/// integration test asserts the literals it expects rather than importing
+/// these, so a wrong constant fails the test instead of moving it.
+pub(crate) const QUIC_MAX_IDLE_TIMEOUT_MS: u32 = 30_000;
+
 impl Default for NatTraversalTimeouts {
     fn default() -> Self {
         Self {
