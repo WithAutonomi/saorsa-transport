@@ -21,6 +21,7 @@ ADRs document significant architectural decisions made in the project. Each reco
 | [ADR-009](ADR-009-masque-relay-data-plane.md) | MASQUE Relay Data Plane Implementation | Accepted | 2026-03-29 |
 | [ADR-010](ADR-010-repository-ownership.md) | Repository Ownership under WithAutonomi | Accepted | 2026-05-29 |
 | [ADR-011](ADR-011-stable-relay-port-reservations.md) | Stable Relay Port Reservations (Authenticated, Leased) | Proposed | 2026-06-24 |
+| [ADR-012](ADR-012-keep-alive-dial-accept-split.md) | Keep-Alive on the Dialling Side Only | Proposed | 2026-08-14 |
 
 ## ADR Template
 
