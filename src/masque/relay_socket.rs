@@ -45,7 +45,7 @@ use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -107,25 +107,139 @@ pub struct RawRelayStreams {
 /// Aborting the reader and writer tasks drops their QUIC stream halves, which
 /// promptly tells the relay server to close the associated MASQUE session and
 /// release its capacity slot. Shutdown is idempotent.
+///
+/// A tunnel can end because it broke or because we dismantled it, and the layers
+/// above need to tell those apart: the first is a transport failure the backing
+/// endpoint must hear about, the second is routine. [`is_closed`](Self::is_closed)
+/// is true either way; [`shutdown_requested`](Self::shutdown_requested) only for
+/// the second.
 #[derive(Debug)]
 pub(crate) struct RelayTunnelControl {
     tasks: PlMutex<Vec<tokio::task::JoinHandle<()>>>,
+    state: Arc<TunnelState>,
+}
+
+/// The tunnel facts that outlive any one owner.
+///
+/// Held by the control, by the [`MasqueRelaySocket`] it owns, and by the tunnel
+/// tasks. Sharing it strongly rather than reaching back through a
+/// `Weak<RelayTunnelControl>` matters: the dial-through path in `p2p_endpoint`
+/// drops its control as soon as the dial completes while the socket and its
+/// tasks live on, and a task that could not record its exit there would leave a
+/// parked poller waiting forever.
+#[derive(Debug)]
+struct TunnelState {
+    /// Why the tunnel stopped carrying traffic. Holds a [`TunnelCause`].
+    cause: AtomicU8,
+    /// Woken once `cause` settles.
     closed: Notify,
-    is_closed: AtomicBool,
+    /// Whether the writer has stopped, so nothing more can leave the tunnel.
+    /// Distinct from the tunnel being closed: the relay's two stream halves are
+    /// independent, so a peer that resets only its server-to-client half leaves
+    /// the writer able to flush a queued CONNECTION_CLOSE.
+    writer_stopped: AtomicBool,
+    /// Woken when the outbound queue frees a slot, and when nothing will ever
+    /// free one again. A [`TunnelPoller`] parked on a full send queue is
+    /// normally released by the writer draining a slot; when the writer is
+    /// aborted instead, shutdown and the writer's own guard wake it here.
+    send_capacity_freed: Notify,
+}
+
+/// Why a tunnel stopped carrying traffic.
+///
+/// Settled by compare-exchange, so the **first** transition out of
+/// [`TunnelCause::Live`] wins. A tunnel that broke and was then cleaned up stays
+/// classified as a failure; otherwise cleanup arriving a moment later would
+/// silence the fault that triggered it.
+///
+/// A `u8` so it can live in an `AtomicU8` alongside the rest of [`TunnelState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TunnelCause {
+    Live = 0,
+    Failed = 1,
+    ShutdownRequested = 2,
+}
+
+impl TunnelState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cause: AtomicU8::new(TunnelCause::Live as u8),
+            closed: Notify::new(),
+            writer_stopped: AtomicBool::new(false),
+            send_capacity_freed: Notify::new(),
+        })
+    }
+
+    /// Settle the terminal cause, if it has not already settled.
+    ///
+    /// Losing the race is normal and not an error: it means something else ended
+    /// the tunnel first, and that first cause is the true one.
+    fn settle(&self, cause: TunnelCause) {
+        if self
+            .cause
+            .compare_exchange(
+                TunnelCause::Live as u8,
+                cause as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.closed.notify_waiters();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.cause.load(Ordering::Acquire) != TunnelCause::Live as u8
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.cause.load(Ordering::Acquire) == TunnelCause::ShutdownRequested as u8
+    }
+
+    fn writer_stopped(&self) -> bool {
+        self.writer_stopped.load(Ordering::Acquire)
+    }
+
+    /// Record that the writer has stopped and release anything waiting on it.
+    ///
+    /// The cause settles first so that a writer which broke on its own is filed
+    /// as a failure before a concurrent teardown can claim the tunnel as
+    /// intentionally dismantled.
+    fn mark_writer_stopped(&self, cause: TunnelCause) {
+        self.settle(cause);
+        self.writer_stopped.store(true, Ordering::Release);
+        self.send_capacity_freed.notify_waiters();
+    }
+}
+
+/// Records the writer's exit exactly once, on whatever path ends it.
+///
+/// Held by the writer future, so it also runs when the task is aborted, even
+/// before its first poll, since the guard is created before the spawn.
+struct WriterExit(Arc<TunnelState>);
+
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        // `Failed` loses to a cause already settled, which is the point: a
+        // writer aborted by shutdown must not overwrite `ShutdownRequested`, and
+        // one aborted after a reader failure must not overwrite `Failed`.
+        self.0.mark_writer_stopped(TunnelCause::Failed);
+    }
 }
 
 impl RelayTunnelControl {
-    fn new() -> Arc<Self> {
+    fn new(state: Arc<TunnelState>) -> Arc<Self> {
         Arc::new(Self {
             tasks: PlMutex::new(Vec::new()),
-            closed: Notify::new(),
-            is_closed: AtomicBool::new(false),
+            state,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn detached() -> Arc<Self> {
-        Self::new()
+        Self::new(TunnelState::new())
     }
 
     fn register(&self, handle: tokio::task::JoinHandle<()>) {
@@ -142,15 +256,23 @@ impl RelayTunnelControl {
         }
     }
 
-    fn mark_closed(&self) {
-        if !self.is_closed.swap(true, Ordering::AcqRel) {
-            self.closed.notify_waiters();
-        }
+    /// Record that the tunnel broke rather than being dismantled on request.
+    ///
+    /// Called by the tunnel tasks when their stream fails, and by the relay
+    /// health monitor before it tears down a relay it has found dead.
+    pub(crate) fn mark_failed(&self) {
+        self.state.settle(TunnelCause::Failed);
     }
 
     /// Returns whether the tunnel has failed or has been explicitly shut down.
     pub(crate) fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Acquire)
+        self.state.is_closed()
+    }
+
+    /// Returns whether this tunnel was dismantled by a local shutdown request
+    /// rather than by a transport failure.
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.state.shutdown_requested()
     }
 
     /// Wait until the tunnel reader exits or shutdown is requested.
@@ -159,7 +281,7 @@ impl RelayTunnelControl {
             if self.is_closed() {
                 return;
             }
-            let notified = self.closed.notified();
+            let notified = self.state.closed.notified();
             if self.is_closed() {
                 return;
             }
@@ -185,7 +307,18 @@ impl RelayTunnelControl {
     }
 
     fn abort_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        self.mark_closed();
+        // Record everything before aborting anything. `settle` releases the
+        // tunnel-death watcher and unblocks `poll_recv`, and the writer state
+        // releases a parked `TunnelPoller`; all three must already be able to
+        // see that this teardown was asked for rather than suffered.
+        //
+        // The writer's own `WriterExit` guard does the same, but only once the
+        // abort lands, and `JoinHandle::abort` is asynchronous. Doing it here
+        // means a parked poller is not waiting on a cancellation to complete: it
+        // re-checks the writer state, not the send channel, which is typically
+        // still open at this point.
+        self.state
+            .mark_writer_stopped(TunnelCause::ShutdownRequested);
         let handles = {
             let mut tasks = self.tasks.lock();
             std::mem::take(&mut *tasks)
@@ -194,12 +327,6 @@ impl RelayTunnelControl {
             handle.abort();
         }
         handles
-    }
-}
-
-fn mark_writer_exit(control: &Weak<RelayTunnelControl>) {
-    if let Some(control) = control.upgrade() {
-        control.mark_closed();
     }
 }
 
@@ -222,12 +349,6 @@ pub struct MasqueRelaySocket {
     /// Bounded channel for outbound packets (drained by the background
     /// writer task into the relay send stream).
     send_tx: mpsc::Sender<Bytes>,
-    /// Notified once after every item the writer task drains from
-    /// `send_tx`.  Pollers parked on a full queue re-check capacity
-    /// after each notification.  `notify_one` is used (not
-    /// `notify_waiters`) so a drain that races with a poller entering
-    /// the wait state stores a permit, avoiding lost wakeups.
-    send_capacity_freed: Arc<Notify>,
     /// Per-target maximum payload size enforced by [`Self::try_send`],
     /// populated by [`TunnelControlFrame::PmtuUpdate`] frames decoded by
     /// the reader task.  When a destination has an entry, any
@@ -237,6 +358,11 @@ pub struct MasqueRelaySocket {
     /// converges to the true egress path MTU.  Targets without an
     /// entry are unconstrained by this layer (Quinn governs sizing).
     target_mtu: Arc<DashMap<SocketAddr, u16>>,
+    /// The tunnel facts, shared with the [`RelayTunnelControl`] that owns the
+    /// tunnel tasks. `poll_recv` reads the cause to tell "we dismantled this"
+    /// from "this broke", and the poller reads the writer state to know whether
+    /// waiting for send capacity is still worth anything.
+    state: Arc<TunnelState>,
     /// The original socket is kept alive so the relay connection's own
     /// QUIC traffic (keepalives, ACKs, stream data) continues to flow
     /// directly.  Without this reference the OS may reclaim the socket.
@@ -286,8 +412,8 @@ impl MasqueRelaySocket {
     ) -> (Arc<Self>, Arc<RelayTunnelControl>) {
         let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(SEND_QUEUE_CAPACITY);
         let (recv_tx, recv_rx) = mpsc::channel::<(Bytes, SocketAddr)>(RECV_QUEUE_CAPACITY);
-        let control = RelayTunnelControl::new();
-        let send_capacity_freed = Arc::new(Notify::new());
+        let state = TunnelState::new();
+        let control = RelayTunnelControl::new(Arc::clone(&state));
 
         let target_mtu: Arc<DashMap<SocketAddr, u16>> = Arc::new(DashMap::new());
         let target_mtu_reader = Arc::clone(&target_mtu);
@@ -296,7 +422,7 @@ impl MasqueRelaySocket {
             relay_public_addr,
             recv_rx: PlMutex::new(recv_rx),
             send_tx: send_tx.clone(),
-            send_capacity_freed: Arc::clone(&send_capacity_freed),
+            state: Arc::clone(&state),
             target_mtu,
             _original_socket: original_socket,
         });
@@ -403,15 +529,18 @@ impl MasqueRelaySocket {
             // Signal the owner before the endpoint driver is dropped so it
             // can gracefully close connections accepted through the tunnel.
             if let Some(control) = weak_control.upgrade() {
-                control.mark_closed();
+                control.mark_failed();
             }
         });
         control.register(reader_handle);
 
         // Background task: write queued outbound packets to relay stream.
-        let writer_capacity = Arc::clone(&send_capacity_freed);
-        let writer_control = Arc::downgrade(&control);
+        let writer_capacity = Arc::clone(&state);
+        // Created before the spawn so an abort that lands before the future's
+        // first poll still records the exit.
+        let writer_exit = WriterExit(Arc::clone(&state));
         let writer_handle = tokio::spawn(async move {
+            let _writer_exit = writer_exit;
             while let Some(encoded) = send_rx.recv().await {
                 // `recv` completing means the channel just freed a
                 // slot.  Wake any poller parked on full-queue
@@ -422,7 +551,7 @@ impl MasqueRelaySocket {
                 let mut batch =
                     Vec::with_capacity(encoded.len().saturating_add(std::mem::size_of::<u32>()));
                 append_relay_frame(&mut batch, &encoded);
-                writer_capacity.notify_one();
+                writer_capacity.send_capacity_freed.notify_one();
 
                 let mut frames = 1usize;
                 while frames < RELAY_STREAM_BATCH_MAX_FRAMES
@@ -431,7 +560,7 @@ impl MasqueRelaySocket {
                     match send_rx.try_recv() {
                         Ok(next) => {
                             append_relay_frame(&mut batch, &next);
-                            writer_capacity.notify_one();
+                            writer_capacity.send_capacity_freed.notify_one();
                             frames += 1;
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -445,15 +574,10 @@ impl MasqueRelaySocket {
                 }
             }
             // Writer exited (stream error or receiver dropped). Dropping
-            // `send_rx` closes the channel so subsequent `try_send`
-            // calls fail fast with `Closed` instead of filling a queue
-            // that nobody will drain. Wake any poller currently parked
-            // on `send_capacity_freed`: it will re-check, observe the closed
-            // channel via `is_closed`, and surface the failure instead
-            // of waiting forever.
+            // `send_rx` closes the channel so subsequent `try_send` calls fail
+            // fast with `Closed` instead of filling a queue nobody will drain.
+            // `_writer_exit` then records the exit and wakes parked pollers.
             drop(send_rx);
-            writer_capacity.notify_waiters();
-            mark_writer_exit(&writer_control);
         });
         control.register(writer_handle);
 
@@ -480,6 +604,30 @@ impl MasqueRelaySocket {
         (socket, control)
     }
 
+    /// Whether a [`TunnelPoller`] should stop waiting for send capacity.
+    ///
+    /// The writer state is checked alongside the channel state because shutdown
+    /// publishes it *before* aborting the writer, whereas the channel's closure
+    /// trails the abort and arrives with no notification of its own. A poller
+    /// that consulted only the channel could wake to one still full and open,
+    /// re-park, and never be woken again.
+    ///
+    /// Every `true` here must be matched by a non-`WouldBlock` result from
+    /// [`enqueue_outbound`](Self::enqueue_outbound): Quinn retries a `WouldBlock`
+    /// immediately and without yielding, so claiming writability and then
+    /// refusing the datagram spins the connection driver instead of parking it.
+    fn writable_or_finished(&self) -> bool {
+        self.send_tx.capacity() > 0 || self.send_tx.is_closed() || self.state.writer_stopped()
+    }
+
+    /// Whether the outbound send channel is still open. Lets the teardown test
+    /// assert that a poller was released by the writer state rather than by the
+    /// channel closing.
+    #[cfg(test)]
+    pub(crate) fn send_channel_open(&self) -> bool {
+        !self.send_tx.is_closed()
+    }
+
     /// Remaining capacity in the outbound send channel.  Exposed for
     /// tests and metrics — a sustained value of 0 means the tunnel
     /// stream can't keep up with Quinn's offered load and the poller
@@ -500,10 +648,20 @@ impl MasqueRelaySocket {
     fn enqueue_outbound(&self, encoded: Bytes) -> io::Result<()> {
         match self.send_tx.try_send(encoded) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "relay send queue full",
-            )),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if self.state.writer_stopped() {
+                    // This queue will never drain, and `writable_or_finished`
+                    // has already told Quinn the socket is writable, so
+                    // `WouldBlock` here would put it into an immediate,
+                    // unyielding retry. Drop the datagram instead — which is
+                    // what an undeliverable packet is.
+                    return Ok(());
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "relay send queue full",
+                ))
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "relay stream closed",
@@ -618,6 +776,21 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                     // packets in this poll; otherwise deliver what we
                     // have and let the next poll see the closed state.
                     if filled == 0 {
+                        if self.state.shutdown_requested() {
+                            // We dismantled this tunnel ourselves, so nothing
+                            // failed. An I/O error here would end the endpoint
+                            // driver through its failure path: logged at ERROR,
+                            // and its `Drop` clears the connection senders
+                            // instead of letting the endpoint retire once its
+                            // last handle goes away.
+                            //
+                            // Park instead. Nothing can arrive on a torn-down
+                            // tunnel, and the driver keeps its other wakers —
+                            // the endpoint-event channel and the explicit wake
+                            // `EndpointRef::drop` issues at refcount zero — so
+                            // it still retires with `Ok(())`.
+                            return Poll::Pending;
+                        }
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "relay recv stream closed",
@@ -681,11 +854,11 @@ impl UdpPoller for TunnelPoller {
         // freely take `&mut self` out of the `Pin`.
         let this = self.get_mut();
 
-        // Fast path: capacity is available right now, or the channel
-        // is closed (writer task exited — return Ready so Quinn
-        // attempts a `try_send`, which surfaces the failure as
-        // `ConnectionAborted`).
-        if this.socket.send_tx.capacity() > 0 || this.socket.send_tx.is_closed() {
+        // Fast path: capacity is available right now, the channel is closed
+        // (writer task exited — return Ready so Quinn attempts a `try_send`,
+        // which surfaces the failure as `ConnectionAborted`), or the tunnel has
+        // ended and no drain is ever coming.
+        if this.socket.writable_or_finished() {
             this.wait = None;
             return Poll::Ready(Ok(()));
         }
@@ -705,15 +878,15 @@ impl UdpPoller for TunnelPoller {
                     // last check and `enable`, `enable` stashes the
                     // permit and the subsequent `.await` returns
                     // immediately.
-                    let notified = socket.send_capacity_freed.notified();
+                    let notified = socket.state.send_capacity_freed.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
 
-                    if socket.send_tx.capacity() > 0 || socket.send_tx.is_closed() {
+                    if socket.writable_or_finished() {
                         return;
                     }
                     notified.await;
-                    if socket.send_tx.capacity() > 0 || socket.send_tx.is_closed() {
+                    if socket.writable_or_finished() {
                         return;
                     }
                     // Spurious wake (e.g., another poller consumed the
@@ -735,7 +908,7 @@ impl UdpPoller for TunnelPoller {
 
 #[cfg(test)]
 mod relay_tunnel_control_tests {
-    use super::{RelayTunnelControl, mark_writer_exit};
+    use super::{RelayTunnelControl, TunnelState, WriterExit};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -749,7 +922,7 @@ mod relay_tunnel_control_tests {
 
     #[tokio::test]
     async fn shutdown_aborts_registered_tasks_and_wakes_waiters() {
-        let control = RelayTunnelControl::new();
+        let control = RelayTunnelControl::detached();
         let dropped = Arc::new(AtomicBool::new(false));
         let marker = DropMarker(Arc::clone(&dropped));
         control.register(tokio::spawn(async move {
@@ -772,7 +945,7 @@ mod relay_tunnel_control_tests {
 
     #[tokio::test]
     async fn shutdown_is_idempotent() {
-        let control = RelayTunnelControl::new();
+        let control = RelayTunnelControl::detached();
 
         control.shutdown().await;
         control.shutdown().await;
@@ -782,7 +955,7 @@ mod relay_tunnel_control_tests {
 
     #[tokio::test]
     async fn shutdown_now_aborts_registered_tasks_without_an_await() {
-        let control = RelayTunnelControl::new();
+        let control = RelayTunnelControl::detached();
         let dropped = Arc::new(AtomicBool::new(false));
         let marker = DropMarker(Arc::clone(&dropped));
         control.register(tokio::spawn(async move {
@@ -804,11 +977,69 @@ mod relay_tunnel_control_tests {
     }
 
     #[test]
-    fn writer_exit_marks_tunnel_closed() {
-        let control = RelayTunnelControl::new();
+    fn writer_exit_marks_the_tunnel_failed_not_shut_down() {
+        let control = RelayTunnelControl::detached();
 
-        mark_writer_exit(&Arc::downgrade(&control));
+        drop(WriterExit(Arc::clone(&control.state)));
+
+        assert!(control.is_closed(), "a writer exit ends the tunnel");
+        assert!(
+            !control.shutdown_requested(),
+            "a tunnel that broke on its own was not dismantled by us"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_records_that_the_teardown_was_requested() {
+        let control = RelayTunnelControl::detached();
+
+        control.shutdown().await;
 
         assert!(control.is_closed());
+        assert!(control.shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn a_writer_exit_is_recorded_even_after_its_control_is_dropped() {
+        // The dial-through path in `p2p_endpoint` discards its control as soon
+        // as the dial completes, while the socket and the tunnel tasks live on.
+        // A writer that could not record its exit there would leave a poller
+        // parked on a full send queue waiting forever.
+        let control = RelayTunnelControl::detached();
+        let state: Arc<TunnelState> = Arc::clone(&control.state);
+        let exit = WriterExit(Arc::clone(&state));
+
+        let waiter = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.send_capacity_freed.notified().await }
+        });
+        tokio::task::yield_now().await;
+
+        drop(control);
+        drop(exit);
+
+        assert!(state.writer_stopped(), "the writer's exit is recorded");
+        assert!(state.is_closed(), "and it ends the tunnel");
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a parked capacity waiter must be released by the writer's exit")
+            .expect("waiter task");
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_a_failure_does_not_reclassify_it_as_requested() {
+        // Cleanup routinely arrives after a tunnel has already broken — the
+        // health monitor calls `shutdown` on tunnels it finds dead. That must
+        // not rewrite the record, or it silences the fault that triggered it.
+        let control = RelayTunnelControl::detached();
+
+        control.mark_failed();
+        control.shutdown().await;
+
+        assert!(control.is_closed());
+        assert!(
+            !control.shutdown_requested(),
+            "cleanup arriving after a failure must not silence the failure"
+        );
     }
 }

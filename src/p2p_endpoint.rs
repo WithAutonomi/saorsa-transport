@@ -4028,26 +4028,33 @@ impl P2pEndpoint {
                 // Monitor relay health. If the relay session died (connection
                 // closed, server restarted, etc.), tear down its one lifecycle
                 // state so the upper layer can acquire a replacement.
-                if relay_event_sent && !inner.is_relay_healthy().await {
-                    let dead = inner.published_relay_handle().await;
-                    if let Some(prepared) = dead {
-                        if let Err(error) = inner.abort_proactive_relay(prepared).await {
-                            warn!(
-                                relay_addr = %prepared.public_addr(),
-                                %error,
-                                "Failed to tear down unhealthy proactive relay"
-                            );
-                        }
+                // One verdict that names the relay it is about. Asking whether
+                // the relay is healthy and then asking separately which relay is
+                // published would let a replacement publish in between, and this
+                // would tear down the healthy replacement.
+                let dead = if relay_event_sent {
+                    inner.unhealthy_published_relay().await
+                } else {
+                    None
+                };
+                if let Some(prepared) = dead {
+                    // The unhealthy path, so the teardown does not file this
+                    // failure as an intentional shutdown.
+                    if let Err(error) = inner.abort_unhealthy_proactive_relay(prepared).await {
+                        warn!(
+                            relay_addr = %prepared.public_addr(),
+                            %error,
+                            "Failed to tear down unhealthy proactive relay"
+                        );
                     }
                     relay_event_sent = false;
-                    if let Some(prepared) = dead {
-                        let relay_addr = prepared.public_addr();
-                        info!(
-                            "Relay tunnel at {} is unhealthy — emitting RelayLost event",
-                            relay_addr
-                        );
-                        let _ = event_tx_for_nat.send(P2pEvent::RelayLost { relay_addr });
-                    }
+
+                    let relay_addr = prepared.public_addr();
+                    info!(
+                        "Relay tunnel at {} is unhealthy — emitting RelayLost event",
+                        relay_addr
+                    );
+                    let _ = event_tx_for_nat.send(P2pEvent::RelayLost { relay_addr });
                 }
             }
         });
