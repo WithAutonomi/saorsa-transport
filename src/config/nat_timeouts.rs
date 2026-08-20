@@ -37,10 +37,11 @@ pub struct NatTraversalTimeouts {
 
 /// QUIC keep-alive interval for connections this node dials.
 ///
-/// Only the dialling side sends keep-alives. One side is enough: a keep-alive
-/// is ack-eliciting, so the peer answers it, both idle timers reset, and each
-/// side puts a packet on the wire once per interval — which is also what
-/// refreshes a NAT mapping for that five-tuple.
+/// The dialling side sets the cadence for the connection. A keep-alive is
+/// ack-eliciting, so the peer answers it, both idle timers reset, and each side
+/// puts a packet on the wire once per interval — which is also what refreshes a
+/// NAT mapping for that five-tuple. The accepting side carries only
+/// [`ACCEPT_KEEP_ALIVE_BACKSTOP`], which this cadence normally holds off.
 ///
 /// 10 s rather than the 5 s + 2 s pair it replaces. Because any traffic resets
 /// both timers, the old arrangement ran at whichever interval was shorter, so
@@ -54,6 +55,63 @@ pub struct NatTraversalTimeouts {
 /// can provoke the ACK that would have refreshed it. 10 s is deliberately below
 /// RFC 8085's 15 s floor for general-Internet keep-alives, for that reason.
 pub(crate) const DIAL_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Longest the accepting side will stay silent on an otherwise idle connection.
+///
+/// The accepting side does not drive the cadence — the dialling peer's 10 s
+/// keep-alive does, and every packet received re-arms this timer, so on a
+/// healthy connection it has no room to fire. It exists to bound how long a
+/// connection can be silent when the peer stops being heard.
+///
+/// Without it the whole connection depends on one side. A QUIC connection
+/// closes silently after `QUIC_MAX_IDLE_TIMEOUT_MS` with nothing received, and
+/// with only the dialling side probing, a network stall is survivable for far
+/// less than that: the connection is already part-way into its silence when the
+/// stall begins, and afterwards recovery waits on the dialling side's probe
+/// timer, which backs off exponentially. Measured against a recurring outage on
+/// a harness, at the outage lengths sampled, the survivable stall was ~28 s with
+/// both sides on a timer and ~16 s with only the dialling side; restoring a
+/// timer here took it back to ~28 s across that range.
+///
+/// The value is bounded from both directions and 25 s sits between them.
+///
+/// Too low and it fires in ordinary operation and starts charging every idle
+/// connection. The real gap between received packets on a healthy connection is
+/// the dialling cadence plus a round trip, and more when a ping is lost and
+/// waits on a probe timer, so the floor is well above 10 s. Restoring the
+/// outage margin does not need a small value: 5 s was measured alongside 25 s
+/// and behaved identically, because what restores the margin is this side
+/// having a timer at all rather than how often it runs.
+///
+/// Too high and it costs twice over.
+///
+/// It crowds [`QUIC_MAX_IDLE_TIMEOUT_MS`]. `handle_timeout` services timers in
+/// `Timer::VALUES` order and `Idle` is ordered before `KeepAlive`, so if the
+/// connection driver is not polled for the gap between the two deadlines, the
+/// idle timeout is processed first and the connection closes without the
+/// backstop ever being sent. 5 s is the nominal difference between the two
+/// constants and the most that gap can be; the real separation can be smaller,
+/// because sending re-arms the keep-alive timer while the idle timer is only
+/// re-armed by the first ack-eliciting send after a receive. That is narrower
+/// slack than the arrangement this replaces and worth knowing, because driver
+/// stalls are a load phenomenon and load is what this change is about.
+///
+/// It also holds a dead peer for longer. The backstop PING is ack-eliciting, so
+/// the first one sent after the peer goes quiet re-arms the idle timer: a peer
+/// that disappears is retained for roughly the backstop plus the idle timeout,
+/// about 55 s, against 30 s with no timer on this side and about 32 s under the
+/// 2 s arrangement that preceded it. Subsequent probes do not extend it
+/// further, since only the first ack-eliciting send after a receive resets the
+/// idle timer. This is inherent to having a backstop at all and a lower value
+/// would shorten it.
+///
+/// 25 s therefore favours not reintroducing the idle-egress cost, which is the
+/// whole point of the arrangement it is protecting, and pays for that on the
+/// other two. If the fleet shows either — connections closing without the
+/// backstop under load, or dead-peer retention pressing on connection capacity
+/// — a lower value inside the measured range is the lighter response than
+/// removing the backstop.
+pub(crate) const ACCEPT_KEEP_ALIVE_BACKSTOP: Duration = Duration::from_secs(25);
 
 /// `max_idle_timeout` applied to every QUIC connection this crate creates.
 ///
