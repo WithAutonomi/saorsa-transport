@@ -30,7 +30,7 @@ jobs:
       version_number: ${{ steps.version.outputs.version_number }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # Need full history for changelog
 
@@ -84,7 +84,7 @@ jobs:
       changelog: ${{ steps.changelog.outputs.changelog }}
       breaking_changes: ${{ steps.breaking.outputs.has_breaking }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -194,7 +194,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Install NASM for Windows builds (required by aws-lc-rs)
       - name: Install NASM
@@ -220,7 +220,7 @@ jobs:
 
       - name: Cache cargo (native)
         if: matrix.use-cross != true
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -323,7 +323,7 @@ jobs:
           certutil -hashfile ${{ matrix.archive }} SHA256 > ${{ matrix.archive }}.sha256
 
       - name: Upload saorsa-transport Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: |
@@ -338,7 +338,7 @@ jobs:
     if: github.event.inputs.dry_run != 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -361,7 +361,7 @@ jobs:
     if: always() && github.event.inputs.dry_run != 'true' && needs.validate.result == 'success' && needs.changelog.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download Artifacts
         uses: actions/download-artifact@v4
