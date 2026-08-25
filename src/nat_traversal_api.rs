@@ -1822,6 +1822,108 @@ pub enum NatTraversalError {
     },
 }
 
+/// Adapt an accepting-side transport config for a relay tunnel.
+///
+/// A relay tunnel needs a smaller MTU than a direct path, and nothing else
+/// about the connection changes. Kept separate from the call site so a test can
+/// assert that adapting it does not drop the accepting-side keep-alive: this is
+/// the second endpoint that accepts connections, and it would be an easy place
+/// to lose the backstop without anything on the direct path noticing.
+fn relay_tunnel_transport_config(base: &TransportConfig) -> TransportConfig {
+    let mut tunnel = base.clone();
+    tunnel.initial_mtu(RELAY_TUNNEL_INITIAL_MTU);
+    tunnel.min_mtu(RELAY_TUNNEL_INITIAL_MTU);
+    tunnel.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+    tunnel
+}
+
+/// Which end of a connection a transport config is being built for.
+///
+/// The two ends differ in exactly one setting, the keep-alive, and sharing the
+/// rest is the point: it is what lets a test assert against the configuration
+/// the endpoint actually consumes rather than against a copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionSide {
+    /// Connections this node opens.
+    Dial,
+    /// Connections this node accepts.
+    Accept,
+}
+
+/// Build the QUIC transport configuration for one end of a connection.
+///
+/// The two direct endpoint configuration sites use this as-is, so for those the
+/// value returned here is the value that reaches the wire. The relay tunnel
+/// endpoint is the exception: it takes the accepting config and adjusts MTU,
+/// via [`relay_tunnel_transport_config`].
+///
+/// Keeping one builder matters for more than tidiness. The accepting side's
+/// keep-alive is a backstop that the peer's traffic normally holds off, so on a
+/// healthy connection it looks exactly like having no keep-alive at all. Tests
+/// that watch a healthy connection therefore cannot tell a correctly wired
+/// endpoint from a reverted one, which is why the wiring is also asserted
+/// directly against the configs this produces.
+pub(crate) fn build_transport_config(
+    config: &NatTraversalConfig,
+    side: ConnectionSide,
+) -> TransportConfig {
+    use crate::config::nat_timeouts::{
+        ACCEPT_KEEP_ALIVE_BACKSTOP, DIAL_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT_MS,
+    };
+
+    const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
+
+    let mut transport_config = TransportConfig::default();
+    transport_config.enable_address_discovery(true);
+
+    // The dialling side sets the cadence for the connection. The accepting side
+    // carries only a backstop on how long it may stay silent: every packet it
+    // receives re-arms that timer and the peer normally pings well inside the
+    // interval, so it seldom fires. On a degraded-but-live path, where the gap
+    // between received packets grows past the interval, it can. It earns its place
+    // when the peer stops being heard, because with no timer on this side at
+    // all, recovery from a network stall waits on the dialling side's probe
+    // timer backing off, which costs most of the margin against
+    // `max_idle_timeout`.
+    let keep_alive = match side {
+        ConnectionSide::Dial => DIAL_KEEP_ALIVE_INTERVAL,
+        ConnectionSide::Accept => ACCEPT_KEEP_ALIVE_BACKSTOP,
+    };
+    transport_config.keep_alive_interval(Some(keep_alive));
+    transport_config.max_idle_timeout(Some(
+        crate::VarInt::from_u32(QUIC_MAX_IDLE_TIMEOUT_MS).into(),
+    ));
+
+    // Tune QUIC flow-control windows from max_message_size
+    let window = varint_from_max_message_size(config.max_message_size);
+    transport_config.stream_receive_window(window);
+    transport_config.send_window(config.max_message_size as u64);
+
+    // Raise the initial congestion window from the default 14 KB to 1 MB. The
+    // default is too small for relay-tunnelled connections (~200-400 ms RTT →
+    // ~50 KB/s), but using the full max_message_size (10 MB) is too aggressive
+    // — it causes a burst that overflows the receiver's kernel UDP buffer
+    // (208 KB on Linux). 1 MB balances fast starts (4 MB chunk completes in
+    // ~2 RTTs through slow-start) with pacing that receivers can absorb.
+    // Uploads originate from client configs, so the dialling side needs the
+    // same bound rather than max_message_size.
+    transport_config.congestion_controller_factory(build_congestion_factory(
+        config.congestion_algorithm,
+        INITIAL_CONGESTION_WINDOW,
+        transport_config.initial_rtt,
+    ));
+
+    // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
+    // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
+    let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
+        concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
+    };
+    transport_config.nat_traversal_config(Some(nat_config));
+    transport_config.allow_loopback(config.allow_loopback);
+
+    transport_config
+}
+
 impl Default for NatTraversalConfig {
     fn default() -> Self {
         Self {
@@ -3409,8 +3511,6 @@ impl NatTraversalEndpoint {
     > {
         use std::sync::Arc;
 
-        const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
-
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
         let server_config = {
             info!("Creating server config using Raw Public Keys (RFC 7250) for symmetric P2P node");
@@ -3455,47 +3555,9 @@ impl NatTraversalEndpoint {
 
             let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
 
-            // Configure transport parameters for NAT traversal
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            // Accepting side: no keep-alive. Only one side of a connection needs
-            // one — a keep-alive is ack-eliciting, so the peer answers it and
-            // both idle timers reset — and the dialling peer supplies it. This
-            // used to be `retry_interval`, which is the NAT *retry* cadence and
-            // an unrelated concern that happens to live in the same struct.
-            transport_config.keep_alive_interval(None);
-            transport_config.max_idle_timeout(Some(
-                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
-                    .into(),
-            ));
-
-            // Tune QUIC flow-control windows from max_message_size
-            let window = varint_from_max_message_size(config.max_message_size);
-            transport_config.stream_receive_window(window);
-            transport_config.send_window(config.max_message_size as u64);
-
-            // Raise the initial congestion window from the default 14 KB
-            // to 1 MB.  The default is too small for relay-tunnelled
-            // connections (~200-400 ms RTT → ~50 KB/s), but using the
-            // full max_message_size (10 MB) is too aggressive — it causes
-            // a burst that overflows the receiver's kernel UDP buffer
-            // (208 KB on Linux).  1 MB balances fast starts (4 MB chunk
-            // completes in ~2 RTTs through slow-start) with pacing that
-            // receivers can absorb.
-            transport_config.congestion_controller_factory(build_congestion_factory(
-                config.congestion_algorithm,
-                INITIAL_CONGESTION_WINDOW,
-                transport_config.initial_rtt,
-            ));
-
-            // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
-            // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
-            transport_config.allow_loopback(config.allow_loopback);
-
+            // Used as-is, so this endpoint consumes exactly the configuration
+            // the unit tests assert against.
+            let transport_config = build_transport_config(config, ConnectionSide::Accept);
             server_config.transport_config(Arc::new(transport_config));
 
             Some(server_config)
@@ -3549,43 +3611,9 @@ impl NatTraversalEndpoint {
             }
 
             // Configure transport parameters for NAT traversal
-            let mut transport_config = TransportConfig::default();
-            transport_config.enable_address_discovery(true);
-            // Dialling side: the only keep-alive on the connection. The peer's
-            // ACK is an outbound packet there too, so both directions put a
-            // packet on the wire roughly once per interval — roughly, because
-            // the timer re-arms on receive as well as send, so each cycle drifts
-            // out by about a round trip.
-            transport_config
-                .keep_alive_interval(Some(crate::config::nat_timeouts::DIAL_KEEP_ALIVE_INTERVAL));
-            transport_config.max_idle_timeout(Some(
-                crate::VarInt::from_u32(crate::config::nat_timeouts::QUIC_MAX_IDLE_TIMEOUT_MS)
-                    .into(),
-            ));
-
-            // Tune QUIC flow-control windows from max_message_size
-            let window = varint_from_max_message_size(config.max_message_size);
-            transport_config.stream_receive_window(window);
-            transport_config.send_window(config.max_message_size as u64);
-
-            // Keep client and server sends on the same bounded startup
-            // window. Uploads originate from client configs, so using
-            // max_message_size here recreates the burst/loss problem that
-            // the server config above avoids.
-            transport_config.congestion_controller_factory(build_congestion_factory(
-                config.congestion_algorithm,
-                INITIAL_CONGESTION_WINDOW,
-                transport_config.initial_rtt,
-            ));
-
-            // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
-            // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
-            let nat_config = crate::transport_parameters::NatTraversalConfig::ServerSupport {
-                concurrency_limit: VarInt::from_u32(config.max_concurrent_attempts as u32),
-            };
-            transport_config.nat_traversal_config(Some(nat_config));
-            transport_config.allow_loopback(config.allow_loopback);
-
+            // Used as-is, so this endpoint consumes exactly the configuration
+            // the unit tests assert against.
+            let transport_config = build_transport_config(config, ConnectionSide::Dial);
             client_config.transport_config(Arc::new(transport_config));
 
             client_config
@@ -3641,12 +3669,17 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("No compatible async runtime found".to_string())
         })?;
 
-        // Clone server config for potential secondary endpoint (relay accept)
-        let server_config_for_relay = server_config.clone();
+        // One authoritative server config: the endpoint is built from a clone
+        // of the value that is also returned, rather than the return being a
+        // clone taken beforehand. The returned config is what the relay accept
+        // path reuses and what the tests assert against, so it has to be the
+        // same object the endpoint runs on — otherwise anything applied between
+        // the two is invisible to both.
+        let server_config_for_relay = server_config;
 
         let mut endpoint = InnerEndpoint::new(
             EndpointConfig::default(),
-            server_config,
+            server_config_for_relay.clone(),
             std_socket,
             runtime,
         )
@@ -5631,17 +5664,13 @@ impl NatTraversalEndpoint {
             .map_err(|_| NatTraversalError::ConfigError("mutex poisoned".to_string()))?
             .clone();
 
-        // Override the inner endpoint's TransportConfig with a
-        // relay-tunnel-safe MTU profile while preserving every other
-        // setting the main endpoint cares about (NAT traversal,
-        // congestion control, idle timeouts, flow control).  We clone
-        // the existing transport config, clamp MTU, and re-attach.
+        // This is the second endpoint that accepts connections, so it needs
+        // the same keep-alive as the first. It derives from the main endpoint's
+        // server config and adjusts only MTU; `relay_tunnel_transport_config`
+        // is that adjustment, kept as one function so a test can check what
+        // comes out of it still carries the accepting-side backstop.
         let server_config = server_config.map(|mut sc| {
-            let mut tunnel_tc = (*sc.transport).clone();
-            tunnel_tc.initial_mtu(RELAY_TUNNEL_INITIAL_MTU);
-            tunnel_tc.min_mtu(RELAY_TUNNEL_INITIAL_MTU);
-            tunnel_tc.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
-            sc.transport = Arc::new(tunnel_tc);
+            sc.transport = Arc::new(relay_tunnel_transport_config(&sc.transport));
             sc
         });
 
@@ -8416,6 +8445,159 @@ impl crate::TokenStore for DefaultTokenStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    use super::{ConnectionSide, NatTraversalConfig, build_transport_config};
+    use crate::config::nat_timeouts::{
+        ACCEPT_KEEP_ALIVE_BACKSTOP, DIAL_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT_MS,
+    };
+    use std::time::Duration as StdDuration;
+
+    /// Pins what each end is actually wired to.
+    ///
+    /// Watching a healthy connection cannot tell "the accepting side has a
+    /// backstop the peer holds off" from "the accepting side has no keep-alive
+    /// at all", because those are the same observation. Asserting on the
+    /// configuration is one way to make a silent revert fail; making the peer
+    /// go quiet is the other, and
+    /// `a_production_endpoint_holds_a_connection_open_for_a_silent_peer` in
+    /// `tests/keep_alive_asymmetry.rs` does that. It lives out there because it
+    /// has to idle past `max_idle_timeout`, which is far too long for the
+    /// library suite's quick-check budget.
+    ///
+    /// Literals rather than a comparison against the constants, so that moving
+    /// a constant fails here instead of quietly moving what is asserted.
+    #[test]
+    fn each_side_is_wired_to_its_own_keep_alive() {
+        let config = NatTraversalConfig::default();
+
+        let accept = build_transport_config(&config, ConnectionSide::Accept);
+        assert_eq!(
+            accept.keep_alive_interval,
+            Some(StdDuration::from_secs(25)),
+            "the accepting side must carry the 25 s backstop; without it, stalls \
+             at the 17-25 s lengths measured on the harness took connections down"
+        );
+
+        let dial = build_transport_config(&config, ConnectionSide::Dial);
+        assert_eq!(
+            dial.keep_alive_interval,
+            Some(StdDuration::from_secs(10)),
+            "the dialling side sets the cadence and must stay at 10 s"
+        );
+
+        let expected_idle = Some(crate::VarInt::from_u32(30_000));
+        assert_eq!(accept.max_idle_timeout, expected_idle);
+        assert_eq!(dial.max_idle_timeout, expected_idle);
+    }
+
+    /// The constants the wiring above reads, and the two bounds the backstop
+    /// sits between.
+    #[test]
+    fn the_backstop_sits_between_the_cadence_and_the_idle_timeout() {
+        assert_eq!(DIAL_KEEP_ALIVE_INTERVAL, StdDuration::from_secs(10));
+        assert_eq!(ACCEPT_KEEP_ALIVE_BACKSTOP, StdDuration::from_secs(25));
+        assert!(
+            ACCEPT_KEEP_ALIVE_BACKSTOP > DIAL_KEEP_ALIVE_INTERVAL,
+            "a backstop at or below the dialling cadence fires in ordinary \
+             operation and charges every idle connection"
+        );
+        let idle = StdDuration::from_millis(u64::from(QUIC_MAX_IDLE_TIMEOUT_MS));
+        assert!(
+            ACCEPT_KEEP_ALIVE_BACKSTOP < idle,
+            "a backstop at or past the idle timeout can never bound anything"
+        );
+    }
+
+    /// What the endpoint actually built, read back from the `ServerConfig` it
+    /// returns rather than from the builder.
+    ///
+    /// The builder assertions above do not cover a call site that takes the
+    /// built config and overrides it afterwards, which is a live way to revert
+    /// this change without failing anything. This is the assertion that closes
+    /// it, because it reads the configuration on its way out of the endpoint
+    /// constructor.
+    ///
+    /// Only the accepting side needs this. The dialling side's cadence is
+    /// visible on the wire and `tests/keep_alive_asymmetry.rs` already pins it
+    /// by counting and spacing its PINGs; the accepting side's backstop is
+    /// silent on a healthy connection and so has no wire signature to check.
+    #[tokio::test]
+    async fn the_endpoint_builds_the_accept_side_with_the_backstop() {
+        let config = NatTraversalConfig {
+            bind_addr: Some((std::net::Ipv4Addr::LOCALHOST, 0).into()),
+            allow_loopback: true,
+            ..NatTraversalConfig::default()
+        };
+        let registry = crate::transport::TransportRegistry::new();
+
+        let (_endpoint, _tx, _rx, _addr, server_config) =
+            super::NatTraversalEndpoint::create_inner_endpoint(&config, None, &registry, None)
+                .await
+                .expect("endpoint construction");
+
+        let server_config = server_config.expect("every node accepts connections");
+        assert_eq!(
+            server_config.transport.keep_alive_interval,
+            Some(StdDuration::from_secs(25)),
+            "the endpoint handed the accepting side a keep-alive other than the \
+             25 s backstop; without it, stalls at the 17-25 s lengths measured \
+             on the harness took connections down"
+        );
+        assert_eq!(
+            server_config.transport.max_idle_timeout,
+            Some(crate::VarInt::from_u32(30_000))
+        );
+    }
+
+    /// The relay tunnel is the other endpoint that accepts connections, and it
+    /// must carry the backstop too.
+    ///
+    /// It derives from the accepting config and changes MTU. Losing the
+    /// keep-alive here would be invisible to everything on the direct path,
+    /// and a connection arriving through a relay is exactly the kind that sits
+    /// behind a loaded middlebox, so it is the last one that should be left
+    /// depending on its peer alone.
+    ///
+    /// This is config-level coverage, not behavioural: exercising the real
+    /// relay path needs a MASQUE tunnel stood up, which is out of proportion
+    /// here. It catches the realistic regression — someone editing this
+    /// adaptation — rather than a deliberate override downstream of it.
+    #[test]
+    fn the_relay_tunnel_endpoint_keeps_the_accept_side_backstop() {
+        let config = NatTraversalConfig::default();
+        let accept = build_transport_config(&config, ConnectionSide::Accept);
+        let tunnel = super::relay_tunnel_transport_config(&accept);
+
+        assert_eq!(
+            tunnel.keep_alive_interval,
+            Some(StdDuration::from_secs(25)),
+            "the relay tunnel endpoint accepts connections and must keep the \
+             backstop; adapting the MTU must not drop it"
+        );
+        assert_eq!(tunnel.max_idle_timeout, accept.max_idle_timeout);
+        assert_ne!(
+            tunnel.get_initial_mtu(),
+            accept.get_initial_mtu(),
+            "the adaptation is supposed to change the MTU, so a test that saw \
+             no difference would be asserting against the wrong thing"
+        );
+    }
+
+    /// Everything other than the keep-alive must be identical on both ends.
+    /// The two sites were duplicated before; this is what keeps them from
+    /// drifting apart again.
+    #[test]
+    fn the_two_sides_differ_only_in_their_keep_alive() {
+        let config = NatTraversalConfig::default();
+        let accept = build_transport_config(&config, ConnectionSide::Accept);
+        let dial = build_transport_config(&config, ConnectionSide::Dial);
+
+        assert_eq!(accept.send_window, dial.send_window);
+        assert_eq!(accept.stream_receive_window, dial.stream_receive_window);
+        assert_eq!(accept.max_idle_timeout, dial.max_idle_timeout);
+        assert_ne!(accept.keep_alive_interval, dial.keep_alive_interval);
+    }
+
     use super::*;
 
     async fn detached_proactive_relay(public_addr: SocketAddr) -> ProactiveRelay {
