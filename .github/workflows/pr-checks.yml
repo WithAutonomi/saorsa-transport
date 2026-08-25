@@ -19,7 +19,7 @@ jobs:
     name: linear-link
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require a linked Linear issue
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -32,7 +32,7 @@ jobs:
     name: pr-template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require the PR template fields
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -45,6 +45,6 @@ jobs:
     name: self-test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run the checker's test matrix
         run: python3 .github/scripts/test_check_pr.py
