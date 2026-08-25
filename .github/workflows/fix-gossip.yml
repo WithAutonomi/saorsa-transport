@@ -60,7 +60,7 @@ jobs:
       test_output: ${{ steps.run_tests.outputs.output }}
       has_failures: ${{ steps.run_tests.outputs.has_failures }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +112,7 @@ jobs:
     outputs:
       issue_number: ${{ steps.create_issue.outputs.issue_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download diagnostics
         uses: actions/download-artifact@v4
