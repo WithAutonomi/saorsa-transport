@@ -128,7 +128,7 @@ jobs:
           cat validation-results/report.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: endpoint-validation-${{ github.run_id }}
           path: validation-results/
