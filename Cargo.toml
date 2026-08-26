@@ -144,7 +144,7 @@ futures-util = { version = "0.3" }
 # Browser transport primitives. Saorsa owns the transport API and wire
 # profile; these crates provide the standardized ICE/DTLS/SCTP machinery.
 stun = { version = "0.7", optional = true }
-webrtc = { version = "0.12", features = ["pem"], optional = true }
+webrtc = { version = "0.14", features = ["pem"], optional = true }
 webrtc-rcgen = { package = "rcgen", version = "0.13", optional = true }
 
 time = { version = "0.3.47" }
