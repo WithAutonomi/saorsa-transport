@@ -1232,7 +1232,7 @@ impl ConnectionRouter {
     pub fn capabilities_for_addr(addr: &TransportAddr) -> TransportCapabilities {
         match addr {
             TransportAddr::Quic(_)
-            | TransportAddr::WebTransport(_)
+            | TransportAddr::WebRtcDirect(_)
             | TransportAddr::Tcp(_)
             | TransportAddr::Udp(_) => TransportCapabilities::broadband(),
             TransportAddr::Bluetooth { .. } => TransportCapabilities::broadband(),

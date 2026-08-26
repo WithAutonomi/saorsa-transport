@@ -101,10 +101,7 @@ pub use crate::transport_error::{Code as TransportErrorCode, Error as TransportE
 pub use crate::transport_parameters;
 
 // Re-export transport abstraction types
-pub use addr::{
-    LoRaParams, MAX_WEBTRANSPORT_CERTIFICATE_HASHES, TransportAddr, TransportType,
-    WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
-};
+pub use addr::{LoRaParams, TransportAddr, TransportType, WebRtcCertificateHash, WebRtcDirectAddr};
 pub use capabilities::{BandwidthClass, TransportCapabilities, TransportCapabilitiesBuilder};
 pub use provider::{
     InboundDatagram, LinkQuality, ProtocolEngine, TransportDiagnostics,

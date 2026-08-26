@@ -216,6 +216,10 @@ pub mod nat_traversal;
 /// Transport-level protocol implementation
 pub mod transport;
 
+/// Signaling-free WebRTC DataChannel transport for direct browser clients.
+#[cfg(feature = "webrtc-direct")]
+pub mod webrtc_direct;
+
 /// Connection router for automatic protocol engine selection (QUIC vs Constrained)
 pub mod connection_router;
 

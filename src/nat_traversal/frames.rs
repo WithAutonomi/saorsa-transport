@@ -48,8 +48,7 @@ use std::time::Duration;
 
 use crate::coding::{self, Codec};
 use crate::transport::{
-    TransportAddr, TransportCapabilities, TransportType, WebTransportAddr,
-    WebTransportCertificateHash, WebTransportHost,
+    TransportAddr, TransportCapabilities, TransportType, WebRtcCertificateHash, WebRtcDirectAddr,
 };
 use crate::varint::VarInt;
 
@@ -517,13 +516,9 @@ const TRANSPORT_TYPE_TCP: u64 = 7;
 const TRANSPORT_TYPE_BLUETOOTH: u64 = 8;
 const TRANSPORT_TYPE_LORAWAN: u64 = 9;
 const TRANSPORT_TYPE_RAW_UDP: u64 = 10;
-const TRANSPORT_TYPE_WEBTRANSPORT: u64 = 11;
-
-const WEBTRANSPORT_HOST_IP4: u8 = 4;
-const WEBTRANSPORT_HOST_IP6: u8 = 6;
-const WEBTRANSPORT_HOST_DNS: u8 = 0x10;
-const WEBTRANSPORT_HOST_DNS4: u8 = 0x14;
-const WEBTRANSPORT_HOST_DNS6: u8 = 0x16;
+// Value 11 belonged to the superseded WebTransport proof of concept. Do not
+// reinterpret persisted or in-flight WebTransport advertisements as WebRTC.
+const TRANSPORT_TYPE_WEBRTC_DIRECT: u64 = 12;
 
 impl Codec for AddAddress {
     fn decode<B: Buf>(buf: &mut B) -> coding::Result<Self> {
@@ -557,7 +552,7 @@ impl Codec for AddAddress {
             TRANSPORT_TYPE_BLUETOOTH => TransportType::Bluetooth,
             TRANSPORT_TYPE_LORAWAN => TransportType::LoRaWan,
             TRANSPORT_TYPE_RAW_UDP => TransportType::Udp,
-            TRANSPORT_TYPE_WEBTRANSPORT => TransportType::WebTransport,
+            TRANSPORT_TYPE_WEBRTC_DIRECT => TransportType::WebRtcDirect,
             _ => TransportType::Quic, // Unknown types fall back to QUIC
         };
 
@@ -600,7 +595,7 @@ impl Codec for AddAddress {
                     _ => TransportAddr::Udp(sock),
                 }
             }
-            TransportType::WebTransport => decode_webtransport_address(buf)?,
+            TransportType::WebRtcDirect => decode_webrtc_direct_address(buf)?,
             TransportType::Bluetooth => {
                 // Bluetooth: MAC (6 bytes) + channel (1 byte)
                 if buf.remaining() < 7 {
@@ -694,7 +689,7 @@ impl Codec for AddAddress {
         // Encode transport type (VarInt)
         let transport_type_raw = match self.transport_type {
             TransportType::Quic => TRANSPORT_TYPE_QUIC,
-            TransportType::WebTransport => TRANSPORT_TYPE_WEBTRANSPORT,
+            TransportType::WebRtcDirect => TRANSPORT_TYPE_WEBRTC_DIRECT,
             TransportType::Tcp => TRANSPORT_TYPE_TCP,
             TransportType::Udp => TRANSPORT_TYPE_RAW_UDP,
             TransportType::Bluetooth => TRANSPORT_TYPE_BLUETOOTH,
@@ -727,8 +722,8 @@ impl Codec for AddAddress {
                 }
                 buf.put_u16(socket_addr.port());
             }
-            TransportAddr::WebTransport(address) => {
-                encode_webtransport_address(address, buf);
+            TransportAddr::WebRtcDirect(address) => {
+                encode_webrtc_direct_address(address, buf);
             }
             TransportAddr::Bluetooth { mac, channel } => {
                 buf.put_slice(mac);
@@ -791,100 +786,57 @@ impl Codec for AddAddress {
     }
 }
 
-fn decode_webtransport_address<B: Buf>(buf: &mut B) -> coding::Result<TransportAddr> {
+fn decode_webrtc_direct_address<B: Buf>(buf: &mut B) -> coding::Result<TransportAddr> {
     if buf.remaining() < 1 {
         return Err(coding::UnexpectedEnd);
     }
-    let host_type = buf.get_u8();
-    let host = match host_type {
-        WEBTRANSPORT_HOST_IP4 => {
+    let address_type = buf.get_u8();
+    let ip = match address_type {
+        4 => {
             if buf.remaining() < 4 {
                 return Err(coding::UnexpectedEnd);
             }
             let mut octets = [0_u8; 4];
             buf.copy_to_slice(&mut octets);
-            WebTransportHost::Ip4(octets.into())
+            IpAddr::V4(octets.into())
         }
-        WEBTRANSPORT_HOST_IP6 => {
+        6 => {
             if buf.remaining() < 16 {
                 return Err(coding::UnexpectedEnd);
             }
             let mut octets = [0_u8; 16];
             buf.copy_to_slice(&mut octets);
-            WebTransportHost::Ip6(octets.into())
-        }
-        WEBTRANSPORT_HOST_DNS | WEBTRANSPORT_HOST_DNS4 | WEBTRANSPORT_HOST_DNS6 => {
-            let length = VarInt::decode(buf)?.into_inner() as usize;
-            if buf.remaining() < length {
-                return Err(coding::UnexpectedEnd);
-            }
-            let mut bytes = vec![0_u8; length];
-            buf.copy_to_slice(&mut bytes);
-            let hostname = String::from_utf8(bytes).map_err(|_| coding::UnexpectedEnd)?;
-            match host_type {
-                WEBTRANSPORT_HOST_DNS => WebTransportHost::Dns(hostname),
-                WEBTRANSPORT_HOST_DNS4 => WebTransportHost::Dns4(hostname),
-                _ => WebTransportHost::Dns6(hostname),
-            }
+            IpAddr::V6(octets.into())
         }
         _ => return Err(coding::UnexpectedEnd),
     };
-    if buf.remaining() < 3 {
+    if buf.remaining() < 34 {
         return Err(coding::UnexpectedEnd);
     }
     let port = buf.get_u16();
-    let hash_count = usize::from(buf.get_u8());
-    if buf.remaining() < hash_count.saturating_mul(32) {
-        return Err(coding::UnexpectedEnd);
-    }
-    let mut certificate_hashes = Vec::with_capacity(hash_count);
-    for _ in 0..hash_count {
-        let mut digest = [0_u8; 32];
-        buf.copy_to_slice(&mut digest);
-        certificate_hashes.push(WebTransportCertificateHash::new(digest));
-    }
-    let address =
-        WebTransportAddr::new(host, port, certificate_hashes).map_err(|_| coding::UnexpectedEnd)?;
-    Ok(TransportAddr::WebTransport(address))
+    let mut digest = [0_u8; 32];
+    buf.copy_to_slice(&mut digest);
+    let address = WebRtcDirectAddr::new(
+        SocketAddr::new(ip, port),
+        WebRtcCertificateHash::new(digest),
+    )
+    .map_err(|_| coding::UnexpectedEnd)?;
+    Ok(TransportAddr::WebRtcDirect(address))
 }
 
-fn encode_webtransport_address<B: BufMut>(address: &WebTransportAddr, buf: &mut B) {
-    match address.host() {
-        WebTransportHost::Ip4(ip) => {
-            buf.put_u8(WEBTRANSPORT_HOST_IP4);
+fn encode_webrtc_direct_address<B: BufMut>(address: &WebRtcDirectAddr, buf: &mut B) {
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            buf.put_u8(4);
             buf.put_slice(&ip.octets());
         }
-        WebTransportHost::Ip6(ip) => {
-            buf.put_u8(WEBTRANSPORT_HOST_IP6);
+        IpAddr::V6(ip) => {
+            buf.put_u8(6);
             buf.put_slice(&ip.octets());
-        }
-        WebTransportHost::Dns(hostname) => {
-            buf.put_u8(WEBTRANSPORT_HOST_DNS);
-            VarInt::from_u64(hostname.len() as u64)
-                .unwrap_or(VarInt::from_u32(0))
-                .encode(buf);
-            buf.put_slice(hostname.as_bytes());
-        }
-        WebTransportHost::Dns4(hostname) => {
-            buf.put_u8(WEBTRANSPORT_HOST_DNS4);
-            VarInt::from_u64(hostname.len() as u64)
-                .unwrap_or(VarInt::from_u32(0))
-                .encode(buf);
-            buf.put_slice(hostname.as_bytes());
-        }
-        WebTransportHost::Dns6(hostname) => {
-            buf.put_u8(WEBTRANSPORT_HOST_DNS6);
-            VarInt::from_u64(hostname.len() as u64)
-                .unwrap_or(VarInt::from_u32(0))
-                .encode(buf);
-            buf.put_slice(hostname.as_bytes());
         }
     }
     buf.put_u16(address.port());
-    buf.put_u8(address.certificate_hashes().len() as u8);
-    for hash in address.certificate_hashes() {
-        buf.put_slice(hash.as_bytes());
-    }
+    buf.put_slice(address.certificate_hash().as_bytes());
 }
 
 impl Codec for PunchMeNow {
@@ -1084,24 +1036,20 @@ mod tests {
     }
 
     #[test]
-    fn test_add_address_webtransport_roundtrip() {
-        let endpoint = WebTransportAddr::new(
-            WebTransportHost::Dns("node.example".to_string()),
-            443,
-            vec![
-                WebTransportCertificateHash::new([0x11; 32]),
-                WebTransportCertificateHash::new([0x22; 32]),
-            ],
+    fn test_add_address_webrtc_direct_roundtrip() {
+        let endpoint = WebRtcDirectAddr::new(
+            "203.0.113.7:443".parse().expect("valid socket address"),
+            WebRtcCertificateHash::new([0x11; 32]),
         )
-        .expect("valid WebTransport endpoint");
-        let original = AddAddress::new(12, 75, TransportAddr::WebTransport(endpoint));
+        .expect("valid WebRTC Direct endpoint");
+        let original = AddAddress::new(12, 75, TransportAddr::WebRtcDirect(endpoint));
 
         let mut buf = BytesMut::new();
         Codec::encode(&original, &mut buf);
         let decoded = AddAddress::decode(&mut buf.freeze()).expect("decode failed");
 
         assert_eq!(decoded, original);
-        assert_eq!(decoded.transport_type, TransportType::WebTransport);
+        assert_eq!(decoded.transport_type, TransportType::WebRtcDirect);
     }
 
     #[test]
@@ -1267,6 +1215,7 @@ mod tests {
         assert_eq!(TRANSPORT_TYPE_BLUETOOTH, 8);
         assert_eq!(TRANSPORT_TYPE_LORAWAN, 9);
         assert_eq!(TRANSPORT_TYPE_RAW_UDP, 10);
+        assert_eq!(TRANSPORT_TYPE_WEBRTC_DIRECT, 12);
     }
 
     #[test]
