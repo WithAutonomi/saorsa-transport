@@ -508,9 +508,12 @@ struct ProactiveRelay {
 
 impl ProactiveRelay {
     async fn teardown(mut self, reason: &'static [u8]) {
+        // Order matters. `close` only queues CONNECTION_CLOSE on each
+        // connection; the frames still have to travel out through the tunnel.
+        // Drain first and dismantle second, or the transport is torn out from
+        // under the endpoint mid-drain and the peer is left to time out.
         self.endpoint
             .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
-        self.tunnel.shutdown().await;
 
         if tokio::time::timeout(Duration::from_secs(1), self.endpoint.wait_idle())
             .await
@@ -521,6 +524,8 @@ impl ProactiveRelay {
                 "Timed out draining proactive relay endpoint during teardown"
             );
         }
+
+        self.tunnel.shutdown().await;
 
         self.relay_session_owner.remove_owned_session(reason);
 
@@ -577,6 +582,7 @@ impl RelayLifecycleState {
 }
 
 struct RelayHealthSnapshot {
+    handle: PreparedRelay,
     relay_addr: SocketAddr,
     tunnel: Arc<crate::masque::RelayTunnelControl>,
 }
@@ -738,6 +744,7 @@ impl RelayLifecycleHandle {
                     RelayLifecycleCommand::Health { reply } => {
                         let health = match &state {
                             RelayLifecycleState::Published(relay) => Some(RelayHealthSnapshot {
+                                handle: relay.handle,
                                 relay_addr: relay.handle.public_addr(),
                                 tunnel: Arc::clone(&relay.tunnel),
                             }),
@@ -4467,11 +4474,20 @@ impl NatTraversalEndpoint {
     /// Returns false if a relay was established but the underlying QUIC
     /// connection has closed.
     pub async fn is_relay_healthy(&self) -> bool {
-        let Some(relay) = self.relay_lifecycle.health().await else {
-            return true;
-        };
+        self.unhealthy_published_relay().await.is_none()
+    }
+
+    /// The published relay, if there is one and it is dead.
+    ///
+    /// Returns the exact allocation the verdict was reached about. Asking
+    /// whether the relay is healthy and then asking separately which relay is
+    /// published leaves a window in which a replacement can publish between the
+    /// two, and the caller would then tear down the healthy replacement on the
+    /// strength of a verdict about its predecessor.
+    pub(crate) async fn unhealthy_published_relay(&self) -> Option<PreparedRelay> {
+        let relay = self.relay_lifecycle.health().await?;
         if relay.tunnel.is_closed() {
-            return false;
+            return Some(relay.handle);
         }
 
         // Check the specific session for the advertised relay address.
@@ -4479,7 +4495,7 @@ impl NatTraversalEndpoint {
         // using relay_addr, so that's the one that must be healthy.
         for entry in self.relay_sessions.iter() {
             if entry.value().public_address == Some(relay.relay_addr) {
-                return entry.value().is_active();
+                return (!entry.value().is_active()).then_some(relay.handle);
             }
         }
 
@@ -4487,7 +4503,7 @@ impl NatTraversalEndpoint {
             "Relay session for {} is dead — re-establishment required",
             relay.relay_addr
         );
-        false
+        Some(relay.handle)
     }
 
     pub(crate) async fn published_relay_handle(&self) -> Option<PreparedRelay> {
@@ -5752,6 +5768,11 @@ impl NatTraversalEndpoint {
             let tunnel = Arc::clone(&tunnel);
             tokio::spawn(async move {
                 tunnel.closed().await;
+                if tunnel.shutdown_requested() {
+                    // `teardown` is already closing and draining this endpoint
+                    // in the right order. Nothing died.
+                    return;
+                }
                 info!(
                     "MASQUE tunnel for relay {} died — closing relay endpoint gracefully",
                     relay_public_addr
@@ -5838,6 +5859,31 @@ impl NatTraversalEndpoint {
             .map_err(NatTraversalError::ConnectionFailed)?
         {
             self.teardown_proactive_relay(relay, b"relay allocation aborted")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Abort a proactive relay that the health monitor has found dead.
+    ///
+    /// The same teardown, but the tunnel is recorded as failed first.
+    /// `is_relay_healthy` can condemn a relay from the state of the *outer*
+    /// relay session while the tunnel's own cause is still `Live`; without this,
+    /// the teardown's `shutdown()` would settle first and file a genuine failure
+    /// as an intentional one, silencing the transport error and the tunnel-death
+    /// log that report it.
+    pub(crate) async fn abort_unhealthy_proactive_relay(
+        &self,
+        prepared: PreparedRelay,
+    ) -> Result<(), NatTraversalError> {
+        if let Some(relay) = self
+            .relay_lifecycle
+            .take_matching(prepared)
+            .await
+            .map_err(NatTraversalError::ConnectionFailed)?
+        {
+            relay.tunnel.mark_failed();
+            self.teardown_proactive_relay(relay, b"relay tunnel unhealthy")
                 .await;
         }
         Ok(())
@@ -8599,6 +8645,613 @@ mod tests {
     }
 
     use super::*;
+
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use crate::high_level::AsyncUdpSocket;
+
+    /// A waker that records whether it was woken, for driving a poller by hand
+    /// and then checking that the code under test actually notified it.
+    #[derive(Default)]
+    struct RecordingWake(AtomicBool);
+
+    impl RecordingWake {
+        fn was_woken(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    impl Wake for RecordingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Collects formatted `tracing` output so a test can assert on what an
+    /// operator would have seen in the node log.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            match self.0.lock() {
+                Ok(buffer) => String::from_utf8_lossy(&buffer).into_owned(),
+                Err(poisoned) => String::from_utf8_lossy(&poisoned.into_inner()).into_owned(),
+            }
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut buffer) = self.0.lock() {
+                buffer.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A proactive relay backed by a real MASQUE tunnel over an in-process QUIC
+    /// connection, plus the peers holding the tunnel up.
+    struct LiveProactiveRelay {
+        relay: ProactiveRelay,
+        socket: Arc<crate::masque::MasqueRelaySocket>,
+        relay_peer: NatTraversalEndpoint,
+        local: NatTraversalEndpoint,
+    }
+
+    async fn live_proactive_relay() -> LiveProactiveRelay {
+        let endpoint_config = || NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+            ..Default::default()
+        };
+        let relay_peer = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("relay peer endpoint");
+        let local = NatTraversalEndpoint::new(endpoint_config(), None, None)
+            .await
+            .expect("local endpoint");
+
+        let relay_server_addr = relay_peer
+            .get_endpoint()
+            .expect("relay peer transport endpoint")
+            .local_addr()
+            .expect("relay peer address");
+        let server_name = relay_server_addr.ip().to_string();
+
+        let connection = local
+            .connect_to(&server_name, relay_server_addr)
+            .await
+            .expect("relay control connection");
+        let (send_stream, recv_stream) = connection.open_bi().await.expect("relay tunnel stream");
+
+        let original_socket = local
+            .get_endpoint()
+            .expect("local transport endpoint")
+            .current_socket()
+            .expect("original socket");
+
+        let relay_public_addr = "203.0.113.7:9000".parse().expect("relay public address");
+        let (socket, tunnel) = crate::masque::MasqueRelaySocket::new(
+            send_stream,
+            recv_stream,
+            relay_public_addr,
+            relay_server_addr,
+            original_socket,
+        );
+
+        let runtime = crate::high_level::default_runtime().expect("async runtime");
+        let relay_endpoint = InnerEndpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            Arc::clone(&socket) as Arc<dyn crate::high_level::AsyncUdpSocket>,
+            runtime,
+        )
+        .expect("relay endpoint");
+
+        LiveProactiveRelay {
+            relay: ProactiveRelay {
+                handle: PreparedRelay::new(relay_public_addr),
+                endpoint: Arc::new(relay_endpoint),
+                tunnel,
+                relay_session_owner: RelaySessionOwner {
+                    relay_server_addr,
+                    public_address: Some(relay_public_addr),
+                    relay_sessions: Arc::new(dashmap::DashMap::new()),
+                    stable_id: usize::MAX,
+                    cleanup_armed: false,
+                },
+                cleanup_armed: true,
+            },
+            socket,
+            relay_peer,
+            local,
+        }
+    }
+
+    /// V2-986: an orderly relay teardown used to end the backing endpoint's
+    /// driver through its I/O-failure path, logging
+    /// `ERROR ... I/O error: relay recv stream closed` once per teardown. The
+    /// fleet upgrade that made teardown deterministic turned that into a ~100x
+    /// rise in transport ERROR volume.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_relay_teardown_reports_no_transport_error() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let LiveProactiveRelay {
+            relay,
+            socket,
+            relay_peer,
+            local,
+        } = live_proactive_relay().await;
+        // This handle and the relay endpoint's own are the only two; once the
+        // endpoint retires, this test holds the socket alone.
+        assert_eq!(Arc::strong_count(&socket), 2);
+
+        relay.teardown(b"relay allocation aborted").await;
+
+        // Parking `poll_recv` must not strand the driver: it still has to retire
+        // once the endpoint is dropped, releasing the tunnel socket. Waiting for
+        // that first also means the driver has finished whatever it was going to
+        // log, so the assertions below cannot pass by reading too early.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&socket) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("relay endpoint driver should retire and release the tunnel socket");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("relay recv stream closed"),
+            "a teardown we initiated must not be logged as a transport failure; got:\n{captured}"
+        );
+        assert!(
+            !captured.contains("I/O error"),
+            "the relay endpoint driver must not end through its I/O-failure path; got:\n{captured}"
+        );
+
+        let _ = local.shutdown().await;
+        let _ = relay_peer.shutdown().await;
+    }
+
+    /// Both halves of the fix on the real production path: a real CONNECT-UDP
+    /// session, the real `run_stream_forwarding_loop` data plane, the real
+    /// `prepare_proactive_relay` / `abort_proactive_relay` lifecycle, and a real
+    /// peer dialling the relay-allocated address.
+    ///
+    /// The peer must be *told* the relay is going away (the ordering half) with
+    /// no transport error logged (the classification half), and the relay server
+    /// must get its capacity slot back.
+    #[tokio::test]
+    async fn real_relay_teardown_closes_the_peer_and_releases_capacity() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let relay_node = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                enable_relay_service: true,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("relay node");
+        let relay_node_addr = relay_node
+            .get_endpoint()
+            .expect("relay transport endpoint")
+            .local_addr()
+            .expect("relay node address");
+        let relay_server = relay_node
+            .relay_server
+            .clone()
+            .expect("relay service should be enabled");
+
+        let client = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                enable_relay_service: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("client node");
+
+        // The real lifecycle: establish a CONNECT-UDP session and stand a relay
+        // endpoint on the resulting tunnel.
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.prepare_proactive_relay(relay_node_addr),
+        )
+        .await
+        .expect("relay preparation timed out")
+        .expect("prepare a proactive relay through the real relay server");
+        let relay_public_addr = prepared.public_addr();
+
+        let sessions_while_live = relay_server.stats().current_active_sessions();
+        assert!(
+            sessions_while_live >= 1,
+            "the relay server should hold a session while the allocation is live"
+        );
+
+        // A real peer dials the relay-allocated address.
+        let peer = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                enable_relay_service: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("peer node");
+        let peer_connection = tokio::time::timeout(
+            Duration::from_secs(30),
+            peer.connect_to(&relay_public_addr.ip().to_string(), relay_public_addr),
+        )
+        .await
+        .expect("peer dial through the real relay timed out")
+        .expect("peer connection through the real relay");
+        assert!(peer_connection.close_reason().is_none());
+
+        // Wait for the relay side to finish accepting. `connect_to` returns as
+        // soon as the *peer* has its keys; tearing down before the relay
+        // endpoint has completed its half means the close goes out as the
+        // transport-level frame RFC 9000 requires during a handshake, rather
+        // than the application close this test is checking for.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.connections.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the relay endpoint should register the accepted peer connection");
+
+        // The real teardown.
+        client
+            .abort_proactive_relay(prepared)
+            .await
+            .expect("abort the proactive relay");
+
+        let close = tokio::time::timeout(Duration::from_secs(10), peer_connection.closed())
+            .await
+            .expect("a peer relayed through a real relay must be told, not left to time out");
+        assert!(
+            matches!(
+                close,
+                crate::ConnectionError::ApplicationClosed(ref closed)
+                    if closed.error_code == crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE)
+            ),
+            "expected the teardown's application close, got {close:?}"
+        );
+
+        // The relay server must get its capacity slot back.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while relay_server.stats().current_active_sessions() >= sessions_while_live {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("teardown must release the relay server's capacity slot");
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("relay recv stream closed"),
+            "the real teardown path must not report a transport failure; got:\n{captured}"
+        );
+
+        let _ = peer.shutdown().await;
+        let _ = client.shutdown().await;
+        let _ = relay_node.shutdown().await;
+    }
+
+    /// A live tunnel whose far side accepts the stream and never reads it, so
+    /// QUIC flow control stalls the writer and the outbound queue fills.
+    ///
+    /// This is the state the lost-wakeup race needs: a `TunnelPoller` parked on
+    /// a full send queue while the channel is still open.
+    #[allow(clippy::type_complexity)]
+    async fn stalled_tunnel() -> (
+        Arc<crate::masque::MasqueRelaySocket>,
+        Arc<crate::masque::RelayTunnelControl>,
+        Vec<NatTraversalEndpoint>,
+        InnerEndpoint,
+        Box<dyn std::any::Any + Send>,
+    ) {
+        let config_source = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("test bind address")),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("config source endpoint");
+        let server_config = config_source
+            .relay_server_config
+            .lock()
+            .expect("relay server config")
+            .clone()
+            .expect("relay server config present");
+        let client_config = config_source
+            .get_endpoint()
+            .expect("transport endpoint")
+            .default_client_config
+            .clone()
+            .expect("client config present");
+
+        let runtime = crate::high_level::default_runtime().expect("async runtime");
+        let tunnel_server = InnerEndpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("tunnel server socket"),
+            Arc::clone(&runtime),
+        )
+        .expect("tunnel server endpoint");
+        let tunnel_server_addr = tunnel_server.local_addr().expect("tunnel server addr");
+
+        let mut tunnel_client = InnerEndpoint::new(
+            EndpointConfig::default(),
+            None,
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("tunnel client socket"),
+            Arc::clone(&runtime),
+        )
+        .expect("tunnel client endpoint");
+        tunnel_client.set_default_client_config(client_config);
+
+        // Accept the tunnel stream and then deliberately never read it.
+        let accept = tokio::spawn(async move {
+            let incoming = tunnel_server.accept().await.expect("tunnel incoming");
+            let connection = incoming.await.expect("tunnel accepted");
+            let streams = connection.accept_bi().await.expect("tunnel stream");
+            (tunnel_server, connection, streams)
+        });
+
+        let tunnel_conn = tunnel_client
+            .connect(tunnel_server_addr, &tunnel_server_addr.ip().to_string())
+            .expect("dial tunnel server")
+            .await
+            .expect("tunnel connection");
+        let (mut client_send, client_recv) =
+            tunnel_conn.open_bi().await.expect("open tunnel stream");
+        client_send
+            .write_all(&0u32.to_be_bytes())
+            .await
+            .expect("open the tunnel stream on the wire");
+        let held = tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("tunnel accept timed out")
+            .expect("tunnel accept task");
+
+        let original_socket = tunnel_client
+            .current_socket()
+            .expect("tunnel client socket");
+        let (socket, tunnel) = crate::masque::MasqueRelaySocket::new(
+            client_send,
+            client_recv,
+            "203.0.113.9:9000".parse().expect("relay public address"),
+            tunnel_server_addr,
+            original_socket,
+        );
+
+        // The far side is returned, not forgotten: it must stay alive and unread
+        // for the duration of the test, and the caller drops it at the end.
+        (
+            socket,
+            tunnel,
+            vec![config_source],
+            tunnel_client,
+            Box::new(held),
+        )
+    }
+
+    /// The driver crashing used to be what freed a connection parked waiting for
+    /// send capacity. It no longer crashes, so shutdown has to free it.
+    ///
+    /// `shutdown_now` records the writer as stopped, aborts it, and wakes
+    /// capacity waiters — but `JoinHandle::abort` is asynchronous, so the send
+    /// channel is still open when the poller wakes. A poller that consulted only
+    /// the channel would see it full and open, consume the notification, re-park,
+    /// and never be woken again, because closing an mpsc does not touch the
+    /// `Notify`.
+    ///
+    /// The tunnel is marked failed first, so this also pins that the writer
+    /// state is tracked independently of which cause was settled first.
+    #[tokio::test]
+    async fn shutdown_releases_a_poller_parked_on_a_full_send_queue() {
+        let (socket, tunnel, _keepalive, _tunnel_client, _far_side) = stalled_tunnel().await;
+
+        let transmit = |contents: &'static [u8]| quinn_udp::Transmit {
+            destination: "198.51.100.4:4433".parse().expect("destination address"),
+            ecn: None,
+            contents,
+            segment_size: None,
+            src_ip: None,
+        };
+
+        let filled = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match socket.try_send(&transmit(&[0u8; 1024])) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                    Ok(()) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("filling the send queue should not take 30s");
+        filled.expect("the queue should fill, not fail");
+
+        let wake_record = Arc::new(RecordingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_record));
+        let mut cx = Context::from_waker(&waker);
+        let mut poller = Arc::clone(&socket).create_io_poller();
+        assert!(
+            matches!(poller.as_mut().poll_writable(&mut cx), Poll::Pending),
+            "a full send queue should park the poller"
+        );
+        assert!(
+            !wake_record.was_woken(),
+            "nothing should have woken the poller yet"
+        );
+
+        // Synchronous on purpose: the aborted writer has not run yet, so the
+        // send channel is still open. Only the recorded writer state can release
+        // the poller here — and the cause settles as `Failed`, not
+        // `ShutdownRequested`, so the two really are independent.
+        tunnel.mark_failed();
+        tunnel.shutdown_now();
+        assert!(
+            wake_record.was_woken(),
+            "shutdown must wake the parked poller, not leave it for the abort to land"
+        );
+        assert!(
+            !tunnel.shutdown_requested(),
+            "the first cause wins, so this teardown stays classified as a failure"
+        );
+        assert!(
+            socket.send_channel_open(),
+            "this test is only meaningful while the channel is still open"
+        );
+
+        assert!(
+            matches!(poller.as_mut().poll_writable(&mut cx), Poll::Ready(Ok(()))),
+            "shutdown must release a parked poller without waiting for the channel to close"
+        );
+
+        // Readiness has to be matched by a send that completes. Quinn retries a
+        // `WouldBlock` immediately and without yielding, so answering "writable"
+        // and then refusing the datagram would spin the connection driver — on a
+        // current-thread runtime, possibly forever, because the aborted writer
+        // never gets to run and close the channel.
+        assert!(
+            socket.send_channel_open(),
+            "the channel must still be open for this to test what it claims"
+        );
+        let sent = socket.try_send(&transmit(&[0u8; 1024]));
+        assert!(
+            !matches!(&sent, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a writable answer must not be followed by WouldBlock; got {sent:?}"
+        );
+    }
+
+    /// The quiet path must stay scoped to teardowns we asked for: a tunnel that
+    /// breaks on its own is still a transport failure and must still be logged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unexpected_tunnel_loss_still_reports_a_transport_error() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let live = live_proactive_relay().await;
+
+        // The relay peer goes away; the tunnel reader's stream read fails.
+        live.relay_peer.shutdown().await.expect("relay peer down");
+        tokio::time::timeout(Duration::from_secs(5), live.relay.tunnel.closed())
+            .await
+            .expect("reader task should observe the broken relay stream");
+
+        // `closed()` fires when the cause settles, which is before the reader
+        // drops `recv_tx` and before the driver has necessarily logged. Wait for
+        // the line itself rather than guessing at a sleep.
+        let captured = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let captured = logs.text();
+                if captured.contains("relay recv stream closed") {
+                    return captured;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| logs.text());
+
+        assert!(
+            captured.contains("relay recv stream closed"),
+            "a tunnel that broke on its own must still surface as a transport failure; got:\n{captured}"
+        );
+
+        let _ = live.local.shutdown().await;
+    }
+
+    /// `is_relay_healthy` can condemn a relay from the outer session's state
+    /// while the tunnel's own cause is still `Live`. The monitor's abort has to
+    /// record that as a failure, or the teardown's `shutdown()` settles first
+    /// and files it as something we chose to do.
+    #[tokio::test]
+    async fn the_health_monitors_abort_is_recorded_as_a_failure() {
+        let live = live_proactive_relay().await;
+        let tunnel = Arc::clone(&live.relay.tunnel);
+        let prepared = live.relay.handle;
+        assert!(!tunnel.is_closed(), "the tunnel starts out live");
+
+        let (generation, previous) = live
+            .local
+            .relay_lifecycle
+            .begin_prepare()
+            .await
+            .expect("begin prepare");
+        assert!(previous.is_none());
+        live.local
+            .relay_lifecycle
+            .complete_prepare(generation, live.relay)
+            .await
+            .expect("lifecycle actor")
+            .map_err(|_| "the relay must install")
+            .expect("relay installed");
+
+        live.local
+            .abort_unhealthy_proactive_relay(prepared)
+            .await
+            .expect("the health monitor's abort");
+
+        assert!(tunnel.is_closed());
+        assert!(
+            !tunnel.shutdown_requested(),
+            "a relay torn down because it was found dead is a failure, not a request"
+        );
+
+        let _ = live.local.shutdown().await;
+        let _ = live.relay_peer.shutdown().await;
+    }
 
     async fn detached_proactive_relay(public_addr: SocketAddr) -> ProactiveRelay {
         let endpoint = NatTraversalEndpoint::new(
