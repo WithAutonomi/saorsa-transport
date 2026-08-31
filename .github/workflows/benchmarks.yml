@@ -91,7 +91,7 @@ jobs:
 
       - name: Download baseline benchmarks
         if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v6
+        uses: dawidd6/action-download-artifact@v24
         with:
           workflow: benchmarks.yml
           branch: ${{ github.base_ref }}
