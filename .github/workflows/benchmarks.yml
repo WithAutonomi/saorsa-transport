@@ -256,7 +256,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Download current results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: benchmark-results-${{ github.sha }}
 
