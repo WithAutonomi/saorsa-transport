@@ -13,11 +13,12 @@
 //! certificate hash from a bootstrap record, so no DNS or signaling service is
 //! required.
 //!
-//! The browser creates an SDP offer with a random credential prefixed by
-//! [`ICE_CREDENTIAL_PREFIX`] and synthesizes the listener's SDP answer from the
-//! bootstrap endpoint. The listener learns that credential and the browser's
-//! observed address from the first STUN binding request, then constructs the
-//! corresponding peer connection locally.
+//! The browser keeps the ICE credentials generated for its local SDP offer and
+//! synthesizes the listener's SDP answer from the bootstrap endpoint. The
+//! answer's username fragment uses [`ICE_CREDENTIAL_PREFIX`] and carries the
+//! browser-generated ICE password. The listener recovers that password, the
+//! browser's username fragment, and its observed address from the first STUN
+//! binding request, then constructs the corresponding peer connection locally.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -54,8 +55,14 @@ use webrtc_rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use crate::transport::WebRtcDirectAddr;
 
-/// Prefix identifying the first version of the Saorsa WebRTC Direct profile.
-pub const ICE_CREDENTIAL_PREFIX: &str = "saorsa+webrtc+v1/";
+/// Prefix identifying the legacy SDP-munging Saorsa WebRTC Direct profile.
+pub const ICE_CREDENTIAL_PREFIX_V1: &str = "saorsa+webrtc+v1/";
+
+/// Prefix identifying the no-SDP-mutation Saorsa WebRTC Direct profile.
+pub const ICE_CREDENTIAL_PREFIX_V2: &str = "saorsa+webrtc+v2/";
+
+/// Prefix used by new Saorsa WebRTC Direct dials.
+pub const ICE_CREDENTIAL_PREFIX: &str = ICE_CREDENTIAL_PREFIX_V2;
 
 /// Maximum binary message size supported by this transport profile.
 ///
@@ -195,14 +202,16 @@ impl WebRtcDirectListener {
             .ok_or(WebRtcDirectError::Closed)?;
         let result = create_inbound_connection(
             association.remote_addr,
-            &association.ice_credential,
+            &association.server_ufrag,
+            &association.client_ufrag,
+            &association.client_pwd,
             Arc::clone(&self.mux),
             &self.certificate,
         )
         .await;
         if result.is_err() {
             self.mux
-                .release_pending(association.remote_addr, &association.ice_credential);
+                .release_pending(association.remote_addr, &association.server_ufrag);
         }
         result
     }
@@ -421,13 +430,17 @@ impl WebRtcDataChannel {
 
 async fn create_inbound_connection(
     remote_addr: SocketAddr,
-    ice_credential: &str,
+    server_ufrag: &str,
+    client_ufrag: &str,
+    client_pwd: &str,
     udp_mux: Arc<DirectUdpMux>,
     certificate: &WebRtcCertificate,
 ) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
-    if !is_valid_ice_credential(ice_credential) {
+    if parse_profile_credentials(server_ufrag, client_ufrag)
+        .is_none_or(|credentials| credentials.client_pwd != client_pwd)
+    {
         return Err(WebRtcDirectError::Protocol(
-            "invalid Saorsa ICE credential".to_string(),
+            "invalid Saorsa WebRTC Direct ICE credentials".to_string(),
         ));
     }
 
@@ -437,7 +450,7 @@ async fn create_inbound_connection(
     settings
         .set_answering_dtls_role(DTLSRole::Server)
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
-    settings.set_ice_credentials(ice_credential.to_string(), ice_credential.to_string());
+    settings.set_ice_credentials(server_ufrag.to_string(), server_ufrag.to_string());
     settings.set_udp_network(UDPNetwork::Muxed(udp_mux as Arc<dyn UDPMux + Send + Sync>));
     settings.detach_data_channels();
     settings.set_srtp_protection_profiles(vec![
@@ -490,7 +503,7 @@ async fn create_inbound_connection(
         })
     }));
 
-    let offer = RTCSessionDescription::offer(client_offer(remote_addr, ice_credential))
+    let offer = RTCSessionDescription::offer(client_offer(remote_addr, client_ufrag, client_pwd))
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     peer_connection
         .set_remote_description(offer)
@@ -519,13 +532,12 @@ async fn create_outbound_client(
     local_addr: SocketAddr,
     udp_mux: Arc<DirectUdpMux>,
 ) -> Result<(Arc<RTCPeerConnection>, WebRtcDataChannel), WebRtcDirectError> {
-    let ice_credential = format!(
-        "{ICE_CREDENTIAL_PREFIX}{}",
-        Alphanumeric.sample_string(&mut rand::thread_rng(), 32)
-    );
+    let client_ufrag = random_ice_string(32);
+    let client_pwd = random_ice_string(32);
+    let server_ufrag = format!("{ICE_CREDENTIAL_PREFIX_V2}{client_pwd}");
     let client_certificate = WebRtcCertificate::generate()?;
     let mut settings = SettingEngine::default();
-    settings.set_ice_credentials(ice_credential.clone(), ice_credential.clone());
+    settings.set_ice_credentials(client_ufrag, client_pwd);
     settings.set_udp_network(UDPNetwork::Muxed(udp_mux as Arc<dyn UDPMux + Send + Sync>));
     settings.detach_data_channels();
     settings.set_srtp_protection_profiles(vec![
@@ -592,7 +604,7 @@ async fn create_outbound_client(
     let answer = RTCSessionDescription::answer(server_answer(
         endpoint.socket_addr(),
         endpoint.certificate_hash().as_bytes(),
-        &ice_credential,
+        &server_ufrag,
     ))
     .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     peer_connection
@@ -646,7 +658,7 @@ fn register_data_channel_handler(
     }));
 }
 
-fn client_offer(remote_addr: SocketAddr, ice_credential: &str) -> String {
+fn client_offer(remote_addr: SocketAddr, client_ufrag: &str, client_pwd: &str) -> String {
     let (ip_version, ip) = match remote_addr.ip() {
         IpAddr::V4(ip) => ("IP4", ip.to_string()),
         IpAddr::V6(ip) => ("IP6", ip.to_string()),
@@ -660,8 +672,8 @@ t=0 0\n\
 m=application {} UDP/DTLS/SCTP webrtc-datachannel\n\
 a=mid:0\n\
 a=ice-options:ice2\n\
-a=ice-ufrag:{ice_credential}\n\
-a=ice-pwd:{ice_credential}\n\
+a=ice-ufrag:{client_ufrag}\n\
+a=ice-pwd:{client_pwd}\n\
 a=fingerprint:sha-256 FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF\n\
 a=setup:actpass\n\
 a=sctp-port:5000\n\
@@ -707,18 +719,63 @@ a=end-of-candidates\n",
     )
 }
 
-fn is_valid_ice_credential(credential: &str) -> bool {
-    credential.starts_with(ICE_CREDENTIAL_PREFIX)
-        && (22..=256).contains(&credential.len())
-        && credential
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+fn random_ice_string(length: usize) -> String {
+    Alphanumeric.sample_string(&mut rand::thread_rng(), length)
+}
+
+fn is_ice_char_string(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+fn is_valid_ice_ufrag(value: &str) -> bool {
+    (4..=256).contains(&value.len()) && is_ice_char_string(value)
+}
+
+fn is_valid_ice_pwd(value: &str) -> bool {
+    (22..=256).contains(&value.len()) && is_ice_char_string(value)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProfileCredentials {
+    server_ufrag: String,
+    client_ufrag: String,
+    client_pwd: String,
+}
+
+fn parse_profile_credentials(server_ufrag: &str, client_ufrag: &str) -> Option<ProfileCredentials> {
+    if !is_valid_ice_ufrag(server_ufrag) || !is_valid_ice_ufrag(client_ufrag) {
+        return None;
+    }
+
+    let client_pwd = if let Some(client_pwd) = server_ufrag.strip_prefix(ICE_CREDENTIAL_PREFIX_V2) {
+        if !is_valid_ice_pwd(client_pwd) {
+            return None;
+        }
+        client_pwd
+    } else if server_ufrag.starts_with(ICE_CREDENTIAL_PREFIX_V1) {
+        if !is_valid_ice_pwd(client_ufrag) {
+            return None;
+        }
+        client_ufrag
+    } else {
+        return None;
+    };
+
+    Some(ProfileCredentials {
+        server_ufrag: server_ufrag.to_string(),
+        client_ufrag: client_ufrag.to_string(),
+        client_pwd: client_pwd.to_string(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IncomingAssociation {
     remote_addr: SocketAddr,
-    ice_credential: String,
+    server_ufrag: String,
+    client_ufrag: String,
+    client_pwd: String,
 }
 
 struct DirectUdpMux {
@@ -774,26 +831,28 @@ impl DirectUdpMux {
                 continue;
             }
 
-            let Some(ice_credential) = remote_ice_credential(packet) else {
+            let Some((server_ufrag, client_ufrag)) = stun_ice_credentials(packet) else {
                 continue;
             };
-            if !is_valid_ice_credential(&ice_credential) {
-                tracing::debug!(%remote_addr, "ignored invalid WebRTC Direct ICE credential");
+            let Some(credentials) = parse_profile_credentials(&server_ufrag, &client_ufrag) else {
+                tracing::debug!(%remote_addr, "ignored invalid or unsupported WebRTC Direct ICE credentials");
                 continue;
-            }
+            };
             let association = IncomingAssociation {
                 remote_addr,
-                ice_credential,
+                server_ufrag: credentials.server_ufrag,
+                client_ufrag: credentials.client_ufrag,
+                client_pwd: credentials.client_pwd,
             };
             {
                 let mut pending = self.pending.write();
-                if pending.contains_key(&association.ice_credential) {
+                if pending.contains_key(&association.server_ufrag) {
                     continue;
                 }
-                pending.insert(association.ice_credential.clone(), association.remote_addr);
+                pending.insert(association.server_ufrag.clone(), association.remote_addr);
             }
             if let Err(error) = self.incoming.try_send(association.clone()) {
-                self.pending.write().remove(&association.ice_credential);
+                self.pending.write().remove(&association.server_ufrag);
                 tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is full");
             }
         }
@@ -912,10 +971,6 @@ fn local_ice_credential(packet: &[u8]) -> Option<String> {
     stun_ice_credentials(packet).map(|(local, _)| local)
 }
 
-fn remote_ice_credential(packet: &[u8]) -> Option<String> {
-    stun_ice_credentials(packet).map(|(_, remote)| remote)
-}
-
 fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
     if !is_stun_message(packet) {
         return None;
@@ -939,17 +994,38 @@ mod tests {
     use stun::textattrs::Username;
 
     #[test]
-    fn validates_only_saorsa_profile_credentials() {
-        assert!(is_valid_ice_credential(
-            "saorsa+webrtc+v1/0123456789abcdefghijklmnopqrstuv"
-        ));
-        assert!(!is_valid_ice_credential(
-            "libp2p+webrtc+v1/0123456789abcdefghijklmnopqrstuv"
-        ));
-        assert!(!is_valid_ice_credential("saorsa+webrtc+v1/too-short"));
-        assert!(!is_valid_ice_credential(
-            "saorsa+webrtc+v1/invalid_underscore_character"
-        ));
+    fn parses_only_supported_saorsa_profile_credentials() {
+        let v1 = "saorsa+webrtc+v1/0123456789abcdefghijklmnopqrstuv";
+        assert_eq!(
+            parse_profile_credentials(v1, v1),
+            Some(ProfileCredentials {
+                server_ufrag: v1.to_string(),
+                client_ufrag: v1.to_string(),
+                client_pwd: v1.to_string(),
+            })
+        );
+
+        let client_pwd = "browserClientPassword1234";
+        let server_ufrag = format!("{ICE_CREDENTIAL_PREFIX_V2}{client_pwd}");
+        assert_eq!(
+            parse_profile_credentials(&server_ufrag, "browserClientUfrag"),
+            Some(ProfileCredentials {
+                server_ufrag,
+                client_ufrag: "browserClientUfrag".to_string(),
+                client_pwd: client_pwd.to_string(),
+            })
+        );
+
+        assert!(parse_profile_credentials("unknown+webrtc+v2/abcd", "browserClient").is_none());
+        assert!(parse_profile_credentials("saorsa+webrtc+v2/too-short", "browserClient").is_none());
+        assert!(
+            parse_profile_credentials(
+                "saorsa+webrtc+v2/abcdefghijklmnopqrstuv\r\na=candidate:x",
+                "browserClient"
+            )
+            .is_none()
+        );
+        assert!(parse_profile_credentials(&"a".repeat(257), "browserClient").is_none());
     }
 
     #[test]
@@ -963,14 +1039,59 @@ mod tests {
     }
 
     #[test]
-    fn client_offer_contains_observed_address_and_saorsa_credential() {
+    fn client_offer_contains_observed_address_and_distinct_v2_credentials() {
         let address: SocketAddr = "192.0.2.4:49152".parse().unwrap();
-        let credential = "saorsa+webrtc+v1/0123456789abcdefghijklmnopqrstuv";
-        let offer = client_offer(address, credential);
+        let client_ufrag = "browserClientUfrag";
+        let client_pwd = "browserClientPassword1234";
+        let offer = client_offer(address, client_ufrag, client_pwd);
         assert!(offer.contains("m=application 49152 UDP/DTLS/SCTP webrtc-datachannel"));
         assert!(offer.contains("c=IN IP4 192.0.2.4"));
-        assert!(offer.contains(&format!("a=ice-ufrag:{credential}")));
+        assert!(offer.contains(&format!("a=ice-ufrag:{client_ufrag}")));
+        assert!(offer.contains(&format!("a=ice-pwd:{client_pwd}")));
         assert!(RTCSessionDescription::offer(offer).is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_v2_dial_opens_a_bidirectional_data_channel() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let certificate_hash = certificate.sha256_digest().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let endpoint = WebRtcDirectAddr::new(
+            listener.local_addr(),
+            crate::transport::WebRtcCertificateHash::new(certificate_hash),
+        )
+        .unwrap();
+        let accepted = tokio::spawn(async move {
+            let mut connection = listener.accept().await.unwrap();
+            let channel = connection.accept_data_channel().await.unwrap();
+            assert_eq!(channel.label(), "saorsa-v2-test");
+            assert_eq!(channel.receive().await.unwrap(), b"client-to-server");
+            channel.send(b"server-to-client").await.unwrap();
+            assert_eq!(channel.receive().await.unwrap(), b"client-finished");
+            connection.close().await.unwrap();
+        });
+
+        let client = WebRtcDirectClient::dial(&endpoint, "saorsa-v2-test")
+            .await
+            .unwrap();
+        client
+            .data_channel()
+            .send(b"client-to-server")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.data_channel().receive().await.unwrap(),
+            b"server-to-client"
+        );
+        client
+            .data_channel()
+            .send(b"client-finished")
+            .await
+            .unwrap();
+        accepted.await.unwrap();
+        client.close().await.unwrap();
     }
 
     #[tokio::test]
