@@ -107,7 +107,7 @@ lru-slab = "0.1.2"
 dirs = "6.0"
 
 # Platform keychain/keyring for secure credential storage
-keyring = "3"
+keyring = "4"
 
 # Crypto dependencies (required for PQC)
 rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"] }
