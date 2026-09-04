@@ -12,8 +12,10 @@ use fips204::{
 };
 use std::time::Duration;
 
+mod payment;
 mod session;
 mod wire;
+pub use payment::*;
 pub use session::{
     PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
     PQ_SERVER_ACCEPT_BYTES, PqClientHandshake, PqSession, PqSessionError, accept_pq_session,
@@ -21,7 +23,14 @@ pub use session::{
 };
 pub use wire::*;
 
-fn verify_ml_dsa_65(public_key: &[u8], signature: &[u8], message: &[u8], context: &[u8]) -> bool {
+/// Verify an ML-DSA-65 signature, returning `false` for malformed input.
+#[must_use]
+pub fn verify_ml_dsa_65(
+    public_key: &[u8],
+    signature: &[u8],
+    message: &[u8],
+    context: &[u8],
+) -> bool {
     let Ok(public_key) = <[u8; ml_dsa_65::PK_LEN]>::try_from(public_key) else {
         return false;
     };
