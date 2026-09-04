@@ -3486,11 +3486,13 @@ dependencies = [
  "fips204",
  "getrandom 0.2.17",
  "hex",
+ "postcard",
  "saorsa-pqc 0.5.1",
  "serde",
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+ "tiny-keccak",
  "zeroize",
 ]
 
@@ -4026,6 +4028,15 @@ checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]
