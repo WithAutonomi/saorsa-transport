@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "saorsa-webrtc",
     "saorsa-transport-workspace-hack",
 ]
 
@@ -77,9 +78,14 @@ fuzzing = ["arbitrary"]
 # - macOS: Uses Core Bluetooth via btleplug crate
 ble = ["dep:btleplug"]
 
+# Signaling-free WebRTC DataChannel listener for direct browser clients.
+# The feature is optional so QUIC-only users do not pull in ICE/DTLS/SCTP.
+webrtc-direct = ["dep:stun", "dep:webrtc", "dep:webrtc-rcgen"]
+
 [dependencies]
 # Core dependencies
 async-trait = "0.1"
+base64 = "0.22"
 bytes = ">=1.11.1"
 enum_dispatch = "0.3"
 rustc-hash = "2"
@@ -135,6 +141,12 @@ btleplug = { version = "0.11", optional = true }
 rcgen = { version = "0.14" }
 tokio-util = { version = "0.7" }
 futures-util = { version = "0.3" }
+
+# Browser transport primitives. Saorsa owns the transport API and wire
+# profile; these crates provide the standardized ICE/DTLS/SCTP machinery.
+stun = { version = "0.7", optional = true }
+webrtc = { version = "0.14", features = ["pem"], optional = true }
+webrtc-rcgen = { package = "rcgen", version = "0.13", optional = true }
 
 time = { version = "0.3.47" }
 rustls-pemfile = { version = "2.0" }

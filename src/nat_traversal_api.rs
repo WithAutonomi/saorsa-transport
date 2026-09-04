@@ -6258,6 +6258,7 @@ impl NatTraversalEndpoint {
         // Transport type bonus (0-10000)
         let transport_bonus = match candidate.transport_type() {
             TransportType::Quic => 10000,
+            TransportType::WebRtcDirect => 9750,
             TransportType::Tcp => 9500,
             TransportType::Udp => 9000,
             TransportType::Yggdrasil => 8000,
