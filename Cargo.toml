@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "saorsa-webrtc",
     "saorsa-transport-workspace-hack",
 ]
 
