@@ -3286,46 +3286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "saorsa-pqc"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2ed2e429e5673763625ca5285bcbf15270fa16918cb5e63fc95ababacbb1a4c"
-dependencies = [
- "aead",
- "aes-gcm",
- "anyhow",
- "blake3",
- "bytes",
- "chacha20poly1305",
- "fips203",
- "fips204",
- "fips205",
- "futures",
- "hkdf",
- "hmac",
- "hpke",
- "libc",
- "log",
- "pbkdf2",
- "postcard",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "sha3",
- "subtle",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "wide",
- "zeroize",
-]
-
-[[package]]
 name = "saorsa-transport"
 version = "0.36.3"
 dependencies = [
@@ -3376,7 +3336,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-platform-verifier",
  "rustls-post-quantum",
- "saorsa-pqc 0.4.2",
+ "saorsa-pqc",
  "saorsa-transport-workspace-hack",
  "serde",
  "serde_json",
@@ -3428,18 +3388,20 @@ dependencies = [
 name = "saorsa-webrtc"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
  "fips203",
  "fips204",
  "getrandom 0.2.17",
  "hex",
- "saorsa-pqc 0.5.1",
+ "postcard",
+ "saorsa-pqc",
  "serde",
  "serde_bytes",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
+ "tiny-keccak",
  "zeroize",
 ]
 
@@ -3986,6 +3948,15 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]
