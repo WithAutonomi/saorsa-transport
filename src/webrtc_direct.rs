@@ -846,7 +846,9 @@ impl DirectUdpMux {
             };
             {
                 let mut pending = self.pending.write();
-                if pending.contains_key(&association.server_ufrag) {
+                if pending.contains_key(&association.server_ufrag)
+                    || pending.len() >= MAX_PENDING_ASSOCIATIONS
+                {
                     continue;
                 }
                 pending.insert(association.server_ufrag.clone(), association.remote_addr);
@@ -929,6 +931,11 @@ impl UDPMux for DirectUdpMux {
 
     async fn remove_conn_by_ufrag(&self, ice_credential: &str) {
         let removed = self.conns.lock().await.remove(ice_credential);
+        // ICE closes through this hook even before a UDP candidate is gathered
+        // or registered for an address. Such associations never reach
+        // register_conn_for_address, so their pending credential must be
+        // released here independently of whether a mux connection exists.
+        self.pending.write().remove(ice_credential);
         if let Some(connection) = removed {
             let mut addresses = self.address_map.write();
             for address in connection.get_addresses() {
@@ -1092,6 +1099,105 @@ mod tests {
             .unwrap();
         accepted.await.unwrap();
         client.close().await.unwrap();
+    }
+
+    fn incomplete_association_request(password: &str) -> Vec<u8> {
+        let mut request = StunMessage::new();
+        request
+            .build(&[
+                Box::new(BINDING_REQUEST),
+                Box::new(TransactionId::new()),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{ICE_CREDENTIAL_PREFIX_V2}{password}:browserClientUfrag"),
+                )),
+            ])
+            .unwrap();
+        request.raw
+    }
+
+    #[tokio::test]
+    async fn closing_incomplete_associations_releases_pending_credentials() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = incomplete_association_request("browserPassword0123456789");
+
+        // No ICE integrity attribute or handshake follows the initial packet.
+        // Rejection and first-channel timeout both close this same association.
+        // Reuse its credential to prove that cleanup also permits a later retry.
+        for _ in 0..8 {
+            sender
+                .send_to(&request, listener.local_addr())
+                .await
+                .unwrap();
+            let connection =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(listener.mux.pending.read().len(), 1);
+            connection.close().await.unwrap();
+            assert!(listener.mux.pending.read().is_empty());
+        }
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_associations_stay_bounded_after_draining_the_accept_queue() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Drain notifications without completing ICE, leaving the pending
+        // registrations alive. Queue capacity alone cannot bound this state.
+        for index in 0..MAX_PENDING_ASSOCIATIONS {
+            let request = incomplete_association_request(&format!("browserPassword{index:016}"));
+            sender
+                .send_to(&request, listener.local_addr())
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let request = incomplete_association_request("browserPasswordOverflow0123");
+        sender
+            .send_to(&request, listener.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                listener.incoming.recv(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(listener.mux.pending.read().len(), MAX_PENDING_ASSOCIATIONS);
+
+        listener
+            .mux
+            .remove_conn_by_ufrag(&format!(
+                "{ICE_CREDENTIAL_PREFIX_V2}browserPassword{:016}",
+                0
+            ))
+            .await;
+        sender
+            .send_to(&request, listener.local_addr())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener.incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(listener.mux.pending.read().len(), MAX_PENDING_ASSOCIATIONS);
+        listener.close().await.unwrap();
     }
 
     #[tokio::test]
