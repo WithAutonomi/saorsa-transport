@@ -195,11 +195,11 @@ impl WebRtcDirectListener {
 
     /// Accept the next browser association discovered through STUN.
     pub async fn accept(&mut self) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
-        let association = self
-            .incoming
-            .recv()
-            .await
-            .ok_or(WebRtcDirectError::Closed)?;
+        let association = tokio::select! {
+            biased;
+            () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
+            association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
+        };
         let result = create_inbound_connection(
             association.remote_addr,
             &association.server_ufrag,
@@ -1238,6 +1238,66 @@ mod tests {
             ])
             .unwrap();
         request.raw
+    }
+
+    #[tokio::test]
+    async fn listener_accept_returns_closed_even_with_queued_associations() {
+        use std::time::Duration;
+
+        for queued in [false, true] {
+            let mut listener = WebRtcDirectListener::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                WebRtcCertificate::generate().unwrap(),
+            )
+            .await
+            .unwrap();
+            if queued {
+                listener
+                    .mux
+                    .incoming
+                    .try_send(IncomingAssociation {
+                        remote_addr: "127.0.0.1:55555".parse().unwrap(),
+                        server_ufrag: format!(
+                            "{ICE_CREDENTIAL_PREFIX_V2}browserPassword0123456789"
+                        ),
+                        client_ufrag: "browserClientUfrag".to_string(),
+                        client_pwd: "browserPassword0123456789".to_string(),
+                    })
+                    .unwrap();
+            }
+            listener.close().await.unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await,
+                    Ok(Err(WebRtcDirectError::Closed))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_wakes_pending_accept() {
+        use std::time::Duration;
+
+        let mut listener = WebRtcDirectListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mux = Arc::clone(&listener.mux);
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut accept)
+                .await
+                .is_err()
+        );
+        mux.close().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), accept).await,
+            Ok(Err(WebRtcDirectError::Closed))
+        ));
     }
 
     #[tokio::test]
