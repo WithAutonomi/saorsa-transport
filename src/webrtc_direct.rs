@@ -281,7 +281,20 @@ pub struct WebRtcDirectClient {
     peer_connection: Arc<RTCPeerConnection>,
     channel: WebRtcDataChannel,
     mux: Arc<DirectUdpMux>,
-    driver: JoinHandle<()>,
+    _driver: UdpDriver,
+}
+
+/// Own the receive task even while a dial future is still being polled.
+struct UdpDriver {
+    shutdown: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Drop for UdpDriver {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
 }
 
 impl WebRtcDirectClient {
@@ -305,27 +318,23 @@ impl WebRtcDirectClient {
         drop(incoming);
         let mux = DirectUdpMux::new(Arc::clone(&socket), local_addr, unused_incoming);
         let driver_mux = Arc::clone(&mux);
-        let driver = tokio::spawn(async move {
-            driver_mux.run(socket).await;
-        });
-
-        let result =
-            create_outbound_client(endpoint, data_channel_label, local_addr, Arc::clone(&mux))
-                .await;
-        match result {
-            Ok((peer_connection, channel)) => Ok(Self {
-                local_addr,
-                peer_connection,
-                channel,
-                mux,
-                driver,
+        let driver = UdpDriver {
+            shutdown: mux.shutdown.clone(),
+            task: tokio::spawn(async move {
+                driver_mux.run(socket).await;
             }),
-            Err(error) => {
-                mux.shutdown.cancel();
-                driver.abort();
-                Err(error)
-            }
-        }
+        };
+
+        let (peer_connection, channel) =
+            create_outbound_client(endpoint, data_channel_label, local_addr, Arc::clone(&mux))
+                .await?;
+        Ok(Self {
+            local_addr,
+            peer_connection,
+            channel,
+            mux,
+            _driver: driver,
+        })
     }
 
     /// Return the local UDP address used for this association.
@@ -349,13 +358,6 @@ impl WebRtcDirectClient {
             .close()
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))
-    }
-}
-
-impl Drop for WebRtcDirectClient {
-    fn drop(&mut self) {
-        self.mux.shutdown.cancel();
-        self.driver.abort();
     }
 }
 
@@ -1056,6 +1058,45 @@ mod tests {
         assert!(offer.contains(&format!("a=ice-ufrag:{client_ufrag}")));
         assert!(offer.contains(&format!("a=ice-pwd:{client_pwd}")));
         assert!(RTCSessionDescription::offer(offer).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_dial_releases_udp_socket() {
+        use std::time::Duration;
+
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = WebRtcDirectAddr::new(
+            remote.local_addr().unwrap(),
+            crate::transport::WebRtcCertificateHash::new([1; 32]),
+        )
+        .unwrap();
+        let dial = tokio::spawn(async move {
+            WebRtcDirectClient::dial(&endpoint, "cancelled-dial-test").await
+        });
+        let mut buffer = [0; 2048];
+        let (_, local_addr) =
+            tokio::time::timeout(Duration::from_secs(2), remote.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        dial.abort();
+        assert!(matches!(dial.await, Err(error) if error.is_cancelled()));
+
+        // Task cancellation is scheduled asynchronously; wait for the driver
+        // to drop its socket, rather than relying on a fixed scheduler delay.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match UdpSocket::bind(local_addr).await {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("could not rebind cancelled dial socket: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled dial retained its UDP socket");
     }
 
     #[tokio::test]
