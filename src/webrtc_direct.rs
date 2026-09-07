@@ -249,14 +249,18 @@ impl WebRtcDirectConnection {
     /// Accept the next reliable ordered DataChannel opened by the browser.
     pub async fn accept_data_channel(&mut self) -> Result<WebRtcDataChannel, WebRtcDirectError> {
         loop {
+            if *self.closed.borrow() {
+                return Err(WebRtcDirectError::Closed);
+            }
             tokio::select! {
-                channel = self.incoming.recv() => {
-                    return channel.ok_or(WebRtcDirectError::Closed);
-                }
+                biased;
                 changed = self.closed.changed() => {
                     if changed.is_err() || *self.closed.borrow() {
                         return Err(WebRtcDirectError::Closed);
                     }
+                }
+                channel = self.incoming.recv() => {
+                    return channel.ok_or(WebRtcDirectError::Closed);
                 }
             }
         }
@@ -1298,6 +1302,39 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), accept).await,
             Ok(Err(WebRtcDirectError::Closed))
         ));
+    }
+
+    #[tokio::test]
+    async fn closed_association_rejects_repeated_channel_accepts() {
+        use std::time::Duration;
+
+        let mut listener = WebRtcDirectListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+        )
+        .await
+        .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &incomplete_association_request("browserPassword0123456789"),
+                listener.local_addr(),
+            )
+            .await
+            .unwrap();
+        let mut connection = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        connection.close().await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), connection.accept_data_channel())
+                    .await,
+                Ok(Err(WebRtcDirectError::Closed))
+            ));
+        }
+        listener.close().await.unwrap();
     }
 
     #[tokio::test]
