@@ -630,10 +630,9 @@ fn register_data_channel_handler(
     peer_connection.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let incoming = incoming.clone();
         Box::pin(async move {
-            if !channel.ordered() || channel.max_retransmits().is_some() {
-                channel.close().await.ok();
-                return;
-            }
+            let reliable = channel.ordered()
+                && channel.max_retransmits().is_none()
+                && channel.max_packet_lifetime().is_none();
             let label = channel.label().to_string();
             let id = channel.id();
             let open_channel = Arc::clone(&channel);
@@ -644,6 +643,13 @@ fn register_data_channel_handler(
                 Box::pin(async move {
                     match open_channel.detach().await {
                         Ok(inner) => {
+                            // on_data_channel runs before the SCTP stream is
+                            // attached. Close after opening so rejection also
+                            // resets the underlying stream at the remote peer.
+                            if !reliable {
+                                inner.close().await.ok();
+                                return;
+                            }
                             let channel = WebRtcDataChannel { inner, label, id };
                             if let Err(error) = incoming.try_send(channel) {
                                 let channel = error.into_inner();
@@ -1140,6 +1146,83 @@ mod tests {
             .unwrap();
         accepted.await.unwrap();
         client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_unordered_and_partially_reliable_channels() {
+        use std::time::Duration;
+        use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let hash = certificate.sha256_digest().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let endpoint = WebRtcDirectAddr::new(listener.local_addr(), hash.into()).unwrap();
+        let accepted = tokio::spawn(async move {
+            let mut connection = listener.accept().await.unwrap();
+            let channel = connection.accept_data_channel().await.unwrap();
+            (listener, connection, channel)
+        });
+        let client = WebRtcDirectClient::dial(&endpoint, "reliable-control")
+            .await
+            .unwrap();
+        let (listener, mut connection, control) = accepted.await.unwrap();
+
+        for options in [
+            RTCDataChannelInit {
+                ordered: Some(false),
+                ..Default::default()
+            },
+            RTCDataChannelInit {
+                max_retransmits: Some(0),
+                ..Default::default()
+            },
+            RTCDataChannelInit {
+                max_packet_life_time: Some(1000),
+                ..Default::default()
+            },
+        ] {
+            let channel = client
+                .peer_connection
+                .create_data_channel("unsupported-channel", Some(options))
+                .await
+                .unwrap();
+            let (opened_tx, mut opened_rx) = mpsc::channel(1);
+            let open_channel = Arc::clone(&channel);
+            channel.on_open(Box::new(move || {
+                let channel = Arc::clone(&open_channel);
+                let opened = opened_tx.clone();
+                Box::pin(async move {
+                    opened.send(channel.detach().await.unwrap()).await.unwrap();
+                })
+            }));
+            let detached = tokio::time::timeout(Duration::from_secs(2), opened_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut buffer = [0; 16];
+            let closed = tokio::time::timeout(
+                Duration::from_secs(2),
+                detached.read_data_channel(&mut buffer),
+            )
+            .await
+            .expect("rejected channel was not reset");
+            assert!(matches!(closed, Ok((0, _)) | Err(_)));
+        }
+
+        // The association still accepts traffic on its reliable channel, and
+        // none of the rejected channels reached the application accept queue.
+        client.data_channel().send(b"still reliable").await.unwrap();
+        assert_eq!(control.receive().await.unwrap(), b"still reliable");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), connection.accept_data_channel())
+                .await
+                .is_err()
+        );
+        connection.close().await.unwrap();
+        client.close().await.unwrap();
+        listener.close().await.unwrap();
     }
 
     fn incomplete_association_request(password: &str) -> Vec<u8> {
