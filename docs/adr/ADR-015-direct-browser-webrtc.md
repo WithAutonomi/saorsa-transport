@@ -1,0 +1,101 @@
+# ADR-015: Direct Browser Connections over WebRTC
+
+## Status
+
+Proposed, 2026-09-07. Implementation: [PR #160](https://github.com/WithAutonomi/saorsa-transport/pull/160).
+
+## Context
+
+Browsers cannot open the raw UDP sockets required by Saorsa's native QUIC
+transport. Browser clients need a direct connection to a public node without
+an HTTP data gateway, a signaling service, DNS, or public-CA certificates.
+The node-to-node QUIC transport retains its native NAT traversal extensions
+and post-quantum authentication.
+
+## Decision
+
+Offer an opt-in `webrtc-direct` listener on its own UDP socket. The browser
+transport uses ICE-lite, DTLS, SCTP, and reliable ordered DataChannels. This
+is a browser-specific exception to the native transport's exclusion of
+STUN/ICE; it does not introduce STUN servers, TURN, or ICE into QUIC traversal.
+
+Advertise a literal IPv4 or IPv6 address, nonzero UDP port, and stable SHA-256
+DTLS certificate hash. Browser application endpoints additionally carry the
+expected 32-byte ANT peer ID. The browser synthesizes an ICE-lite SDP answer
+using that certificate pin. The v2 ICE username fragment carries the browser's
+original ICE password, allowing the listener to recover the credentials from
+the first STUN request without modifying the browser's local offer. The
+listener also recognizes the existing v1 profile.
+
+The P-256 DTLS certificate is a transport credential, not an ANT identity.
+Applications must establish the portable `saorsa-webrtc` post-quantum session
+before accepting application RPCs: ephemeral ML-KEM-768, an ML-DSA-65 signed
+transcript bound to the expected peer ID, and ChaCha20-Poly1305 records with
+independent direction keys and strict sequence validation. The native listener
+API exposes raw binary channels; that API alone does not enforce the
+application handshake. Browser protocol v5, framing, payment metadata, and
+signature primitives live in the portable crate so native and WASM adapters
+share the same contract. Payment verification and RPC authorization remain
+application responsibilities.
+
+Use transport advertisement type 12; type 11 remains reserved for the earlier
+WebTransport experiment. Browser endpoints are advertised descriptors and do
+not become native QUIC dial targets through `as_socket_addr()`.
+
+### Admission and lifecycle
+
+- Bound pending ICE associations to 256 and queued application channels to 16.
+  These queue bounds do not replace application connection limits or first-RPC
+  deadlines. Callers must close rejected and expired associations.
+- Route STUN requests by ICE credential before consulting source-address
+  mappings so a new browser association can reuse a UDP source port.
+- Reject unordered channels and either partial-reliability mode. Reset rejected
+  streams after SCTP attaches them; closing the channel before attachment does
+  not reset the peer's stream in the current WebRTC dependency.
+- Limit each binary DataChannel message to 16 KiB. Larger application frames
+  use bounded framing and fragmentation in the portable protocol and adapters.
+- Own each outbound receive task with a drop guard during setup and after
+  connection establishment, so cancelling a dial releases its socket.
+- Make listener shutdown wake acceptance and make closed channel acceptance
+  terminal, including repeated calls and queued associations.
+
+### Dependencies
+
+Keep ICE, DTLS, and SCTP behind the optional native feature. The separate
+`saorsa-webrtc` crate builds for `wasm32-unknown-unknown` without the native
+transport graph. Its cryptographic, framing, and payment primitives are
+versioned together with the application profile.
+
+The current optional DTLS dependency uses unmaintained `bincode 1.3.3` for
+state export/import APIs that Saorsa does not invoke. The maintenance-only
+advisory has a documented exception in `deny.toml`; vulnerability checks
+remain enabled. [Issue #164](https://github.com/WithAutonomi/saorsa-transport/issues/164)
+tracks removal of the dependency and exception.
+
+## Consequences
+
+Browsers can transfer application data directly to public nodes while pinning
+the transport certificate and authenticating the ANT identity independently.
+The additional native dependency graph is opt-in, but deployments enabling it
+must manage certificate persistence, UDP reachability, application admission,
+and coordinated browser-protocol upgrades. Nodes without a public UDP path
+need a future relay design; this decision does not provide that path.
+
+Tests cover certificate persistence, address rejection and round trips, v2
+native interoperability, both partial-reliability modes, cancellation, stale
+UDP mappings, pending bounds, shutdown, PQ authentication, replay rejection,
+and portable framing. Downstream devnet and real-browser checks validate the
+combined application stack before rollout.
+
+## Alternatives Considered
+
+- An HTTP data gateway would route all browser file traffic through a service.
+- WebTransport would require a different browser trust and deployment model.
+- General WebRTC signaling and TURN would add coordination and relay services
+  outside the scope of direct connections to public nodes.
+
+## Mitigation / Rollback
+
+Leave `webrtc-direct` disabled or stop advertising and binding its listener.
+Revert the coordinated browser profile pins when reverting its wire contract.
+No stored record format or existing native QUIC wire behavior changes.
