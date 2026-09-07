@@ -10,11 +10,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr as _;
 
 /// Current browser request/response protocol version.
-pub const BROWSER_PROTOCOL_VERSION: u16 = 4;
+pub const BROWSER_PROTOCOL_VERSION: u16 = 5;
 /// Protocol name authenticated by the node HELLO response.
-pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v4";
+pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v5";
 /// Ordered WebRTC `DataChannel` label used by Autonomi nodes.
-pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v4";
+pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v5";
 /// Maximum content carried by one browser protocol frame.
 pub const MAX_BROWSER_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum JSON header carried by one browser protocol frame.
@@ -173,11 +173,13 @@ impl BrowserEndpointInput {
     }
 }
 
-/// Public EVM configuration transmitted by manifests and HELLO responses.
+/// Public EVM identity transmitted by manifests and HELLO responses.
+/// RPC endpoints belong to the node operator or client application and never
+/// form part of this wire record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPaymentNetwork {
-    /// HTTP(S) JSON-RPC endpoint.
-    pub rpc_url: String,
+    /// EVM chain ID used for payment verification.
+    pub chain_id: u64,
     /// ERC-20 payment token contract.
     pub payment_token_address: String,
     /// Autonomi payment vault contract.
@@ -380,6 +382,7 @@ pub enum BrowserResponseStatus {
 /// Browser RPC response variants and their fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Quote metadata intentionally stays inline.
 pub enum BrowserResponseBody {
     /// Authenticated node and protocol metadata.
     Hello {
@@ -1099,9 +1102,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_v3_and_length_mismatches() {
+    fn rejects_stale_v4_and_length_mismatches() {
         let stale = serde_json::json!({
-            "version": 3,
+            "version": 4,
             "request_id": 1,
             "status": "ok",
             "content_length": 0,
@@ -1133,7 +1136,7 @@ mod tests {
             max_chunk_size: MAX_BROWSER_RECORD_BYTES,
             capabilities: vec!["get_chunk".to_string()],
             payment: BrowserPaymentNetwork {
-                rpc_url: "http://127.0.0.1:8545/".to_string(),
+                chain_id: 31337,
                 payment_token_address: "11".repeat(20),
                 payment_vault_address: "22".repeat(20),
             },
@@ -1141,6 +1144,32 @@ mod tests {
         assert_eq!(
             validate_hello_metadata(&hello, &expected).expect("HELLO"),
             "ab".repeat(32)
+        );
+    }
+
+    #[test]
+    fn payment_metadata_contains_identity_without_rpc_configuration() {
+        let payment = BrowserPaymentNetwork {
+            chain_id: 31337,
+            payment_token_address: "11".repeat(20),
+            payment_vault_address: "22".repeat(20),
+        };
+        let value = serde_json::to_value(payment).expect("payment JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "chain_id": 31337,
+                "payment_token_address": "11".repeat(20),
+                "payment_vault_address": "22".repeat(20),
+            })
+        );
+        assert!(
+            serde_json::from_value::<BrowserPaymentNetwork>(serde_json::json!({
+                "rpc_url": "https://operator.invalid/private-key",
+                "payment_token_address": "11".repeat(20),
+                "payment_vault_address": "22".repeat(20),
+            }))
+            .is_err()
         );
     }
 
@@ -1157,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn value_shape_remains_the_v4_json_contract() {
+    fn value_shape_uses_the_v5_json_contract() {
         let response = BrowserResponse::ok(
             42,
             BrowserResponseBody::Chunk {
@@ -1167,7 +1196,7 @@ mod tests {
             3,
         );
         let value = serde_json::to_value(response).expect("response JSON");
-        assert_eq!(value["version"], Value::from(4));
+        assert_eq!(value["version"], Value::from(5));
         assert_eq!(value["request_id"], Value::from(42));
         assert_eq!(value["status"], Value::from("ok"));
         assert_eq!(value["type"], Value::from("chunk"));
