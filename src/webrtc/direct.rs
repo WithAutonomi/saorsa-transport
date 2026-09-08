@@ -323,9 +323,11 @@ impl WebRtcDirectListener {
             }));
         }
         let task = self.accepting.as_mut().ok_or(WebRtcDirectError::Closed)?;
-        let result = task
-            .await
-            .map_err(|error| WebRtcDirectError::Session(error.to_string()));
+        let result = tokio::select! {
+            biased;
+            () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
+            result = task => result.map_err(|error| WebRtcDirectError::Session(error.to_string())),
+        };
         self.accepting = None;
         result?
     }
@@ -1634,6 +1636,26 @@ mod tests {
             ));
         }
         listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_accept_with_construction_in_flight() {
+        let mut listener = WebRtcDirectListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+        )
+        .await
+        .unwrap();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        listener.accepting = Some(tokio::spawn(async move {
+            let _ = waiting.await;
+            Err(WebRtcDirectError::Closed)
+        }));
+        listener.close().await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        release.send(()).unwrap();
+        assert!(matches!(result, Ok(Err(WebRtcDirectError::Closed))));
     }
 
     #[tokio::test]
