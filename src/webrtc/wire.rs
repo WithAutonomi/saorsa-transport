@@ -235,6 +235,9 @@ pub struct BrowserQuoteArtifact {
 /// One node returned by the browser closest-node RPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrowserNode {
+    /// Hex-encoded native MessagePack peer record, retaining address tags and publish sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_record: Option<String>,
     /// Lowercase ANT peer ID.
     pub peer_id: String,
     /// Native transport addresses retained for diagnostics.
