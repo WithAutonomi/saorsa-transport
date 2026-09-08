@@ -158,6 +158,7 @@ pub struct WebRtcDirectListener {
     mux: Arc<DirectUdpMux>,
     incoming: mpsc::Receiver<IncomingAssociation>,
     driver: JoinHandle<()>,
+    accepting: Option<JoinHandle<Result<WebRtcDirectConnection, WebRtcDirectError>>>,
 }
 
 impl WebRtcDirectListener {
@@ -180,6 +181,7 @@ impl WebRtcDirectListener {
             mux,
             incoming,
             driver,
+            accepting: None,
         })
     }
 
@@ -195,25 +197,45 @@ impl WebRtcDirectListener {
 
     /// Accept the next browser association discovered through STUN.
     pub async fn accept(&mut self) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
-        let association = tokio::select! {
-            biased;
-            () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
-            association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
-        };
-        let result = create_inbound_connection(
-            association.remote_addr,
-            &association.server_ufrag,
-            &association.client_ufrag,
-            &association.client_pwd,
-            Arc::clone(&self.mux),
-            &self.certificate,
-        )
-        .await;
-        if result.is_err() {
-            self.mux
-                .release_pending(association.remote_addr, &association.server_ufrag);
+        if self.accepting.is_none() {
+            let association = tokio::select! {
+                biased;
+                () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
+                association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
+            };
+            let mux = Arc::clone(&self.mux);
+            let certificate = self.certificate.clone();
+            // Own construction independently of the caller's select! future.
+            // Cancelling accept leaves this task available to the next accept.
+            self.accepting = Some(tokio::spawn(async move {
+                let mut owner = AssociationOwner {
+                    mux: Arc::clone(&mux),
+                    credential: association.server_ufrag.clone(),
+                    remote_addr: association.remote_addr,
+                    peer: None,
+                };
+                create_inbound_connection(
+                    association.remote_addr,
+                    &association.server_ufrag,
+                    &association.client_ufrag,
+                    &association.client_pwd,
+                    mux,
+                    &certificate,
+                    &mut owner,
+                )
+                .await
+                .map(|mut connection| {
+                    connection.owner = Some(owner);
+                    connection
+                })
+            }));
         }
-        result
+        let task = self.accepting.as_mut().ok_or(WebRtcDirectError::Closed)?;
+        let result = task
+            .await
+            .map_err(|error| WebRtcDirectError::Session(error.to_string()));
+        self.accepting = None;
+        result?
     }
 
     /// Stop accepting connections and release the shared UDP mux.
@@ -232,12 +254,38 @@ impl Drop for WebRtcDirectListener {
     }
 }
 
+// Own cleanup on setup errors, rejected connections, and caller cancellation.
+struct AssociationOwner {
+    mux: Arc<DirectUdpMux>,
+    credential: String,
+    remote_addr: SocketAddr,
+    peer: Option<Arc<RTCPeerConnection>>,
+}
+
+impl Drop for AssociationOwner {
+    fn drop(&mut self) {
+        self.mux.release_pending(self.remote_addr, &self.credential);
+        let mux = Arc::clone(&self.mux);
+        let credential = self.credential.clone();
+        let peer = self.peer.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(peer) = peer {
+                    let _ = peer.close().await;
+                }
+                mux.remove_conn_by_ufrag(&credential).await;
+            });
+        }
+    }
+}
+
 /// One browser WebRTC association that can carry application DataChannels.
 pub struct WebRtcDirectConnection {
     remote_addr: SocketAddr,
     peer_connection: Arc<RTCPeerConnection>,
     incoming: mpsc::Receiver<WebRtcDataChannel>,
     closed: watch::Receiver<bool>,
+    owner: Option<AssociationOwner>,
 }
 
 impl WebRtcDirectConnection {
@@ -441,6 +489,7 @@ async fn create_inbound_connection(
     client_pwd: &str,
     udp_mux: Arc<DirectUdpMux>,
     certificate: &WebRtcCertificate,
+    owner: &mut AssociationOwner,
 ) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
     if parse_profile_credentials(server_ufrag, client_ufrag)
         .is_none_or(|credentials| credentials.client_pwd != client_pwd)
@@ -491,6 +540,7 @@ async fn create_inbound_connection(
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?,
     );
 
+    owner.peer = Some(Arc::clone(&peer_connection));
     let (incoming_tx, incoming) = mpsc::channel(16);
     register_data_channel_handler(&peer_connection, incoming_tx);
     let (closed_tx, closed) = watch::channel(false);
@@ -526,6 +576,7 @@ async fn create_inbound_connection(
 
     Ok(WebRtcDirectConnection {
         remote_addr,
+        owner: None,
         peer_connection,
         incoming,
         closed,
@@ -1334,6 +1385,74 @@ mod tests {
                 Ok(Err(WebRtcDirectError::Closed))
             ));
         }
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_accept_preserves_construction_and_drop_releases_slot() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let address = "127.0.0.1:45678".parse().unwrap();
+        let credential = "cancelled-test".to_string();
+        listener
+            .mux
+            .pending
+            .write()
+            .insert(credential.clone(), address);
+        let owner = AssociationOwner {
+            mux: Arc::clone(&listener.mux),
+            credential,
+            remote_addr: address,
+            peer: None,
+        };
+        let (release, wait) = tokio::sync::oneshot::channel();
+        listener.accepting = Some(tokio::spawn(async move {
+            let _owner = owner;
+            let _ = wait.await;
+            Err(WebRtcDirectError::Closed)
+        }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(listener.accepting.is_some());
+        assert_eq!(listener.mux.pending.read().len(), 1);
+        release.send(()).unwrap();
+        assert!(matches!(
+            listener.accept().await,
+            Err(WebRtcDirectError::Closed)
+        ));
+        assert!(listener.mux.pending.read().is_empty());
+        assert!(listener.accepting.is_none());
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_incomplete_connection_closes_peer_and_mux() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &incomplete_association_request("browserPassword0123456789"),
+                listener.local_addr(),
+            )
+            .await
+            .unwrap();
+        let connection = listener.accept().await.unwrap();
+        let peer = Arc::clone(&connection.peer_connection);
+        drop(connection);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while peer.connection_state() != webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(listener.mux.pending.read().is_empty());
         listener.close().await.unwrap();
     }
 
