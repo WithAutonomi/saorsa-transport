@@ -149,7 +149,7 @@ serde_yaml = { version = "0.9", optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 
 # Post-Quantum Cryptography - required in v0.12.0+
-saorsa-pqc = { version = "0.5" , optional = true }
+saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154", optional = true }
 
 # Data structures
 slab = { version = "0.4.11", optional = true }
