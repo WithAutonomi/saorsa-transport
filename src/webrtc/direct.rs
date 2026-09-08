@@ -1720,6 +1720,10 @@ mod tests {
             .send_to(&response, listener.local_addr())
             .await
             .unwrap();
+        sender
+            .send_to(&packet, listener.local_addr())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

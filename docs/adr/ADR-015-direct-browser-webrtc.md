@@ -30,9 +30,13 @@ on the wire; ICE message integrity is not peer authentication in this profile.
 The certificate pin and the independent PQ session supply authentication and
 confidentiality. A fresh association must complete a signed STUN Binding round
 trip to its observed source before RTC allocation. The listener validates method,
-class, MESSAGE-INTEGRITY and FINGERPRINT. A response must match the random
-transaction, source address, password and two-second probe deadline. The small
-probe table is bounded globally and per canonical IP; it contains no RTC state.
+class, MESSAGE-INTEGRITY and FINGERPRINT. Challenge transactions carry a keyed, source-bound 96-bit cookie valid for the
+current or previous two-second interval. Unanswered challenges retain no state.
+A returned cookie is cached for at most two seconds; the next ordinary ICE
+request supplies the credentials used to check the response MESSAGE-INTEGRITY
+before admission. This cache is bounded globally and per canonical IP, evicts
+the oldest returned proof when full, and contains no RTC state. ICE request
+retransmission completes admission without browser-specific signalling.
 Challenges never exceed the triggering packet size. This is reachability proof,
 not protection against an on-path attacker or many genuinely reachable sources.
 Existing associations are pinned to their validated source; moving to a new
