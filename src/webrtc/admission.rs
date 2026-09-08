@@ -90,14 +90,11 @@ impl Admission {
     pub(super) fn receive(&mut self, packet: &[u8], source: SocketAddr, now: Instant) -> Decision {
         self.expire(now);
         let mut message = Message::new();
-        if packet.len() > 512
-            || message.unmarshal_binary(packet).is_err()
-            || FINGERPRINT.check(&message).is_err()
-        {
+        if message.unmarshal_binary(packet).is_err() || FINGERPRINT.check(&message).is_err() {
             return Decision::Ignore;
         }
         if message.typ == BINDING_SUCCESS {
-            if !self.valid_cookie(&message, source, now) {
+            if packet.len() > 512 || !self.valid_cookie(&message, source, now) {
                 return Decision::Ignore;
             }
             // Only a returned source-bound cookie consumes memory. Retain its
@@ -331,6 +328,42 @@ pub(super) mod tests {
         assert_eq!(admission.verified.len(), MAX_PROBES);
         admission.expire(now + PROBE_LIFETIME);
         assert!(admission.verified.is_empty());
+    }
+
+    #[test]
+    fn long_valid_ice_requests_are_not_limited_by_the_proof_cache_bound() {
+        let mut admission = Admission::default();
+        let source = "127.0.0.1:5000".parse().unwrap();
+        let now = Instant::now();
+        let password = "a".repeat(230);
+        let mut message = Message::new();
+        message.unmarshal_binary(&request(&password)).unwrap();
+        let server = format!("{}{}", super::super::ICE_CREDENTIAL_PREFIX_V2, password);
+        message
+            .build(&[
+                Box::new(TransactionId::new()),
+                Box::new(BINDING_REQUEST),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{server}:{}", "b".repeat(256)),
+                )),
+            ])
+            .unwrap();
+        message.add(ATTR_ICE_CONTROLLING, &1u64.to_be_bytes());
+        message.add(ATTR_PRIORITY, &1u32.to_be_bytes());
+        MessageIntegrity::new_short_term_integrity(server)
+            .add_to(&mut message)
+            .unwrap();
+        FINGERPRINT.add_to(&mut message).unwrap();
+        assert!(message.raw.len() > 512);
+        let Decision::Challenge(challenge) = admission.receive(&message.raw, source, now) else {
+            panic!("challenge")
+        };
+        admission.receive(&response(&challenge, &password, source), source, now);
+        assert!(matches!(
+            admission.receive(&message.raw, source, now),
+            Decision::Admit(_)
+        ));
     }
 
     #[test]
