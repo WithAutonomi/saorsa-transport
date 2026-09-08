@@ -38,8 +38,13 @@ signature primitives live in the portable module so native and WASM adapters
 share the same contract. Payment verification and RPC authorization remain
 application responsibilities.
 
-Use transport advertisement type 12; type 11 remains reserved for the earlier
-WebTransport experiment. Browser endpoints are advertised descriptors and do
+Extended address encoding reserves type 12 for WebRTC; type 11 remains
+reserved for the earlier WebTransport experiment. Unknown layouts are rejected
+before payload decoding. This is not forward-compatible with old decoders that
+assume unknown types are QUIC: do not send extended frames to those peers.
+`advertise_transport_address` currently only transmits socket advertisements and
+returns an error for WebRTC and other unsupported transports. In this stack,
+WebRTC descriptors travel through saorsa-core’s V2 peer-record address plane. Browser endpoints are advertised descriptors and do
 not become native QUIC dial targets through `as_socket_addr()`.
 
 ### Admission and lifecycle
