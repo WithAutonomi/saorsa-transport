@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher as _, Keccak};
 
-use crate::verify_ml_dsa_65;
+use super::verify_ml_dsa_65;
 
 /// Domain-separation tag for a storage commitment signature.
 pub const DOMAIN_COMMITMENT: &[u8] = b"autonomi.ant.replication.storage_commitment.v1";

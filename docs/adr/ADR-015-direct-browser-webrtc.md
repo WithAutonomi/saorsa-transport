@@ -28,13 +28,13 @@ the first STUN request without modifying the browser's local offer. The
 listener also recognizes the existing v1 profile.
 
 The P-256 DTLS certificate is a transport credential, not an ANT identity.
-Applications must establish the portable `saorsa-webrtc` post-quantum session
+Applications must establish the portable `saorsa_transport::webrtc` post-quantum session
 before accepting application RPCs: ephemeral ML-KEM-768, an ML-DSA-65 signed
 transcript bound to the expected peer ID, and ChaCha20-Poly1305 records with
 independent direction keys and strict sequence validation. The native listener
 API exposes raw binary channels; that API alone does not enforce the
 application handshake. Browser protocol v5, framing, payment metadata, and
-signature primitives live in the portable crate so native and WASM adapters
+signature primitives live in the portable module so native and WASM adapters
 share the same contract. Payment verification and RPC authorization remain
 application responsibilities.
 
@@ -61,10 +61,14 @@ not become native QUIC dial targets through `as_socket_addr()`.
 
 ### Dependencies
 
-Keep ICE, DTLS, and SCTP behind the optional native feature. The separate
-`saorsa-webrtc` crate builds for `wasm32-unknown-unknown` without the native
-transport graph. Its cryptographic, framing, and payment primitives are
-versioned together with the application profile.
+Keep ICE, DTLS, and SCTP behind the optional `webrtc-direct` native feature.
+The `webrtc` feature exposes `saorsa_transport::webrtc` and builds for
+`wasm32-unknown-unknown` with default features disabled. Its cryptographic,
+framing, and payment primitives are versioned together with the application
+profile. The native listener lives in `webrtc::direct`; the existing
+`webrtc_direct` path remains a compatibility re-export. The standalone
+`saorsa-webrtc` package is removed now that transport has a portable feature
+boundary.
 
 The current optional DTLS dependency uses unmaintained `bincode 1.3.3` for
 state export/import APIs that Saorsa does not invoke. The maintenance-only

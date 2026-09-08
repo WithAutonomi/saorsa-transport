@@ -36,22 +36,22 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::api::{APIBuilder, interceptor_registry::register_default_interceptors};
-use webrtc::data::data_channel::DataChannel;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
-use webrtc::dtls_transport::dtls_role::DTLSRole;
-use webrtc::ice::network_type::NetworkType;
-use webrtc::ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
-use webrtc::ice::udp_network::UDPNetwork;
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::peer_connection::certificate::RTCCertificate;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::util::{Conn, Error as WebRtcUtilError};
 use webrtc_rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+use webrtc_stack::api::setting_engine::SettingEngine;
+use webrtc_stack::api::{APIBuilder, interceptor_registry::register_default_interceptors};
+use webrtc_stack::data::data_channel::DataChannel;
+use webrtc_stack::data_channel::RTCDataChannel;
+use webrtc_stack::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
+use webrtc_stack::dtls_transport::dtls_role::DTLSRole;
+use webrtc_stack::ice::network_type::NetworkType;
+use webrtc_stack::ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
+use webrtc_stack::ice::udp_network::UDPNetwork;
+use webrtc_stack::interceptor::registry::Registry;
+use webrtc_stack::peer_connection::RTCPeerConnection;
+use webrtc_stack::peer_connection::certificate::RTCCertificate;
+use webrtc_stack::peer_connection::configuration::RTCConfiguration;
+use webrtc_stack::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc_stack::util::{Conn, Error as WebRtcUtilError};
 
 use crate::transport::WebRtcDirectAddr;
 
@@ -471,7 +471,7 @@ async fn create_inbound_connection(
     let first_ip = AtomicBool::new(true);
     settings.set_ip_filter(Box::new(move |_| first_ip.swap(false, Ordering::Relaxed)));
 
-    let mut media_engine = webrtc::api::media_engine::MediaEngine::default();
+    let mut media_engine = webrtc_stack::api::media_engine::MediaEngine::default();
     media_engine
         .register_default_codecs()
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
@@ -497,7 +497,7 @@ async fn create_inbound_connection(
     peer_connection.on_peer_connection_state_change(Box::new(move |state| {
         let closed_tx = closed_tx.clone();
         Box::pin(async move {
-            use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+            use webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState;
             if matches!(
                 state,
                 RTCPeerConnectionState::Failed
@@ -1155,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unordered_and_partially_reliable_channels() {
         use std::time::Duration;
-        use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+        use webrtc_stack::data_channel::data_channel_init::RTCDataChannelInit;
 
         let certificate = WebRtcCertificate::generate().unwrap();
         let hash = certificate.sha256_digest().unwrap();
