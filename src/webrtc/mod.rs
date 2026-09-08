@@ -19,10 +19,8 @@ use saorsa_pqc::{
 };
 use std::time::Duration;
 
-mod payment;
 mod session;
 mod wire;
-pub use payment::*;
 pub use session::{
     PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
     PQ_SERVER_ACCEPT_BYTES, PqClientHandshake, PqSession, PqSessionError, accept_pq_session,
