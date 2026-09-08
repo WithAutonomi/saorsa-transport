@@ -39,6 +39,11 @@ Existing associations are pinned to their validated source; moving to a new
 source requires a new association rather than credential-based rebinding.
 
 The P-256 DTLS certificate is a transport credential, not an ANT identity.
+New certificates have five-year X.509 validity on every architecture. Runtime
+expiry is derived from the signed X.509 notAfter value, not upstream's artificial
+two-day ARM expiry. Loading old PEM files preserves their key and certificate pin
+while ignoring that advisory EXPIRES header. Actually expired or not-yet-valid
+certificates are rejected; operators must replace and re-advertise those pins.
 Applications must establish the portable `saorsa_transport::webrtc` post-quantum session
 before accepting application RPCs: ephemeral ML-KEM-768, an ML-DSA-65 signed
 transcript bound to the expected peer ID, and ChaCha20-Poly1305 records with
