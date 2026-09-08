@@ -171,6 +171,12 @@ pub struct WebRtcDirectAddr {
 impl WebRtcDirectAddr {
     /// Construct an endpoint from a literal IP address, UDP port, and stable certificate pin.
     pub fn new(socket_addr: SocketAddr, certificate_hash: WebRtcCertificateHash) -> Result<Self> {
+        if matches!(socket_addr, SocketAddr::V6(addr) if addr.scope_id() != 0 || addr.flowinfo() != 0)
+        {
+            return Err(anyhow!(
+                "WebRTC Direct addresses cannot encode IPv6 scope or flow information"
+            ));
+        }
         if socket_addr.port() == 0 {
             return Err(anyhow!("WebRTC Direct UDP port must not be zero"));
         }
@@ -1190,6 +1196,20 @@ mod tests {
     }
 
     #[test]
+    fn webrtc_direct_rejects_unrepresentable_ipv6_metadata() {
+        let hash = WebRtcCertificateHash::new([0x44; 32]);
+        for (flow, scope) in [(0, 3), (1, 0)] {
+            let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                443,
+                flow,
+                scope,
+            ));
+            assert!(WebRtcDirectAddr::new(addr, hash).is_err());
+        }
+    }
+
+    #[test]
     fn test_webrtc_direct_rejects_dns_and_invalid_address_components() {
         let hash = WebRtcCertificateHash::new([0x44; 32]);
         let duplicate =
@@ -1202,7 +1222,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            "/ip4/127.0.0.1/udp/0/webrtc-direct/certhash/uAA"
+            format!("/ip4/127.0.0.1/udp/0/webrtc-direct/certhash/{hash}")
                 .parse::<TransportAddr>()
                 .is_err()
         );

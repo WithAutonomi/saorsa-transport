@@ -553,7 +553,7 @@ impl Codec for AddAddress {
             TRANSPORT_TYPE_LORAWAN => TransportType::LoRaWan,
             TRANSPORT_TYPE_RAW_UDP => TransportType::Udp,
             TRANSPORT_TYPE_WEBRTC_DIRECT => TransportType::WebRtcDirect,
-            _ => TransportType::Quic, // Unknown types fall back to QUIC
+            _ => return Err(coding::UnexpectedEnd), // Unknown layouts cannot be safely skipped
         };
 
         // Decode transport-specific address
@@ -1050,6 +1050,17 @@ mod tests {
 
         assert_eq!(decoded, original);
         assert_eq!(decoded.transport_type, TransportType::WebRtcDirect);
+    }
+
+    #[test]
+    fn unknown_address_types_are_rejected_before_payload_decoding() {
+        for transport_type in [11u8, 13, 63] {
+            // A valid QUIC-shaped payload must not make an unknown type dialable.
+            let encoded = [1, 1, transport_type, 4, 127, 0, 0, 1, 1, 187, 0];
+            let mut remaining = &encoded[..];
+            assert!(AddAddress::decode(&mut remaining).is_err());
+            assert_eq!(remaining, &encoded[3..]);
+        }
     }
 
     #[test]
