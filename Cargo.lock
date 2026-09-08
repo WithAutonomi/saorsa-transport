@@ -3357,6 +3357,7 @@ dependencies = [
  "webrtc",
  "windows",
  "x25519-dalek",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 

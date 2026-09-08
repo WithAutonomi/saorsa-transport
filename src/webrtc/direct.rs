@@ -125,17 +125,56 @@ impl WebRtcCertificate {
         ensure_crypto_provider();
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
-        let inner = RTCCertificate::from_key_pair(key_pair)
+        let mut params = webrtc_rcgen::CertificateParams::default();
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365 * 5);
+        let certificate = params
+            .self_signed(&key_pair)
             .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
-        Ok(Self { inner })
+        let private_key = webrtc_stack::dtls::crypto::CryptoPrivateKey::try_from(&key_pair)
+            .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
+        Self::from_dtls(webrtc_stack::dtls::crypto::Certificate {
+            certificate: vec![certificate.der().clone()],
+            private_key,
+        })
     }
 
-    /// Load a certificate and private key from WebRTC's persistent PEM form.
+    /// Load persistent key material, deriving expiry from the signed certificate.
+    /// Legacy ARM files may contain an artificial two-day EXPIRES header; that
+    /// advisory header is ignored without changing the certificate or its pin.
     pub fn from_pem(pem: &str) -> Result<Self, WebRtcDirectError> {
         ensure_crypto_provider();
-        let inner = RTCCertificate::from_pem(pem)
+        let (_, material) = pem
+            .split_once("-----END EXPIRES-----")
+            .ok_or_else(|| WebRtcDirectError::Certificate("missing EXPIRES PEM header".into()))?;
+        let certificate = webrtc_stack::dtls::crypto::Certificate::from_pem(material.trim())
             .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
-        Ok(Self { inner })
+        Self::from_dtls(certificate)
+    }
+
+    fn from_dtls(
+        certificate: webrtc_stack::dtls::crypto::Certificate,
+    ) -> Result<Self, WebRtcDirectError> {
+        let der = certificate
+            .certificate
+            .first()
+            .ok_or_else(|| WebRtcDirectError::Certificate("missing X.509 certificate".into()))?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref())
+            .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
+        if !parsed.validity().is_valid() {
+            return Err(WebRtcDirectError::Certificate(
+                "X.509 certificate is expired or not yet valid".into(),
+            ));
+        }
+        let seconds = u64::try_from(parsed.validity().not_after.timestamp())
+            .map_err(|error| WebRtcDirectError::Certificate(error.to_string()))?;
+        let expires = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(seconds))
+            .ok_or_else(|| {
+                WebRtcDirectError::Certificate("X.509 expiry exceeds platform clock range".into())
+            })?;
+        Ok(Self {
+            inner: RTCCertificate::from_existing(certificate, expires),
+        })
     }
 
     /// Serialize the certificate and private key for persistent storage.
@@ -1271,6 +1310,45 @@ mod tests {
 
         let loaded = WebRtcCertificate::from_pem(&certificate.serialize_pem()).unwrap();
         assert_eq!(loaded.sha256_digest().unwrap(), digest);
+    }
+
+    #[tokio::test]
+    async fn expired_arm_metadata_does_not_expire_a_valid_certificate_or_change_its_pin() {
+        let certificate = WebRtcCertificate::generate().unwrap();
+        let pem = certificate.serialize_pem();
+        let (_, material) = pem.split_once("-----END EXPIRES-----").unwrap();
+        // Simulate the old ARM expiry already in the past, and a malformed short
+        // header that the upstream loader would panic while indexing.
+        for expiry in ["AAAAAAAAAAA=", "AA=="] {
+            let old = format!("-----BEGIN EXPIRES-----\n{expiry}\n-----END EXPIRES-----{material}");
+            let loaded = WebRtcCertificate::from_pem(&old).unwrap();
+            assert_eq!(
+                loaded.sha256_digest().unwrap(),
+                certificate.sha256_digest().unwrap()
+            );
+            let api = APIBuilder::new().build();
+            let peer = api
+                .new_peer_connection(RTCConfiguration {
+                    certificates: vec![loaded.inner],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            peer.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_signed_certificate_is_rejected() {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = webrtc_rcgen::CertificateParams::default();
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let certificate = params.self_signed(&key).unwrap();
+        let dtls = webrtc_stack::dtls::crypto::Certificate {
+            certificate: vec![certificate.der().clone()],
+            private_key: webrtc_stack::dtls::crypto::CryptoPrivateKey::try_from(&key).unwrap(),
+        };
+        assert!(WebRtcCertificate::from_dtls(dtls).is_err());
     }
 
     #[test]
