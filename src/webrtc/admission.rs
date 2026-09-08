@@ -1,7 +1,7 @@
 // Copyright 2026 Saorsa Labs Ltd.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Bounded STUN reachability probes; these do not authenticate peer identity.
+//! Stateless STUN reachability challenges; these do not authenticate peer identity.
 use super::{IncomingAssociation, parse_profile_credentials, stun_ice_credentials};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -18,15 +18,25 @@ const PROBE_LIFETIME: Duration = Duration::from_secs(2);
 const MAX_PROBES: usize = 256;
 const MAX_PROBES_PER_IP: usize = 4;
 
-struct Probe {
-    association: IncomingAssociation,
-    transaction: TransactionId,
+struct ReturnedProof {
+    message: Message,
     expires: Instant,
 }
 
-#[derive(Default)]
 pub(super) struct Admission {
-    probes: HashMap<SocketAddr, Probe>,
+    secret: [u8; 32],
+    born: Instant,
+    verified: HashMap<SocketAddr, ReturnedProof>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            secret: rand::random(),
+            born: Instant::now(),
+            verified: HashMap::new(),
+        }
+    }
 }
 
 pub(super) enum Decision {
@@ -36,41 +46,91 @@ pub(super) enum Decision {
 }
 
 impl Admission {
+    fn bucket(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.born).as_secs() / PROBE_LIFETIME.as_secs()
+    }
+
+    fn cookie(&self, source: SocketAddr, bucket: u64) -> TransactionId {
+        let mut hash = blake3::Hasher::new_keyed(&self.secret);
+        hash.update(b"saorsa-webrtc-reachability-v1");
+        hash.update(source.to_string().as_bytes());
+        hash.update(&bucket.to_be_bytes());
+        let mut bytes = [0; 12];
+        bytes.copy_from_slice(&hash.finalize().as_bytes()[..12]);
+        TransactionId(bytes)
+    }
+
+    fn valid_cookie(&self, message: &Message, source: SocketAddr, now: Instant) -> bool {
+        let bucket = self.bucket(now);
+        [Some(bucket), bucket.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .any(|bucket| {
+                // Hash equality uses constant-time comparison, including this padded cookie.
+                let mut expected = [0; 32];
+                let mut received = [0; 32];
+                expected[..12].copy_from_slice(&self.cookie(source, bucket).0);
+                received[..12].copy_from_slice(&message.transaction_id.0);
+                blake3::Hash::from_bytes(expected) == blake3::Hash::from_bytes(received)
+            })
+    }
+
     pub(super) fn expects_response(&self, packet: &[u8], source: SocketAddr) -> bool {
-        let Some(probe) = self.probes.get(&source) else {
-            return false;
-        };
         let mut message = Message::new();
-        message.unmarshal_binary(packet).is_ok()
+        packet.len() <= 512
+            && message.unmarshal_binary(packet).is_ok()
             && message.typ == BINDING_SUCCESS
-            && message.transaction_id == probe.transaction
+            && self.valid_cookie(&message, source, Instant::now())
     }
 
     pub(super) fn expire(&mut self, now: Instant) {
-        self.probes.retain(|_, probe| probe.expires > now);
+        self.verified.retain(|_, proof| proof.expires > now);
     }
 
     pub(super) fn receive(&mut self, packet: &[u8], source: SocketAddr, now: Instant) -> Decision {
         self.expire(now);
         let mut message = Message::new();
-        if message.unmarshal_binary(packet).is_err() || FINGERPRINT.check(&message).is_err() {
+        if packet.len() > 512
+            || message.unmarshal_binary(packet).is_err()
+            || FINGERPRINT.check(&message).is_err()
+        {
             return Decision::Ignore;
         }
         if message.typ == BINDING_SUCCESS {
-            let Some(probe) = self.probes.get(&source) else {
-                return Decision::Ignore;
-            };
-            if message.transaction_id != probe.transaction
-                || MessageIntegrity::new_short_term_integrity(probe.association.client_pwd.clone())
-                    .check(&mut message)
-                    .is_err()
-            {
+            if !self.valid_cookie(&message, source, now) {
                 return Decision::Ignore;
             }
-            return self
-                .probes
-                .remove(&source)
-                .map_or(Decision::Ignore, |probe| Decision::Admit(probe.association));
+            // Only a returned source-bound cookie consumes memory. Retain its
+            // integrity tag until the next ICE request supplies the credentials.
+            let ip = source.ip().to_canonical();
+            let same_ip = self
+                .verified
+                .keys()
+                .filter(|addr| addr.ip().to_canonical() == ip)
+                .count();
+            if !self.verified.contains_key(&source)
+                && (same_ip >= MAX_PROBES_PER_IP || self.verified.len() >= MAX_PROBES)
+            {
+                let victim = self
+                    .verified
+                    .iter()
+                    .filter(|(addr, _)| {
+                        same_ip < MAX_PROBES_PER_IP || addr.ip().to_canonical() == ip
+                    })
+                    .min_by_key(|(_, proof)| proof.expires)
+                    .map(|(addr, _)| *addr);
+                if let Some(victim) = victim {
+                    self.verified.remove(&victim);
+                }
+            }
+            self.verified.insert(
+                source,
+                ReturnedProof {
+                    message,
+                    expires: now + PROBE_LIFETIME,
+                },
+            );
+            return Decision::Ignore;
         }
         if message.typ != BINDING_REQUEST {
             return Decision::Ignore;
@@ -87,24 +147,25 @@ impl Admission {
         {
             return Decision::Ignore;
         }
-        // Do not refresh or reflect retransmissions indefinitely. A fresh probe
-        // is allowed only after expiry; spoofed sources cannot allocate RTC state.
-        if self.probes.contains_key(&source)
-            || self.probes.len() >= MAX_PROBES
-            || self
-                .probes
-                .keys()
-                .filter(|addr| addr.ip().to_canonical() == source.ip().to_canonical())
-                .count()
-                >= MAX_PROBES_PER_IP
-        {
-            return Decision::Ignore;
+        if let Some(mut proof) = self.verified.remove(&source) {
+            if self.valid_cookie(&proof.message, source, now)
+                && MessageIntegrity::new_short_term_integrity(credentials.client_pwd.clone())
+                    .check(&mut proof.message)
+                    .is_ok()
+            {
+                return Decision::Admit(IncomingAssociation {
+                    remote_addr: source,
+                    server_ufrag: server,
+                    client_ufrag: client,
+                    client_pwd: credentials.client_pwd,
+                    generation: None,
+                });
+            }
         }
-        let transaction = TransactionId::new();
         let mut challenge = Message::new();
         if challenge
             .build(&[
-                Box::new(transaction),
+                Box::new(self.cookie(source, self.bucket(now))),
                 Box::new(BINDING_REQUEST),
                 Box::new(Username::new(ATTR_USERNAME, format!("{client}:{server}"))),
             ])
@@ -114,7 +175,7 @@ impl Admission {
         }
         challenge.add(ATTR_ICE_CONTROLLED, &0u64.to_be_bytes());
         challenge.add(ATTR_PRIORITY, &1u32.to_be_bytes());
-        if MessageIntegrity::new_short_term_integrity(credentials.client_pwd.clone())
+        if MessageIntegrity::new_short_term_integrity(credentials.client_pwd)
             .add_to(&mut challenge)
             .is_err()
             || FINGERPRINT.add_to(&mut challenge).is_err()
@@ -122,20 +183,6 @@ impl Admission {
         {
             return Decision::Ignore;
         }
-        self.probes.insert(
-            source,
-            Probe {
-                association: IncomingAssociation {
-                    remote_addr: source,
-                    server_ufrag: server,
-                    client_ufrag: client,
-                    client_pwd: credentials.client_pwd,
-                    generation: None,
-                },
-                transaction,
-                expires: now + PROBE_LIFETIME,
-            },
-        );
         Decision::Challenge(challenge.raw)
     }
 }
@@ -194,52 +241,96 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn only_an_unexpired_response_from_the_challenged_address_admits() {
+    fn unanswered_sources_cannot_exhaust_admission() {
         let mut admission = Admission::default();
-        let source = "127.0.0.1:5000".parse().unwrap();
-        let other = "127.0.0.2:5000".parse().unwrap();
         let now = Instant::now();
         let password = "browserPassword0123456789";
-        let original = request(password);
-        let Decision::Challenge(challenge) = admission.receive(&original, source, now) else {
-            panic!("expected challenge")
+        let packet = request(password);
+        let source = "127.0.0.1:5000".parse().unwrap();
+        let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+            panic!("challenge")
         };
-        assert!(challenge.len() <= original.len());
-        let valid = response(&challenge, password, source);
+        assert!(challenge.len() <= packet.len());
+        for index in 0..1024u16 {
+            let spoofed = SocketAddr::from(([10, 0, (index / 256) as u8, index as u8], 5000));
+            assert!(matches!(
+                admission.receive(&packet, spoofed, now),
+                Decision::Challenge(_)
+            ));
+        }
+        assert!(admission.verified.is_empty());
+        let proof = response(&challenge, password, source);
         assert!(matches!(
-            admission.receive(&valid, other, now),
-            Decision::Ignore
-        ));
-        let wrong = response(&challenge, "wrong password", source);
-        assert!(matches!(
-            admission.receive(&wrong, source, now),
-            Decision::Ignore
-        ));
-        let mut wrong_id = Message::new();
-        wrong_id
-            .build(&[Box::new(TransactionId::new()), Box::new(BINDING_REQUEST)])
-            .unwrap();
-        assert!(matches!(
-            admission.receive(&response(&wrong_id.raw, password, source), source, now),
+            admission.receive(&proof, source, now),
             Decision::Ignore
         ));
         assert!(matches!(
-            admission.receive(&valid, source, now),
+            admission.receive(&packet, source, now),
             Decision::Admit(_)
         ));
+        assert!(admission.verified.is_empty());
+    }
+
+    #[test]
+    fn cookies_require_source_freshness_and_matching_ice_integrity() {
+        let mut admission = Admission::default();
+        let now = Instant::now();
+        let source = "127.0.0.1:5000".parse().unwrap();
+        let password = "browserPassword0123456789";
+        let packet = request(password);
+        let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+            panic!("challenge")
+        };
+        let proof = response(&challenge, password, source);
+        for other in ["127.0.0.2:5000", "127.0.0.1:5001"] {
+            admission.receive(&proof, other.parse().unwrap(), now);
+            assert!(admission.verified.is_empty());
+        }
+        admission.receive(&response(&challenge, "wrong password", source), source, now);
         assert!(matches!(
-            admission.receive(&valid, source, now),
-            Decision::Ignore
-        ));
-        assert!(matches!(
-            admission.receive(&original, source, now),
+            admission.receive(&packet, source, now),
             Decision::Challenge(_)
         ));
-        assert!(matches!(
-            admission.receive(&valid, source, now + PROBE_LIFETIME),
-            Decision::Ignore
-        ));
-        assert!(admission.probes.is_empty());
+        admission.receive(&proof, source, now + Duration::from_secs(4));
+        assert!(admission.verified.is_empty());
+        let mut restarted = Admission::default();
+        restarted.receive(&proof, source, now);
+        assert!(restarted.verified.is_empty());
+    }
+
+    #[test]
+    fn returned_proof_cache_is_bounded_and_expires() {
+        let mut admission = Admission::default();
+        let now = Instant::now();
+        let password = "browserPassword0123456789";
+        let packet = request(password);
+        for index in 0..1024u16 {
+            let source = SocketAddr::from(([10, 0, (index / 256) as u8, index as u8], 5000));
+            let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+                panic!("challenge")
+            };
+            admission.receive(&response(&challenge, password, source), source, now);
+        }
+        assert_eq!(admission.verified.len(), MAX_PROBES);
+        let now = now + Duration::from_millis(1);
+        for port in 1..10 {
+            let source = SocketAddr::from(([127, 0, 0, 1], port));
+            let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+                panic!("challenge")
+            };
+            admission.receive(&response(&challenge, password, source), source, now);
+        }
+        assert_eq!(
+            admission
+                .verified
+                .keys()
+                .filter(|addr| addr.ip().is_loopback())
+                .count(),
+            MAX_PROBES_PER_IP
+        );
+        assert_eq!(admission.verified.len(), MAX_PROBES);
+        admission.expire(now + PROBE_LIFETIME);
+        assert!(admission.verified.is_empty());
     }
 
     #[test]
@@ -247,7 +338,6 @@ pub(super) mod tests {
         let mut admission = Admission::default();
         let source = "127.0.0.1:5000".parse().unwrap();
         let original = request("browserPassword0123456789");
-        // Include every truncation and a corrupt fingerprint.
         for end in 0..original.len() {
             assert!(matches!(
                 admission.receive(&original[..end], source, Instant::now()),
@@ -261,32 +351,6 @@ pub(super) mod tests {
             admission.receive(&corrupt, source, Instant::now()),
             Decision::Ignore
         ));
-        assert!(admission.probes.is_empty());
-    }
-
-    #[test]
-    fn probes_are_bounded_per_ip_globally_and_expire_without_refresh() {
-        let mut admission = Admission::default();
-        let now = Instant::now();
-        let packet = request("browserPassword0123456789");
-        for port in 1..=MAX_PROBES_PER_IP {
-            let source = SocketAddr::from(([127, 0, 0, 1], port as u16));
-            assert!(matches!(
-                admission.receive(&packet, source, now),
-                Decision::Challenge(_)
-            ));
-        }
-        assert!(matches!(
-            admission.receive(&packet, "127.0.0.1:9999".parse().unwrap(), now),
-            Decision::Ignore
-        ));
-        for index in 1..=MAX_PROBES {
-            let source =
-                SocketAddr::from(([10, 0, (index / 256) as u8, (index % 256) as u8], 5000));
-            let _ = admission.receive(&packet, source, now);
-        }
-        assert_eq!(admission.probes.len(), MAX_PROBES);
-        admission.expire(now + PROBE_LIFETIME);
-        assert!(admission.probes.is_empty());
+        assert!(admission.verified.is_empty());
     }
 }
