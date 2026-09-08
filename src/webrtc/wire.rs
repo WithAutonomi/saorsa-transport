@@ -236,6 +236,10 @@ pub struct BrowserQuoteArtifact {
 /// One node returned by the browser closest-node RPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrowserNode {
+    /// Hex-encoded owner-signed address record retained by client-side objects.
+    /// FIND_NODE transfers proofs separately in its binary response body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_record: Option<String>,
     /// Hex-encoded native MessagePack peer record, retaining address tags and publish sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_record: Option<String>,
@@ -289,6 +293,9 @@ pub enum BrowserRequestBody {
     Hello,
     /// Return locally known nodes closest to `target`.
     FindNode {
+        /// Request owner-signed address records in the binary response body.
+        #[serde(default)]
+        with_address_records: bool,
         /// Lowercase 32-byte lookup target.
         target: String,
         /// Optional bounded result count.
@@ -1274,5 +1281,24 @@ mod tests {
         assert_eq!(value["request_id"], Value::from(42));
         assert_eq!(value["status"], Value::from("ok"));
         assert_eq!(value["type"], Value::from("chunk"));
+    }
+    #[test]
+    fn legacy_find_node_defaults_to_unsigned_hints() {
+        let request: BrowserRequestBody = serde_json::from_value(serde_json::json!({
+            "type": "find_node", "target": "11".repeat(32), "count": 20
+        }))
+        .expect("legacy request");
+        assert!(matches!(
+            request,
+            BrowserRequestBody::FindNode {
+                with_address_records: false,
+                ..
+            }
+        ));
+        let node: BrowserNode = serde_json::from_value(serde_json::json!({
+            "peer_id": "11".repeat(32), "native_addresses": [], "reliability": 1.0
+        }))
+        .expect("legacy node");
+        assert!(node.address_record.is_none());
     }
 }
