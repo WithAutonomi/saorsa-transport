@@ -11,9 +11,9 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use fips203::{
+use saorsa_pqc::{
+    kem_traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _},
     ml_kem_768,
-    traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _},
 };
 use std::fmt;
 use zeroize::Zeroize;

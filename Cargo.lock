@@ -3286,6 +3286,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "saorsa-pqc"
+version = "0.5.1"
+source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=6d57e9dd73d537182fe85b0050e809a224f21154#6d57e9dd73d537182fe85b0050e809a224f21154"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "anyhow",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "fips203",
+ "fips204",
+ "fips205",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "hpke",
+ "log",
+ "pbkdf2",
+ "postcard",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "subtle",
+ "thiserror 2.0.20",
+ "time",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "saorsa-transport"
 version = "0.36.3"
 dependencies = [
@@ -3336,7 +3371,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-platform-verifier",
  "rustls-post-quantum",
- "saorsa-pqc",
+ "saorsa-pqc 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saorsa-transport-workspace-hack",
  "serde",
  "serde_json",
@@ -3391,12 +3426,10 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
- "fips203",
- "fips204",
  "getrandom 0.2.17",
  "hex",
  "postcard",
- "saorsa-pqc",
+ "saorsa-pqc 0.5.1 (git+https://github.com/saorsa-labs/saorsa-pqc?rev=6d57e9dd73d537182fe85b0050e809a224f21154)",
  "serde",
  "serde_bytes",
  "serde_json",
