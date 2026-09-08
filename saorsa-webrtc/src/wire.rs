@@ -19,8 +19,10 @@ pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v5";
 pub const MAX_BROWSER_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum JSON header carried by one browser protocol frame.
 pub const MAX_BROWSER_HEADER_BYTES: usize = 64 * 1024;
+/// Maximum encoded ant-protocol message, including payment proof overhead.
+pub const MAX_BROWSER_CONTENT_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum complete browser application frame.
-pub const MAX_BROWSER_FRAME_BYTES: usize = 4 + MAX_BROWSER_HEADER_BYTES + MAX_BROWSER_RECORD_BYTES;
+pub const MAX_BROWSER_FRAME_BYTES: usize = 4 + MAX_BROWSER_HEADER_BYTES + MAX_BROWSER_CONTENT_BYTES;
 /// Backwards-compatible name for the maximum complete response frame.
 pub const MAX_BROWSER_RESPONSE_BYTES: usize = MAX_BROWSER_FRAME_BYTES;
 /// Maximum accepted WebRTC Direct multiaddress length.
@@ -277,6 +279,8 @@ impl BrowserRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserRequestBody {
+    /// An encoded ant-protocol request in the binary body.
+    ChunkProtocol,
     /// Authenticate and describe the connected node.
     Hello,
     /// Return locally known nodes closest to `target`.
@@ -384,6 +388,8 @@ pub enum BrowserResponseStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // Quote metadata intentionally stays inline.
 pub enum BrowserResponseBody {
+    /// An encoded ant-protocol response in the binary body.
+    ChunkProtocol,
     /// Authenticated node and protocol metadata.
     Hello {
         /// Authenticated protocol name.
@@ -651,6 +657,10 @@ pub fn encode_request_frame(
             request.version
         )));
     }
+    validate_record_bound(
+        request.content_length,
+        matches!(request.body, BrowserRequestBody::ChunkProtocol),
+    )?;
     encode_frame(request, request.content_length, content, "request")
 }
 
@@ -669,7 +679,25 @@ pub fn encode_response_frame(
             response.version
         )));
     }
+    validate_record_bound(
+        response.content_length,
+        matches!(response.body, BrowserResponseBody::ChunkProtocol),
+    )?;
     encode_frame(response, response.content_length, content, "response")
+}
+
+fn validate_record_bound(length: usize, chunk_protocol: bool) -> Result<(), BrowserProtocolError> {
+    let maximum = if chunk_protocol {
+        MAX_BROWSER_CONTENT_BYTES
+    } else {
+        MAX_BROWSER_RECORD_BYTES
+    };
+    if length > maximum {
+        return Err(BrowserProtocolError::Frame(format!(
+            "content must be at most {maximum} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn encode_frame<T: Serialize>(
@@ -710,6 +738,10 @@ pub fn parse_request_header(
     let request: BrowserRequest = serde_json::from_slice(header).map_err(|error| {
         BrowserProtocolError::Frame(format!("request JSON is invalid: {error}"))
     })?;
+    validate_record_bound(
+        request.content_length,
+        matches!(request.body, BrowserRequestBody::ChunkProtocol),
+    )?;
     validate_complete_length(
         frame.len(),
         content_offset,
@@ -785,10 +817,14 @@ fn parse_response_header(
             response.version
         )));
     }
+    validate_record_bound(
+        response.content_length,
+        matches!(response.body, BrowserResponseBody::ChunkProtocol),
+    )?;
     let frame_length = content_offset
         .checked_add(response.content_length)
         .ok_or_else(|| BrowserProtocolError::Frame("response length overflow".to_string()))?;
-    if response.content_length > MAX_BROWSER_RECORD_BYTES {
+    if response.content_length > MAX_BROWSER_CONTENT_BYTES {
         return Err(BrowserProtocolError::Frame(
             "invalid response content length".to_string(),
         ));
@@ -841,9 +877,9 @@ fn validate_content_length(
     actual: usize,
     direction: &str,
 ) -> Result<(), BrowserProtocolError> {
-    if declared > MAX_BROWSER_RECORD_BYTES {
+    if declared > MAX_BROWSER_CONTENT_BYTES {
         return Err(BrowserProtocolError::Frame(format!(
-            "{direction} content must be at most {MAX_BROWSER_RECORD_BYTES} bytes"
+            "{direction} content must be at most {MAX_BROWSER_CONTENT_BYTES} bytes"
         )));
     }
     if declared != actual {
@@ -860,9 +896,9 @@ fn validate_complete_length(
     content_length: usize,
     direction: &str,
 ) -> Result<(), BrowserProtocolError> {
-    if content_length > MAX_BROWSER_RECORD_BYTES {
+    if content_length > MAX_BROWSER_CONTENT_BYTES {
         return Err(BrowserProtocolError::Frame(format!(
-            "{direction} content length {content_length} exceeds {MAX_BROWSER_RECORD_BYTES}"
+            "{direction} content length {content_length} exceeds {MAX_BROWSER_CONTENT_BYTES}"
         )));
     }
     let expected = content_offset
@@ -1028,6 +1064,39 @@ fn is_valid_ice_pwd(value: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn shared_protocol_allows_proof_overhead_but_preserves_record_limit() {
+        let content = vec![0; MAX_BROWSER_RECORD_BYTES + 4096];
+        let request = BrowserRequest {
+            version: BROWSER_PROTOCOL_VERSION,
+            request_id: 1,
+            content_length: content.len(),
+            body: BrowserRequestBody::ChunkProtocol,
+        };
+        let encoded = encode_request_frame(&request, &content).unwrap();
+        assert_eq!(parse_request_frame(&encoded).unwrap().content, content);
+        let response = BrowserResponse::ok(1, BrowserResponseBody::ChunkProtocol, content.len());
+        let encoded = encode_response_frame(&response, &content).unwrap();
+        assert_eq!(parse_response_frame(&encoded).unwrap().content, content);
+        let oversized = vec![0; MAX_BROWSER_CONTENT_BYTES + 1];
+        let response = BrowserResponse::ok(1, BrowserResponseBody::ChunkProtocol, oversized.len());
+        assert!(encode_response_frame(&response, &oversized).is_err());
+        let response = BrowserResponse::ok(
+            1,
+            BrowserResponseBody::Chunk {
+                address: "00".repeat(32),
+                size: content.len(),
+            },
+            content.len(),
+        );
+        assert!(encode_response_frame(&response, &content).is_err());
+        // Reject a forged length from the header before waiting for its body.
+        let header = serde_json::to_vec(&response).unwrap();
+        let mut forged = (header.len() as u32).to_be_bytes().to_vec();
+        forged.extend(header);
+        assert!(response_frame_length(&forged).is_err());
+    }
 
     fn endpoint() -> BrowserEndpoint {
         BrowserEndpoint::new(

@@ -6,9 +6,9 @@
 //! sides use this module so the sender never waits longer than the receiver is
 //! willing to accept the same frame.
 
-use fips204::{
+use saorsa_pqc::{
+    dsa_traits::{SerDes as _, Verifier as _},
     ml_dsa_65,
-    traits::{SerDes as _, Verifier as _},
 };
 use std::time::Duration;
 
