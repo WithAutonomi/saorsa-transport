@@ -25,7 +25,18 @@ expected 32-byte ANT peer ID. The browser synthesizes an ICE-lite SDP answer
 using that certificate pin. The v2 ICE username fragment carries the browser's
 original ICE password, allowing the listener to recover the credentials from
 the first STUN request without modifying the browser's local offer. The
-listener also recognizes the existing v1 profile.
+listener also recognizes the existing v1 profile. These credentials are public
+on the wire; ICE message integrity is not peer authentication in this profile.
+The certificate pin and the independent PQ session supply authentication and
+confidentiality. A fresh association must complete a signed STUN Binding round
+trip to its observed source before RTC allocation. The listener validates method,
+class, MESSAGE-INTEGRITY and FINGERPRINT. A response must match the random
+transaction, source address, password and two-second probe deadline. The small
+probe table is bounded globally and per canonical IP; it contains no RTC state.
+Challenges never exceed the triggering packet size. This is reachability proof,
+not protection against an on-path attacker or many genuinely reachable sources.
+Existing associations are pinned to their validated source; moving to a new
+source requires a new association rather than credential-based rebinding.
 
 The P-256 DTLS certificate is a transport credential, not an ANT identity.
 Applications must establish the portable `saorsa_transport::webrtc` post-quantum session
@@ -49,9 +60,12 @@ not become native QUIC dial targets through `as_socket_addr()`.
 
 ### Admission and lifecycle
 
-- Bound pending ICE associations to 256 and queued application channels to 16.
-  These queue bounds do not replace application connection limits or first-RPC
-  deadlines. Callers must close rejected and expired associations.
+- Apply configurable global/per-IP association limits before RTC allocation;
+  ant-node supplies its configured connection limits. Queued associations and
+  incomplete RTC handshakes expire after ten seconds. Queue bounds do not replace
+  application first-RPC deadlines. Dropped associations own asynchronous cleanup.
+- Inbound construction remains owned by the listener across cancelled `accept`
+  futures. Setup errors and dropped results close RTC and release mux state.
 - Route STUN requests by ICE credential before consulting source-address
   mappings so a new browser association can reuse a UDP source port.
 - Reject unordered channels and either partial-reliability mode. Reset rejected

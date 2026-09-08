@@ -20,6 +20,9 @@
 //! browser's username fragment, and its observed address from the first STUN
 //! binding request, then constructs the corresponding peer connection locally.
 
+#[path = "admission.rs"]
+mod admission;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -71,6 +74,24 @@ pub const ICE_CREDENTIAL_PREFIX: &str = ICE_CREDENTIAL_PREFIX_V2;
 pub const MAX_DATA_CHANNEL_MESSAGE_SIZE: usize = 16 * 1024;
 
 const MAX_PENDING_ASSOCIATIONS: usize = 256;
+
+/// Resource limits applied after address validation and before RTC allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct WebRtcAdmissionLimits {
+    /// Maximum simultaneous associations, including handshakes.
+    pub max_connections: usize,
+    /// Maximum simultaneous associations from one canonical IP address.
+    pub max_connections_per_ip: usize,
+}
+
+impl Default for WebRtcAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_PENDING_ASSOCIATIONS,
+            max_connections_per_ip: 4,
+        }
+    }
+}
 
 /// Errors produced by the WebRTC Direct transport.
 #[derive(Debug, Error)]
@@ -167,10 +188,27 @@ impl WebRtcDirectListener {
         bind_addr: SocketAddr,
         certificate: WebRtcCertificate,
     ) -> Result<Self, WebRtcDirectError> {
+        Self::bind_with_limits(bind_addr, certificate, WebRtcAdmissionLimits::default()).await
+    }
+
+    /// Bind with application connection limits enforced before RTC allocation.
+    pub async fn bind_with_limits(
+        bind_addr: SocketAddr,
+        certificate: WebRtcCertificate,
+        limits: WebRtcAdmissionLimits,
+    ) -> Result<Self, WebRtcDirectError> {
+        if limits.max_connections == 0
+            || limits.max_connections > MAX_PENDING_ASSOCIATIONS
+            || limits.max_connections_per_ip == 0
+        {
+            return Err(WebRtcDirectError::Protocol(
+                "invalid WebRTC admission limits".into(),
+            ));
+        }
         let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
         let local_addr = socket.local_addr()?;
         let (incoming_tx, incoming) = mpsc::channel(MAX_PENDING_ASSOCIATIONS);
-        let mux = DirectUdpMux::new(Arc::clone(&socket), local_addr, incoming_tx);
+        let mux = DirectUdpMux::with_limits(Arc::clone(&socket), local_addr, incoming_tx, limits);
         let driver_mux = Arc::clone(&mux);
         let driver = tokio::spawn(async move {
             driver_mux.run(socket).await;
@@ -198,10 +236,20 @@ impl WebRtcDirectListener {
     /// Accept the next browser association discovered through STUN.
     pub async fn accept(&mut self) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
         if self.accepting.is_none() {
-            let association = tokio::select! {
-                biased;
-                () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
-                association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
+            let association = loop {
+                let association = tokio::select! {
+                    biased;
+                    () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
+                    association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
+                };
+                if self
+                    .mux
+                    .pending
+                    .read()
+                    .contains_key(&association.server_ufrag)
+                {
+                    break association;
+                }
             };
             let mux = Arc::clone(&self.mux);
             let certificate = self.certificate.clone();
@@ -212,6 +260,11 @@ impl WebRtcDirectListener {
                     mux: Arc::clone(&mux),
                     credential: association.server_ufrag.clone(),
                     remote_addr: association.remote_addr,
+                    admitted_at: mux
+                        .admitted
+                        .read()
+                        .get(&association.server_ufrag)
+                        .map(|(_, at)| *at),
                     peer: None,
                 };
                 create_inbound_connection(
@@ -260,6 +313,7 @@ struct AssociationOwner {
     credential: String,
     remote_addr: SocketAddr,
     peer: Option<Arc<RTCPeerConnection>>,
+    admitted_at: Option<tokio::time::Instant>,
 }
 
 impl Drop for AssociationOwner {
@@ -268,12 +322,13 @@ impl Drop for AssociationOwner {
         let mux = Arc::clone(&self.mux);
         let credential = self.credential.clone();
         let peer = self.peer.take();
+        let admitted_at = self.admitted_at;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Some(peer) = peer {
                     let _ = peer.close().await;
                 }
-                mux.remove_conn_by_ufrag(&credential).await;
+                mux.remove_owned_connection(&credential, admitted_at).await;
             });
         }
     }
@@ -541,6 +596,15 @@ async fn create_inbound_connection(
     );
 
     owner.peer = Some(Arc::clone(&peer_connection));
+    let setup_peer = Arc::downgrade(&peer_connection);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if let Some(peer) = setup_peer.upgrade() {
+            if peer.connection_state() != webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected {
+                let _ = peer.close().await;
+            }
+        }
+    });
     let (incoming_tx, incoming) = mpsc::channel(16);
     register_data_channel_handler(&peer_connection, incoming_tx);
     let (closed_tx, closed) = watch::channel(false);
@@ -846,6 +910,9 @@ struct DirectUdpMux {
     conns: Mutex<HashMap<String, UDPMuxConn>>,
     address_map: RwLock<HashMap<SocketAddr, UDPMuxConn>>,
     pending: RwLock<HashMap<String, SocketAddr>>,
+    admitted: RwLock<HashMap<String, (SocketAddr, tokio::time::Instant)>>,
+    limits: WebRtcAdmissionLimits,
+    admission: parking_lot::Mutex<admission::Admission>,
     incoming: mpsc::Sender<IncomingAssociation>,
     socket: Weak<UdpSocket>,
     shutdown: CancellationToken,
@@ -858,11 +925,28 @@ impl DirectUdpMux {
         local_addr: SocketAddr,
         incoming: mpsc::Sender<IncomingAssociation>,
     ) -> Arc<Self> {
+        Self::with_limits(
+            socket,
+            local_addr,
+            incoming,
+            WebRtcAdmissionLimits::default(),
+        )
+    }
+
+    fn with_limits(
+        socket: Arc<UdpSocket>,
+        local_addr: SocketAddr,
+        incoming: mpsc::Sender<IncomingAssociation>,
+        limits: WebRtcAdmissionLimits,
+    ) -> Arc<Self> {
         Arc::new(Self {
             local_addr,
             conns: Mutex::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
+            admitted: RwLock::new(HashMap::new()),
+            limits,
+            admission: parking_lot::Mutex::new(admission::Admission::default()),
             incoming,
             socket: Arc::downgrade(&socket),
             shutdown: CancellationToken::new(),
@@ -872,9 +956,14 @@ impl DirectUdpMux {
 
     async fn run(self: Arc<Self>, socket: Arc<UdpSocket>) {
         let mut buffer = [0_u8; MAX_DATA_CHANNEL_MESSAGE_SIZE];
+        let mut expiry = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             let received = tokio::select! {
                 () = self.shutdown.cancelled() => break,
+                _ = expiry.tick() => {
+                    self.admission.lock().expire(tokio::time::Instant::now());
+                    continue;
+                }
                 received = socket.recv_from(&mut buffer) => received,
             };
             let (length, remote_addr) = match received {
@@ -886,7 +975,14 @@ impl DirectUdpMux {
                 }
             };
             let packet = &buffer[..length];
-            let connection = self.connection_for_packet(packet, remote_addr).await;
+            // Probe responses must bypass stale source mappings when a browser
+            // replaces an association while reusing its UDP port.
+            let probe_response = self.admission.lock().expects_response(packet, remote_addr);
+            let connection = if probe_response {
+                None
+            } else {
+                self.connection_for_packet(packet, remote_addr).await
+            };
             if let Some(connection) = connection {
                 if let Err(error) = connection.write_packet(packet, remote_addr).await {
                     tracing::debug!(%error, %remote_addr, "failed to route WebRTC UDP packet");
@@ -894,19 +990,35 @@ impl DirectUdpMux {
                 continue;
             }
 
-            let Some((server_ufrag, client_ufrag)) = stun_ice_credentials(packet) else {
-                continue;
+            let decision =
+                self.admission
+                    .lock()
+                    .receive(packet, remote_addr, tokio::time::Instant::now());
+            let association = match decision {
+                admission::Decision::Ignore => continue,
+                admission::Decision::Challenge(bytes) => {
+                    let _ = socket.send_to(&bytes, remote_addr).await;
+                    continue;
+                }
+                admission::Decision::Admit(association) => association,
             };
-            let Some(credentials) = parse_profile_credentials(&server_ufrag, &client_ufrag) else {
-                tracing::debug!(%remote_addr, "ignored invalid or unsupported WebRTC Direct ICE credentials");
-                continue;
-            };
-            let association = IncomingAssociation {
-                remote_addr,
-                server_ufrag: credentials.server_ufrag,
-                client_ufrag: credentials.client_ufrag,
-                client_pwd: credentials.client_pwd,
-            };
+            let admitted_at = tokio::time::Instant::now();
+            {
+                let mut admitted = self.admitted.write();
+                if admitted.contains_key(&association.server_ufrag)
+                    || admitted.len() >= self.limits.max_connections
+                    || admitted
+                        .values()
+                        .filter(|addr| {
+                            addr.0.ip().to_canonical() == remote_addr.ip().to_canonical()
+                        })
+                        .count()
+                        >= self.limits.max_connections_per_ip
+                {
+                    continue;
+                }
+                admitted.insert(association.server_ufrag.clone(), (remote_addr, admitted_at));
+            }
             {
                 let mut pending = self.pending.write();
                 if pending.contains_key(&association.server_ufrag)
@@ -916,8 +1028,26 @@ impl DirectUdpMux {
                 }
                 pending.insert(association.server_ufrag.clone(), association.remote_addr);
             }
+            let expiry_mux = Arc::downgrade(&self);
+            let expiry_credential = association.server_ufrag.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if let Some(mux) = expiry_mux.upgrade() {
+                    if mux.pending.read().contains_key(&expiry_credential)
+                        && mux
+                            .admitted
+                            .read()
+                            .get(&expiry_credential)
+                            .is_some_and(|(_, created)| *created == admitted_at)
+                    {
+                        mux.remove_owned_connection(&expiry_credential, Some(admitted_at))
+                            .await;
+                    }
+                }
+            });
             if let Err(error) = self.incoming.try_send(association.clone()) {
                 self.pending.write().remove(&association.server_ufrag);
+                self.admitted.write().remove(&association.server_ufrag);
                 tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is full");
             }
         }
@@ -935,9 +1065,51 @@ impl DirectUdpMux {
         // the source-address mapping registered when the ICE agent sent its
         // request. DTLS and SCTP packets use that mapping as well.
         if let Some(local_credential) = local_ice_credential(packet) {
+            // An existing association is bound to the source that completed
+            // our reachability transaction. Public ICE credentials cannot move it.
+            if self
+                .admitted
+                .read()
+                .get(&local_credential)
+                .is_some_and(|(source, _)| *source != remote_addr)
+            {
+                return None;
+            }
+            if !self.admitted.read().contains_key(&local_credential)
+                && !self.address_map.read().contains_key(&remote_addr)
+            {
+                return None;
+            }
             return self.conns.lock().await.get(&local_credential).cloned();
         }
         self.address_map.read().get(&remote_addr).cloned()
+    }
+
+    async fn remove_owned_connection(
+        &self,
+        credential: &str,
+        expected: Option<tokio::time::Instant>,
+    ) {
+        let mut connections = self.conns.lock().await;
+        let mut admitted = self.admitted.write();
+        if admitted.get(credential).map(|(_, at)| *at) != expected {
+            return;
+        }
+        let removed = connections.remove(credential);
+        self.pending.write().remove(credential);
+        admitted.remove(credential);
+        if let Some(connection) = removed {
+            let mut addresses = self.address_map.write();
+            for address in connection.get_addresses() {
+                if addresses
+                    .get(&address)
+                    .is_some_and(|current| current.key() == credential)
+                {
+                    addresses.remove(&address);
+                }
+            }
+            connection.close();
+        }
     }
 
     fn release_pending(&self, remote_addr: SocketAddr, ice_credential: &str) {
@@ -961,6 +1133,7 @@ impl UDPMux for DirectUdpMux {
         }
         self.address_map.write().clear();
         self.pending.write().clear();
+        self.admitted.write().clear();
         Ok(())
     }
 
@@ -984,27 +1157,19 @@ impl UDPMux for DirectUdpMux {
         let mut closed = connection.close_rx();
         let mux = Arc::clone(&self);
         let credential = ice_credential.to_string();
+        let admitted_at = self.admitted.read().get(ice_credential).map(|(_, at)| *at);
         tokio::spawn(async move {
             let _ = closed.changed().await;
-            mux.remove_conn_by_ufrag(&credential).await;
+            mux.remove_owned_connection(&credential, admitted_at).await;
         });
         connections.insert(ice_credential.to_string(), connection.clone());
         Ok(Arc::new(connection))
     }
 
     async fn remove_conn_by_ufrag(&self, ice_credential: &str) {
-        let removed = self.conns.lock().await.remove(ice_credential);
-        // ICE closes through this hook even before a UDP candidate is gathered
-        // or registered for an address. Such associations never reach
-        // register_conn_for_address, so their pending credential must be
-        // released here independently of whether a mux connection exists.
-        self.pending.write().remove(ice_credential);
-        if let Some(connection) = removed {
-            let mut addresses = self.address_map.write();
-            for address in connection.get_addresses() {
-                addresses.remove(&address);
-            }
-        }
+        let admitted_at = self.admitted.read().get(ice_credential).map(|(_, at)| *at);
+        self.remove_owned_connection(ice_credential, admitted_at)
+            .await;
     }
 }
 
@@ -1280,19 +1445,30 @@ mod tests {
         listener.close().await.unwrap();
     }
 
-    fn incomplete_association_request(password: &str) -> Vec<u8> {
-        let mut request = StunMessage::new();
-        request
-            .build(&[
-                Box::new(BINDING_REQUEST),
-                Box::new(TransactionId::new()),
-                Box::new(Username::new(
-                    ATTR_USERNAME,
-                    format!("{ICE_CREDENTIAL_PREFIX_V2}{password}:browserClientUfrag"),
-                )),
-            ])
+    async fn prove_association(
+        sender: &UdpSocket,
+        listener: &WebRtcDirectListener,
+        password: &str,
+    ) {
+        let packet = admission::tests::request(password);
+        sender
+            .send_to(&packet, listener.local_addr())
+            .await
             .unwrap();
-        request.raw
+        let mut buffer = [0u8; 2048];
+        let (length, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.recv_from(&mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response =
+            admission::tests::response(&buffer[..length], password, sender.local_addr().unwrap());
+        sender
+            .send_to(&response, listener.local_addr())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1366,13 +1542,7 @@ mod tests {
         .await
         .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(
-                &incomplete_association_request("browserPassword0123456789"),
-                listener.local_addr(),
-            )
-            .await
-            .unwrap();
+        prove_association(&sender, &listener, "browserPassword0123456789").await;
         let mut connection = tokio::time::timeout(Duration::from_secs(2), listener.accept())
             .await
             .unwrap()
@@ -1405,6 +1575,7 @@ mod tests {
             mux: Arc::clone(&listener.mux),
             credential,
             remote_addr: address,
+            admitted_at: None,
             peer: None,
         };
         let (release, wait) = tokio::sync::oneshot::channel();
@@ -1437,13 +1608,7 @@ mod tests {
             .await
             .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(
-                &incomplete_association_request("browserPassword0123456789"),
-                listener.local_addr(),
-            )
-            .await
-            .unwrap();
+        prove_association(&sender, &listener, "browserPassword0123456789").await;
         let connection = listener.accept().await.unwrap();
         let peer = Arc::clone(&connection.peer_connection);
         drop(connection);
@@ -1463,16 +1628,12 @@ mod tests {
             .await
             .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let request = incomplete_association_request("browserPassword0123456789");
 
-        // No ICE integrity attribute or handshake follows the initial packet.
+        // Reachability is established, but no DTLS handshake follows.
         // Rejection and first-channel timeout both close this same association.
         // Reuse its credential to prove that cleanup also permits a later retry.
-        for _ in 0..8 {
-            sender
-                .send_to(&request, listener.local_addr())
-                .await
-                .unwrap();
+        for index in 0..8 {
+            prove_association(&sender, &listener, &format!("browserPassword{index:016}")).await;
             let connection =
                 tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
                     .await
@@ -1486,57 +1647,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_associations_stay_bounded_after_draining_the_accept_queue() {
-        let certificate = WebRtcCertificate::generate().unwrap();
-        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse().unwrap(), certificate)
-            .await
-            .unwrap();
+    async fn unreturned_probes_never_allocate_or_queue_associations() {
+        let listener = WebRtcDirectListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+        )
+        .await
+        .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        // Drain notifications without completing ICE, leaving the pending
-        // registrations alive. Queue capacity alone cannot bound this state.
         for index in 0..MAX_PENDING_ASSOCIATIONS {
-            let request = incomplete_association_request(&format!("browserPassword{index:016}"));
             sender
-                .send_to(&request, listener.local_addr())
+                .send_to(
+                    &admission::tests::request(&format!("browserPassword{index:016}")),
+                    listener.local_addr(),
+                )
                 .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(2), listener.incoming.recv())
-                .await
-                .unwrap()
                 .unwrap();
         }
-        let request = incomplete_association_request("browserPasswordOverflow0123");
-        sender
-            .send_to(&request, listener.local_addr())
-            .await
-            .unwrap();
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                listener.incoming.recv(),
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(listener.mux.pending.read().len(), MAX_PENDING_ASSOCIATIONS);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(listener.mux.pending.read().is_empty());
+        assert!(listener.mux.admitted.read().is_empty());
+        assert!(listener.mux.conns.lock().await.is_empty());
+        assert!(listener.incoming.is_empty());
+        listener.close().await.unwrap();
+    }
 
-        listener
-            .mux
-            .remove_conn_by_ufrag(&format!(
-                "{ICE_CREDENTIAL_PREFIX_V2}browserPassword{:016}",
-                0
-            ))
-            .await;
-        sender
-            .send_to(&request, listener.local_addr())
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.incoming.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(listener.mux.pending.read().len(), MAX_PENDING_ASSOCIATIONS);
+    #[tokio::test]
+    async fn validated_queue_respects_source_limit_and_expires_without_accept() {
+        let listener = WebRtcDirectListener::bind_with_limits(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+            WebRtcAdmissionLimits {
+                max_connections: 2,
+                max_connections_per_ip: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        prove_association(&first, &listener, "browserPasswordFirst012345").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        prove_association(&second, &listener, "browserPasswordSecond01234").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(listener.mux.admitted.read().len(), 1);
+        assert_eq!(listener.incoming.len(), 1);
+        assert!(listener.mux.conns.lock().await.is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            while !listener.mux.admitted.read().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(listener.mux.pending.read().is_empty());
         listener.close().await.unwrap();
     }
 
@@ -1612,5 +1776,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(routed.key(), old_credential);
+        mux.admitted.write().insert(
+            new_credential.to_string(),
+            (remote_addr, tokio::time::Instant::now()),
+        );
+        let other_addr = "127.0.0.2:49152".parse().unwrap();
+        assert!(
+            mux.connection_for_packet(&request.raw, other_addr)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            mux.admitted.read().get(new_credential).unwrap().0,
+            remote_addr
+        );
     }
 }
