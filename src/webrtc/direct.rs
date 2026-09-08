@@ -30,7 +30,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use stun::attributes::ATTR_USERNAME;
 use stun::message::{Message as StunMessage, is_message as is_stun_message};
@@ -281,12 +281,7 @@ impl WebRtcDirectListener {
                     () = self.mux.shutdown.cancelled() => return Err(WebRtcDirectError::Closed),
                     association = self.incoming.recv() => association.ok_or(WebRtcDirectError::Closed)?,
                 };
-                if self
-                    .mux
-                    .pending
-                    .read()
-                    .contains_key(&association.server_ufrag)
-                {
+                if self.mux.is_pending(&association) {
                     break association;
                 }
             };
@@ -299,11 +294,7 @@ impl WebRtcDirectListener {
                     mux: Arc::clone(&mux),
                     credential: association.server_ufrag.clone(),
                     remote_addr: association.remote_addr,
-                    admitted_at: mux
-                        .admitted
-                        .read()
-                        .get(&association.server_ufrag)
-                        .map(|(_, at)| *at),
+                    generation: association.generation,
                     peer: None,
                 };
                 create_inbound_connection(
@@ -348,28 +339,85 @@ impl Drop for WebRtcDirectListener {
     }
 }
 
+// Give upstream ICE a session-scoped mux. Its callbacks carry the generation
+// captured at admission instead of looking up whichever session is current.
+struct AssociationMux {
+    mux: Arc<DirectUdpMux>,
+    credential: String,
+    generation: u64,
+}
+
+#[async_trait]
+impl UDPMux for AssociationMux {
+    async fn close(&self) -> Result<(), WebRtcUtilError> {
+        self.mux
+            .remove_owned_connection(&self.credential, Some(self.generation))
+            .await;
+        Ok(())
+    }
+
+    async fn get_conn(
+        self: Arc<Self>,
+        credential: &str,
+    ) -> Result<Arc<dyn Conn + Send + Sync>, WebRtcUtilError> {
+        if credential != self.credential {
+            return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
+        }
+        let writer: Arc<dyn UDPMuxWriter + Send + Sync> = self.clone();
+        Arc::clone(&self.mux)
+            .get_owned_conn(credential, Some(self.generation), writer)
+            .await
+    }
+
+    async fn remove_conn_by_ufrag(&self, credential: &str) {
+        if credential == self.credential {
+            self.mux
+                .remove_owned_connection(credential, Some(self.generation))
+                .await;
+        }
+    }
+}
+
+#[async_trait]
+impl UDPMuxWriter for AssociationMux {
+    async fn register_conn_for_address(&self, connection: &UDPMuxConn, addr: SocketAddr) {
+        if connection.key() == self.credential {
+            self.mux
+                .register_owned_address(connection, addr, Some(self.generation));
+        }
+    }
+
+    async fn send_to(&self, packet: &[u8], target: &SocketAddr) -> Result<usize, WebRtcUtilError> {
+        if self.mux.admitted.read().get(&self.credential) != Some(&(*target, self.generation)) {
+            return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
+        }
+        self.mux.send_to(packet, target).await
+    }
+}
+
 // Own cleanup on setup errors, rejected connections, and caller cancellation.
 struct AssociationOwner {
     mux: Arc<DirectUdpMux>,
     credential: String,
     remote_addr: SocketAddr,
     peer: Option<Arc<RTCPeerConnection>>,
-    admitted_at: Option<tokio::time::Instant>,
+    generation: Option<u64>,
 }
 
 impl Drop for AssociationOwner {
     fn drop(&mut self) {
-        self.mux.release_pending(self.remote_addr, &self.credential);
+        self.mux
+            .release_pending(self.remote_addr, &self.credential, self.generation);
         let mux = Arc::clone(&self.mux);
         let credential = self.credential.clone();
         let peer = self.peer.take();
-        let admitted_at = self.admitted_at;
+        let generation = self.generation;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Some(peer) = peer {
                     let _ = peer.close().await;
                 }
-                mux.remove_owned_connection(&credential, admitted_at).await;
+                mux.remove_owned_connection(&credential, generation).await;
             });
         }
     }
@@ -602,7 +650,11 @@ async fn create_inbound_connection(
         .set_answering_dtls_role(DTLSRole::Server)
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     settings.set_ice_credentials(server_ufrag.to_string(), server_ufrag.to_string());
-    settings.set_udp_network(UDPNetwork::Muxed(udp_mux as Arc<dyn UDPMux + Send + Sync>));
+    settings.set_udp_network(UDPNetwork::Muxed(Arc::new(AssociationMux {
+        mux: udp_mux,
+        credential: server_ufrag.to_string(),
+        generation: owner.generation.ok_or(WebRtcDirectError::Closed)?,
+    })));
     settings.detach_data_channels();
     settings.set_srtp_protection_profiles(vec![
         SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
@@ -944,15 +996,17 @@ struct IncomingAssociation {
     server_ufrag: String,
     client_ufrag: String,
     client_pwd: String,
+    generation: Option<u64>,
 }
 
 struct DirectUdpMux {
     local_addr: SocketAddr,
     conns: Mutex<HashMap<String, UDPMuxConn>>,
     address_map: RwLock<HashMap<SocketAddr, UDPMuxConn>>,
-    pending: RwLock<HashMap<String, SocketAddr>>,
-    admitted: RwLock<HashMap<String, (SocketAddr, tokio::time::Instant)>>,
+    pending: RwLock<HashMap<String, (SocketAddr, u64)>>,
+    admitted: RwLock<HashMap<String, (SocketAddr, u64)>>,
     limits: WebRtcAdmissionLimits,
+    next_generation: AtomicU64,
     admission: parking_lot::Mutex<admission::Admission>,
     incoming: mpsc::Sender<IncomingAssociation>,
     socket: Weak<UdpSocket>,
@@ -987,6 +1041,7 @@ impl DirectUdpMux {
             pending: RwLock::new(HashMap::new()),
             admitted: RwLock::new(HashMap::new()),
             limits,
+            next_generation: AtomicU64::new(1),
             admission: parking_lot::Mutex::new(admission::Admission::default()),
             incoming,
             socket: Arc::downgrade(&socket),
@@ -1035,7 +1090,7 @@ impl DirectUdpMux {
                 self.admission
                     .lock()
                     .receive(packet, remote_addr, tokio::time::Instant::now());
-            let association = match decision {
+            let mut association = match decision {
                 admission::Decision::Ignore => continue,
                 admission::Decision::Challenge(bytes) => {
                     let _ = socket.send_to(&bytes, remote_addr).await;
@@ -1043,7 +1098,15 @@ impl DirectUdpMux {
                 }
                 admission::Decision::Admit(association) => association,
             };
-            let admitted_at = tokio::time::Instant::now();
+            let Ok(generation) =
+                self.next_generation
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        value.checked_add(1)
+                    })
+            else {
+                continue;
+            };
+            association.generation = Some(generation);
             {
                 let mut admitted = self.admitted.write();
                 if admitted.contains_key(&association.server_ufrag)
@@ -1058,30 +1121,32 @@ impl DirectUdpMux {
                 {
                     continue;
                 }
-                admitted.insert(association.server_ufrag.clone(), (remote_addr, admitted_at));
-            }
-            {
                 let mut pending = self.pending.write();
                 if pending.contains_key(&association.server_ufrag)
                     || pending.len() >= MAX_PENDING_ASSOCIATIONS
                 {
                     continue;
                 }
-                pending.insert(association.server_ufrag.clone(), association.remote_addr);
+                admitted.insert(association.server_ufrag.clone(), (remote_addr, generation));
+                pending.insert(
+                    association.server_ufrag.clone(),
+                    (association.remote_addr, generation),
+                );
             }
             let expiry_mux = Arc::downgrade(&self);
             let expiry_credential = association.server_ufrag.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 if let Some(mux) = expiry_mux.upgrade() {
-                    if mux.pending.read().contains_key(&expiry_credential)
-                        && mux
-                            .admitted
-                            .read()
-                            .get(&expiry_credential)
-                            .is_some_and(|(_, created)| *created == admitted_at)
+                    if mux
+                        .admitted
+                        .read()
+                        .get(&expiry_credential)
+                        .is_some_and(|(_, created)| *created == generation)
+                        && mux.pending.read().get(&expiry_credential)
+                            == Some(&(remote_addr, generation))
                     {
-                        mux.remove_owned_connection(&expiry_credential, Some(admitted_at))
+                        mux.remove_owned_connection(&expiry_credential, Some(generation))
                             .await;
                     }
                 }
@@ -1126,11 +1191,7 @@ impl DirectUdpMux {
         self.address_map.read().get(&remote_addr).cloned()
     }
 
-    async fn remove_owned_connection(
-        &self,
-        credential: &str,
-        expected: Option<tokio::time::Instant>,
-    ) {
+    async fn remove_owned_connection(&self, credential: &str, expected: Option<u64>) {
         let mut connections = self.conns.lock().await;
         let mut admitted = self.admitted.write();
         if admitted.get(credential).map(|(_, at)| *at) != expected {
@@ -1153,10 +1214,93 @@ impl DirectUdpMux {
         }
     }
 
-    fn release_pending(&self, remote_addr: SocketAddr, ice_credential: &str) {
-        let removed = self.pending.write().remove(ice_credential);
-        if removed.is_some_and(|pending_addr| pending_addr != remote_addr) {
-            tracing::debug!(%remote_addr, %ice_credential, "released WebRTC association from a replacement candidate address");
+    async fn get_owned_conn(
+        self: Arc<Self>,
+        ice_credential: &str,
+        expected: Option<u64>,
+        writer: Arc<dyn UDPMuxWriter + Send + Sync>,
+    ) -> Result<Arc<dyn Conn + Send + Sync>, WebRtcUtilError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
+        }
+        let mut connections = self.conns.lock().await;
+        if self.closed.load(Ordering::Acquire)
+            || self.admitted.read().get(ice_credential).map(|(_, id)| *id) != expected
+        {
+            return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
+        }
+        if let Some(connection) = connections.get(ice_credential) {
+            return Ok(Arc::new(connection.clone()));
+        }
+        let connection = UDPMuxConn::new(UDPMuxConnParams {
+            local_addr: self.local_addr,
+            key: ice_credential.to_string(),
+            udp_mux: Arc::downgrade(&writer),
+        });
+        let mut closed = connection.close_rx();
+        let mux = Arc::clone(&self);
+        let credential = ice_credential.to_string();
+        let generation = expected;
+        tokio::spawn(async move {
+            let _ = closed.changed().await;
+            mux.remove_owned_connection(&credential, generation).await;
+        });
+        connections.insert(ice_credential.to_string(), connection.clone());
+        Ok(Arc::new(connection))
+    }
+
+    fn register_owned_address(
+        &self,
+        connection: &UDPMuxConn,
+        addr: SocketAddr,
+        generation: Option<u64>,
+    ) {
+        let admitted = self.admitted.read();
+        if self.closed.load(Ordering::Acquire)
+            || admitted.get(connection.key()).map(|(_, id)| *id) != generation
+        {
+            return;
+        }
+        if admitted
+            .get(connection.key())
+            .is_some_and(|(source, _)| *source != addr)
+        {
+            return;
+        }
+        let key = connection.key();
+        self.address_map
+            .write()
+            .entry(addr)
+            .and_modify(|current| {
+                if current.key() != key {
+                    current.remove_address(&addr);
+                    *current = connection.clone();
+                }
+            })
+            .or_insert_with(|| connection.clone());
+        self.pending.write().remove(connection.key());
+    }
+
+    fn is_pending(&self, association: &IncomingAssociation) -> bool {
+        let Some(generation) = association.generation else {
+            return false;
+        };
+        let admitted = self.admitted.read();
+        let expected = (association.remote_addr, generation);
+        admitted.get(&association.server_ufrag) == Some(&expected)
+            && self.pending.read().get(&association.server_ufrag) == Some(&expected)
+    }
+
+    fn release_pending(&self, remote_addr: SocketAddr, credential: &str, generation: Option<u64>) {
+        let admitted = self.admitted.read();
+        if admitted.get(credential).map(|(_, id)| *id) == generation {
+            let mut pending = self.pending.write();
+            if pending
+                .get(credential)
+                .is_some_and(|(addr, id)| *addr == remote_addr && Some(*id) == generation)
+            {
+                pending.remove(credential);
+            }
         }
     }
 }
@@ -1182,53 +1326,19 @@ impl UDPMux for DirectUdpMux {
         self: Arc<Self>,
         ice_credential: &str,
     ) -> Result<Arc<dyn Conn + Send + Sync>, WebRtcUtilError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
-        }
-        let mut connections = self.conns.lock().await;
-        if let Some(connection) = connections.get(ice_credential) {
-            return Ok(Arc::new(connection.clone()));
-        }
         let writer: Arc<dyn UDPMuxWriter + Send + Sync> = self.clone();
-        let connection = UDPMuxConn::new(UDPMuxConnParams {
-            local_addr: self.local_addr,
-            key: ice_credential.to_string(),
-            udp_mux: Arc::downgrade(&writer),
-        });
-        let mut closed = connection.close_rx();
-        let mux = Arc::clone(&self);
-        let credential = ice_credential.to_string();
-        let admitted_at = self.admitted.read().get(ice_credential).map(|(_, at)| *at);
-        tokio::spawn(async move {
-            let _ = closed.changed().await;
-            mux.remove_owned_connection(&credential, admitted_at).await;
-        });
-        connections.insert(ice_credential.to_string(), connection.clone());
-        Ok(Arc::new(connection))
+        self.get_owned_conn(ice_credential, None, writer).await
     }
 
     async fn remove_conn_by_ufrag(&self, ice_credential: &str) {
-        let admitted_at = self.admitted.read().get(ice_credential).map(|(_, at)| *at);
-        self.remove_owned_connection(ice_credential, admitted_at)
-            .await;
+        self.remove_owned_connection(ice_credential, None).await;
     }
 }
 
 #[async_trait]
 impl UDPMuxWriter for DirectUdpMux {
     async fn register_conn_for_address(&self, connection: &UDPMuxConn, addr: SocketAddr) {
-        let key = connection.key();
-        self.address_map
-            .write()
-            .entry(addr)
-            .and_modify(|current| {
-                if current.key() != key {
-                    current.remove_address(&addr);
-                    *current = connection.clone();
-                }
-            })
-            .or_insert_with(|| connection.clone());
-        self.pending.write().remove(connection.key());
+        self.register_owned_address(connection, addr, None);
     }
 
     async fn send_to(&self, packet: &[u8], target: &SocketAddr) -> Result<usize, WebRtcUtilError> {
@@ -1525,6 +1635,67 @@ mod tests {
         listener.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn retired_generation_cannot_mutate_replacement() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, _) = mpsc::channel(1);
+        let mux = DirectUdpMux::new(Arc::clone(&socket), socket.local_addr().unwrap(), tx);
+        let credential = "replacement".to_string();
+        let remote = "127.0.0.1:45678".parse().unwrap();
+        let retired = Arc::new(AssociationMux {
+            mux: mux.clone(),
+            credential: credential.clone(),
+            generation: 1,
+        });
+        let owner = AssociationOwner {
+            mux: mux.clone(),
+            credential: credential.clone(),
+            remote_addr: remote,
+            peer: None,
+            generation: Some(1),
+        };
+        mux.admitted.write().insert(credential.clone(), (remote, 2));
+        mux.pending.write().insert(credential.clone(), (remote, 2));
+        drop(owner);
+        retired.remove_conn_by_ufrag(&credential).await;
+        retired.close().await.unwrap();
+        assert!(retired.clone().get_conn(&credential).await.is_err());
+        assert!(retired.send_to(b"stale", &remote).await.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(mux.pending.read().get(&credential), Some(&(remote, 2)));
+        assert_eq!(mux.admitted.read().get(&credential), Some(&(remote, 2)));
+        assert!(mux.conns.lock().await.is_empty());
+        mux.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_associations_require_their_original_source_and_generation() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, _) = mpsc::channel(1);
+        let mux = DirectUdpMux::new(Arc::clone(&socket), socket.local_addr().unwrap(), tx);
+        let current = "127.0.0.1:45679".parse().unwrap();
+        let credential = "replacement".to_string();
+        mux.pending.write().insert(credential.clone(), (current, 2));
+        mux.admitted
+            .write()
+            .insert(credential.clone(), (current, 2));
+        for (source, generation, accepted) in [
+            (current, 1, false),
+            ("127.0.0.1:45678".parse().unwrap(), 2, false),
+            (current, 2, true),
+        ] {
+            let association = IncomingAssociation {
+                remote_addr: source,
+                server_ufrag: credential.clone(),
+                client_ufrag: "client".into(),
+                client_pwd: "password".into(),
+                generation: Some(generation),
+            };
+            assert_eq!(mux.is_pending(&association), accepted);
+        }
+        mux.close().await.unwrap();
+    }
+
     async fn prove_association(
         sender: &UdpSocket,
         listener: &WebRtcDirectListener,
@@ -1573,6 +1744,7 @@ mod tests {
                         ),
                         client_ufrag: "browserClientUfrag".to_string(),
                         client_pwd: "browserPassword0123456789".to_string(),
+                        generation: None,
                     })
                     .unwrap();
             }
@@ -1670,12 +1842,17 @@ mod tests {
             .mux
             .pending
             .write()
-            .insert(credential.clone(), address);
+            .insert(credential.clone(), (address, 1));
+        listener
+            .mux
+            .admitted
+            .write()
+            .insert(credential.clone(), (address, 1));
         let owner = AssociationOwner {
             mux: Arc::clone(&listener.mux),
             credential,
             remote_addr: address,
-            admitted_at: None,
+            generation: Some(1),
             peer: None,
         };
         let (release, wait) = tokio::sync::oneshot::channel();
@@ -1876,10 +2053,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(routed.key(), old_credential);
-        mux.admitted.write().insert(
-            new_credential.to_string(),
-            (remote_addr, tokio::time::Instant::now()),
-        );
+        mux.admitted
+            .write()
+            .insert(new_credential.to_string(), (remote_addr, 1));
         let other_addr = "127.0.0.2:49152".parse().unwrap();
         assert!(
             mux.connection_for_packet(&request.raw, other_addr)
