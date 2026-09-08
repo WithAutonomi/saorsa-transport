@@ -6,7 +6,7 @@
 //! material, and protects every subsequent application frame with
 //! ChaCha20-Poly1305.
 
-use crate::verify_ml_dsa_65;
+use super::verify_ml_dsa_65;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},

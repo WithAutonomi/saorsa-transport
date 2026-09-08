@@ -6,6 +6,13 @@
 //! sides use this module so the sender never waits longer than the receiver is
 //! willing to accept the same frame.
 
+#![deny(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+/// Native WebRTC Direct listener and socket implementation.
+#[cfg(feature = "webrtc-direct")]
+pub mod direct;
+
 use saorsa_pqc::{
     dsa_traits::{SerDes as _, Verifier as _},
     ml_dsa_65,

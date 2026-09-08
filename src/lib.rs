@@ -260,7 +260,11 @@ pub mod transport;
 /// Signaling-free WebRTC DataChannel transport for direct browser clients.
 #[cfg(feature = "webrtc-direct")]
 #[cfg(feature = "native")]
-pub mod webrtc_direct;
+pub use webrtc::direct as webrtc_direct;
+
+/// Portable WebRTC profile, framing, and post-quantum sessions.
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 
 /// Connection router for automatic protocol engine selection (QUIC vs Constrained)
 #[cfg(feature = "native")]
