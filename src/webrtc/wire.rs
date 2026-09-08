@@ -179,6 +179,7 @@ impl BrowserEndpointInput {
 /// RPC endpoints belong to the node operator or client application and never
 /// form part of this wire record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserPaymentNetwork {
     /// EVM chain ID used for payment verification.
     pub chain_id: u64,
@@ -1237,6 +1238,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<BrowserPaymentNetwork>(serde_json::json!({
+                "chain_id": 31337,
                 "rpc_url": "https://operator.invalid/private-key",
                 "payment_token_address": "11".repeat(20),
                 "payment_vault_address": "22".repeat(20),
