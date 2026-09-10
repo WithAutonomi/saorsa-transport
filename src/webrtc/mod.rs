@@ -28,6 +28,29 @@ pub use session::{
 };
 pub use wire::*;
 
+/// Source accounting key shared by WebRTC transport admission and RPC budgets.
+/// IPv4-mapped addresses share the IPv4 bucket; native IPv6 addresses share
+/// one bucket per /64 so rotating interface identifiers cannot evade limits.
+#[must_use]
+pub fn source_ip_bucket(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(ip) => std::net::IpAddr::V4(ip),
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            ))
+        }
+    }
+}
+
 /// Verify an ML-DSA-65 signature, returning `false` for malformed input.
 #[must_use]
 pub fn verify_ml_dsa_65(
@@ -77,6 +100,29 @@ pub fn transfer_timeout(frame_bytes: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_buckets_share_ipv6_prefixes_and_ipv4_mapped_addresses()
+    -> Result<(), std::net::AddrParseError> {
+        let parse = |address: &str| address.parse::<std::net::IpAddr>();
+        assert_eq!(
+            source_ip_bucket(parse("2001:db8:1:2::1")?),
+            source_ip_bucket(parse("2001:db8:1:2:ffff::9")?)
+        );
+        assert_ne!(
+            source_ip_bucket(parse("2001:db8:1:2::1")?),
+            source_ip_bucket(parse("2001:db8:1:3::1")?)
+        );
+        assert_eq!(
+            source_ip_bucket(parse("::ffff:192.0.2.1")?),
+            source_ip_bucket(parse("192.0.2.1")?)
+        );
+        assert_ne!(
+            source_ip_bucket(parse("192.0.2.1")?),
+            source_ip_bucket(parse("192.0.2.2")?)
+        );
+        Ok(())
+    }
 
     #[test]
     fn transfer_timeout_scales_with_body_size() {

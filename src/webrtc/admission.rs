@@ -99,11 +99,11 @@ impl Admission {
             }
             // Only a returned source-bound cookie consumes memory. Retain its
             // integrity tag until the next ICE request supplies the credentials.
-            let ip = source.ip().to_canonical();
+            let ip = super::super::source_ip_bucket(source.ip());
             let same_ip = self
                 .verified
                 .keys()
-                .filter(|addr| addr.ip().to_canonical() == ip)
+                .filter(|addr| super::super::source_ip_bucket(addr.ip()) == ip)
                 .count();
             if !self.verified.contains_key(&source)
                 && (same_ip >= MAX_PROBES_PER_IP || self.verified.len() >= MAX_PROBES)
@@ -112,7 +112,8 @@ impl Admission {
                     .verified
                     .iter()
                     .filter(|(addr, _)| {
-                        same_ip < MAX_PROBES_PER_IP || addr.ip().to_canonical() == ip
+                        same_ip < MAX_PROBES_PER_IP
+                            || super::super::source_ip_bucket(addr.ip()) == ip
                     })
                     .min_by_key(|(_, proof)| proof.expires)
                     .map(|(addr, _)| *addr);
@@ -235,6 +236,30 @@ pub(super) mod tests {
             ])
             .unwrap();
         response.raw
+    }
+
+    #[test]
+    fn returned_cookies_share_an_ipv6_prefix_budget() {
+        let mut admission = Admission::default();
+        let now = Instant::now();
+        let password = "browserPassword0123456789";
+        let packet = request(password);
+        for host in 1..=12 {
+            let source = format!("[2001:db8:1:2::{host:x}]:5000").parse().unwrap();
+            let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+                panic!("expected challenge")
+            };
+            let proof = response(&challenge, password, source);
+            admission.receive(&proof, source, now);
+        }
+        assert_eq!(admission.verified.len(), MAX_PROBES_PER_IP);
+        let other = "[2001:db8:1:3::1]:5000".parse().unwrap();
+        let Decision::Challenge(challenge) = admission.receive(&packet, other, now) else {
+            panic!("expected challenge")
+        };
+        let proof = response(&challenge, password, other);
+        admission.receive(&proof, other, now);
+        assert_eq!(admission.verified.len(), MAX_PROBES_PER_IP + 1);
     }
 
     #[test]
