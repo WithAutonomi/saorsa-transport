@@ -80,7 +80,7 @@ const MAX_PENDING_ASSOCIATIONS: usize = 256;
 pub struct WebRtcAdmissionLimits {
     /// Maximum simultaneous associations, including handshakes.
     pub max_connections: usize,
-    /// Maximum simultaneous associations from one canonical IP address.
+    /// Maximum simultaneous associations from one IPv4 address or IPv6 /64.
     pub max_connections_per_ip: usize,
 }
 
@@ -1114,7 +1114,8 @@ impl DirectUdpMux {
                     || admitted
                         .values()
                         .filter(|addr| {
-                            addr.0.ip().to_canonical() == remote_addr.ip().to_canonical()
+                            super::source_ip_bucket(addr.0.ip())
+                                == super::source_ip_bucket(remote_addr.ip())
                         })
                         .count()
                         >= self.limits.max_connections_per_ip
