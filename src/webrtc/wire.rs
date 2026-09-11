@@ -5,24 +5,28 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr as _;
 
 /// Current browser request/response protocol version.
-pub const BROWSER_PROTOCOL_VERSION: u16 = 5;
+pub const BROWSER_PROTOCOL_VERSION: u16 = 6;
 /// Protocol name authenticated by the node HELLO response.
-pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v5";
+pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v6";
 /// Ordered WebRTC `DataChannel` label used by Autonomi nodes.
-pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v5";
+pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v6";
 /// Maximum content carried by one browser protocol frame.
 pub const MAX_BROWSER_RECORD_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum JSON header carried by one browser protocol frame.
+/// Fixed maximum JSON header carried by one browser protocol frame.
+///
+/// Accommodates a paid PUT with a signed quote and a full hex-encoded storage
+/// commitment (including its duplicated public key and signature).
 pub const MAX_BROWSER_HEADER_BYTES: usize = 64 * 1024;
 /// Maximum encoded ant-protocol message, including payment proof overhead.
 pub const MAX_BROWSER_CONTENT_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum complete browser application frame.
-pub const MAX_BROWSER_FRAME_BYTES: usize = 4 + MAX_BROWSER_HEADER_BYTES + MAX_BROWSER_CONTENT_BYTES;
+pub const MAX_BROWSER_FRAME_BYTES: usize = MAX_BROWSER_HEADER_BYTES + MAX_BROWSER_CONTENT_BYTES;
 /// Backwards-compatible name for the maximum complete response frame.
 pub const MAX_BROWSER_RESPONSE_BYTES: usize = MAX_BROWSER_FRAME_BYTES;
 /// Maximum accepted WebRTC Direct multiaddress length.
@@ -721,14 +725,11 @@ fn encode_frame<T: Serialize>(
     let header = serde_json::to_vec(header)
         .map_err(|error| BrowserProtocolError::Frame(error.to_string()))?;
     validate_header_length(header.len())?;
-    let capacity = 4usize
-        .checked_add(header.len())
-        .and_then(|size| size.checked_add(content.len()))
+    let capacity = header
+        .len()
+        .checked_add(content.len())
         .ok_or_else(|| BrowserProtocolError::Frame(format!("{direction} length overflow")))?;
-    let header_length = u32::try_from(header.len())
-        .map_err(|_| BrowserProtocolError::Frame(format!("{direction} header length overflow")))?;
     let mut frame = Vec::with_capacity(capacity);
-    frame.extend_from_slice(&header_length.to_be_bytes());
     frame.extend_from_slice(&header);
     frame.extend_from_slice(content);
     Ok(frame)
@@ -741,14 +742,17 @@ fn encode_frame<T: Serialize>(
 /// # Errors
 ///
 /// Returns an error for malformed JSON, invalid lengths, or exceeded bounds.
-pub fn parse_request_header(
-    frame: &[u8],
-    max_header_bytes: usize,
-) -> Result<(BrowserRequest, usize), BrowserProtocolError> {
-    let (header, content_offset) = split_header(frame, max_header_bytes, "request")?;
-    let request: BrowserRequest = serde_json::from_slice(header).map_err(|error| {
-        BrowserProtocolError::Frame(format!("request JSON is invalid: {error}"))
-    })?;
+pub fn parse_request_header(frame: &[u8]) -> Result<(BrowserRequest, usize), BrowserProtocolError> {
+    let (request, content_offset) = parse_json_header::<BrowserRequest>(frame, "request")?
+        .ok_or_else(|| {
+            BrowserProtocolError::Frame("request ended inside its JSON header".into())
+        })?;
+    if request.version != BROWSER_PROTOCOL_VERSION {
+        return Err(BrowserProtocolError::Frame(format!(
+            "unsupported request version {}",
+            request.version
+        )));
+    }
     validate_record_bound(
         request.content_length,
         matches!(request.body, BrowserRequestBody::ChunkProtocol),
@@ -762,20 +766,20 @@ pub fn parse_request_header(
     Ok((request, content_offset))
 }
 
-/// Parse one complete length-prefixed browser request.
+/// Parse one complete browser request.
 ///
 /// # Errors
 ///
 /// Returns an error for malformed JSON, invalid lengths, or exceeded bounds.
 pub fn parse_request_frame(frame: &[u8]) -> Result<BrowserRequestFrame, BrowserProtocolError> {
-    let (request, content_offset) = parse_request_header(frame, MAX_BROWSER_HEADER_BYTES)?;
+    let (request, content_offset) = parse_request_header(frame)?;
     Ok(BrowserRequestFrame {
         request,
         content: frame[content_offset..].to_vec(),
     })
 }
 
-/// Parse one complete length-prefixed browser response.
+/// Parse one complete browser response.
 ///
 /// # Errors
 ///
@@ -800,28 +804,28 @@ pub fn parse_response_frame(frame: &[u8]) -> Result<BrowserResponseFrame, Browse
 ///
 /// Returns an error when an available header is malformed or exceeds a bound.
 pub fn response_frame_length(frame: &[u8]) -> Result<Option<usize>, BrowserProtocolError> {
-    if frame.len() < 4 {
+    let Some((response, content_offset)) = parse_json_header::<BrowserResponse>(frame, "response")?
+    else {
         return Ok(None);
-    }
-    let header_length = u32::from_be_bytes(
-        frame[..4]
-            .try_into()
-            .map_err(|_| BrowserProtocolError::Frame("missing header length".to_string()))?,
-    ) as usize;
-    validate_header_length(header_length)?;
-    if frame.len() < 4 + header_length {
-        return Ok(None);
-    }
-    parse_response_header(frame).map(|(_, _, length)| Some(length))
+    };
+    response_length(&response, content_offset).map(Some)
 }
 
 fn parse_response_header(
     frame: &[u8],
 ) -> Result<(BrowserResponse, usize, usize), BrowserProtocolError> {
-    let (header, content_offset) = split_header(frame, MAX_BROWSER_HEADER_BYTES, "response")?;
-    let response: BrowserResponse = serde_json::from_slice(header).map_err(|error| {
-        BrowserProtocolError::Frame(format!("response JSON is invalid: {error}"))
-    })?;
+    let (response, content_offset) = parse_json_header::<BrowserResponse>(frame, "response")?
+        .ok_or_else(|| {
+            BrowserProtocolError::Frame("response ended inside its JSON header".into())
+        })?;
+    let frame_length = response_length(&response, content_offset)?;
+    Ok((response, content_offset, frame_length))
+}
+
+fn response_length(
+    response: &BrowserResponse,
+    content_offset: usize,
+) -> Result<usize, BrowserProtocolError> {
     if response.version != BROWSER_PROTOCOL_VERSION {
         return Err(BrowserProtocolError::Frame(format!(
             "unsupported response version {}",
@@ -840,38 +844,34 @@ fn parse_response_header(
             "invalid response content length".to_string(),
         ));
     }
-    Ok((response, content_offset, frame_length))
+    Ok(frame_length)
 }
 
-fn split_header<'a>(
-    frame: &'a [u8],
-    max_header_bytes: usize,
+// Parse just the first JSON value. Its byte offset is the binary body boundary;
+// body bytes (including whitespace, braces, and invalid UTF-8) are never JSON.
+// Bound the whole message before parsing, then bound the parser's input too.
+fn parse_json_header<T: DeserializeOwned>(
+    frame: &[u8],
     direction: &str,
-) -> Result<(&'a [u8], usize), BrowserProtocolError> {
-    if frame.len() < 4 {
+) -> Result<Option<(T, usize)>, BrowserProtocolError> {
+    if frame.len() > MAX_BROWSER_FRAME_BYTES {
         return Err(BrowserProtocolError::Frame(format!(
-            "{direction} ended before its four-byte header length"
+            "{direction} frame exceeds protocol limit"
         )));
     }
-    let header_length = u32::from_be_bytes(
-        frame[..4]
-            .try_into()
-            .map_err(|_| BrowserProtocolError::Frame("missing header length".to_string()))?,
-    ) as usize;
-    if header_length == 0 || header_length > max_header_bytes {
-        return Err(BrowserProtocolError::Frame(format!(
-            "invalid {direction} header length {header_length}"
-        )));
+    let bounded = &frame[..frame.len().min(MAX_BROWSER_HEADER_BYTES)];
+    let mut stream = serde_json::Deserializer::from_slice(bounded).into_iter::<T>();
+    match stream.next() {
+        Some(Ok(header)) => Ok(Some((header, stream.byte_offset()))),
+        None if frame.len() < MAX_BROWSER_HEADER_BYTES => Ok(None),
+        Some(Err(error)) if error.is_eof() && frame.len() < MAX_BROWSER_HEADER_BYTES => Ok(None),
+        Some(Err(error)) => Err(BrowserProtocolError::Frame(format!(
+            "{direction} JSON is invalid or exceeds header limit: {error}"
+        ))),
+        None => Err(BrowserProtocolError::Frame(format!(
+            "{direction} header exceeds protocol limit"
+        ))),
     }
-    let content_offset = 4usize.checked_add(header_length).ok_or_else(|| {
-        BrowserProtocolError::Frame(format!("{direction} header length overflow"))
-    })?;
-    if content_offset > frame.len() {
-        return Err(BrowserProtocolError::Frame(format!(
-            "{direction} ended inside its JSON header"
-        )));
-    }
-    Ok((&frame[4..content_offset], content_offset))
 }
 
 fn validate_header_length(header_length: usize) -> Result<(), BrowserProtocolError> {
@@ -1104,9 +1104,66 @@ mod tests {
         assert!(encode_response_frame(&response, &content).is_err());
         // Reject a forged length from the header before waiting for its body.
         let header = serde_json::to_vec(&response).unwrap();
-        let mut forged = (header.len() as u32).to_be_bytes().to_vec();
-        forged.extend(header);
-        assert!(response_frame_length(&forged).is_err());
+        assert!(response_frame_length(&header).is_err());
+    }
+
+    #[test]
+    fn json_boundary_preserves_arbitrary_binary_content() {
+        let content = b" \n}\"{\x00\xff";
+        let request = BrowserRequest::new(1, BrowserRequestBody::ChunkProtocol, content.len());
+        let frame = encode_request_frame(&request, content).unwrap();
+        assert_eq!(frame[0], b'{');
+        assert_eq!(parse_request_frame(&frame).unwrap().content, content);
+        let response = BrowserResponse::ok(1, BrowserResponseBody::ChunkProtocol, content.len());
+        let frame = encode_response_frame(&response, content).unwrap();
+        assert_eq!(parse_response_frame(&frame).unwrap().content, content);
+        let header_length = frame.len() - content.len();
+        for length in 0..header_length {
+            assert_eq!(response_frame_length(&frame[..length]).unwrap(), None);
+        }
+        assert_eq!(
+            response_frame_length(&frame[..header_length]).unwrap(),
+            Some(frame.len())
+        );
+    }
+
+    #[test]
+    fn fixed_bounds_reject_oversized_frames_and_headers() {
+        // Reject the complete message before trying to parse its invalid JSON.
+        let oversized = vec![0xff; MAX_BROWSER_FRAME_BYTES + 1];
+        assert!(
+            parse_request_header(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("frame exceeds")
+        );
+        assert!(
+            parse_response_frame(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("frame exceeds")
+        );
+        // Valid JSON ending exactly at the header bound is accepted. An extra
+        // leading space moves the closing brace outside the parser's bound.
+        let request = BrowserRequest::new(1, BrowserRequestBody::Hello, 0);
+        let json = serde_json::to_vec(&request).unwrap();
+        let mut frame = vec![b' '; MAX_BROWSER_HEADER_BYTES - json.len()];
+        frame.extend(&json);
+        assert!(parse_request_frame(&frame).is_ok());
+        frame.insert(0, b' ');
+        assert!(parse_request_frame(&frame).is_err());
+        assert!(parse_request_frame(b"{\"version\":").is_err());
+        let mut old = (json.len() as u32).to_be_bytes().to_vec();
+        old.extend(&json);
+        assert!(parse_request_frame(&old).is_err());
+        let stale = BrowserRequest {
+            version: 5,
+            ..request
+        };
+        assert!(parse_request_frame(&serde_json::to_vec(&stale).unwrap()).is_err());
+        let mut trailing = json;
+        trailing.push(0);
+        assert!(parse_request_frame(&trailing).is_err());
     }
 
     fn endpoint() -> BrowserEndpoint {
@@ -1192,13 +1249,7 @@ mod tests {
             "address": "11".repeat(32),
         });
         let header = serde_json::to_vec(&stale).expect("serialize");
-        let mut frame = Vec::new();
-        frame.extend_from_slice(
-            &u32::try_from(header.len())
-                .expect("header length")
-                .to_be_bytes(),
-        );
-        frame.extend_from_slice(&header);
+        let frame = header;
         assert!(parse_response_frame(&frame).is_err());
 
         let request = BrowserRequest::new(1, BrowserRequestBody::Hello, 1);
@@ -1267,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn value_shape_uses_the_v5_json_contract() {
+    fn value_shape_uses_the_v6_json_contract() {
         let response = BrowserResponse::ok(
             42,
             BrowserResponseBody::Chunk {
@@ -1277,7 +1328,7 @@ mod tests {
             3,
         );
         let value = serde_json::to_value(response).expect("response JSON");
-        assert_eq!(value["version"], Value::from(5));
+        assert_eq!(value["version"], Value::from(BROWSER_PROTOCOL_VERSION));
         assert_eq!(value["request_id"], Value::from(42));
         assert_eq!(value["status"], Value::from("ok"));
         assert_eq!(value["type"], Value::from("chunk"));
