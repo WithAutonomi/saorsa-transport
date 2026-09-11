@@ -42,6 +42,12 @@ not protection against an on-path attacker or many genuinely reachable sources.
 Existing associations are pinned to their validated source; moving to a new
 source requires a new association rather than credential-based rebinding.
 
+Both native inbound and outbound WebRTC paths explicitly disable ICE mDNS.
+Their candidates use literal IP addresses, so no local multicast name resolver
+is needed. Disabled mode skips mDNS socket creation and `.local` resolution.
+The upstream WebRTC crates still include `webrtc-mdns` as a mandatory dependency;
+this setting disables its runtime use in our native connections.
+
 The P-256 DTLS certificate is a transport credential, not an ANT identity.
 New certificates have five-year X.509 validity on every architecture. Runtime
 expiry is derived from the signed X.509 notAfter value, not upstream's artificial
