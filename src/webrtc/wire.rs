@@ -11,11 +11,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr as _;
 
 /// Current browser request/response protocol version.
-pub const BROWSER_PROTOCOL_VERSION: u16 = 6;
+pub const BROWSER_PROTOCOL_VERSION: u16 = 5;
 /// Protocol name authenticated by the node HELLO response.
-pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v6";
+pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v5";
 /// Ordered WebRTC `DataChannel` label used by Autonomi nodes.
-pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v6";
+pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v5";
 /// Maximum content carried by one browser protocol frame.
 pub const MAX_BROWSER_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Fixed maximum JSON header carried by one browser protocol frame.
@@ -1157,7 +1157,7 @@ mod tests {
         old.extend(&json);
         assert!(parse_request_frame(&old).is_err());
         let stale = BrowserRequest {
-            version: 5,
+            version: BROWSER_PROTOCOL_VERSION + 1,
             ..request
         };
         assert!(parse_request_frame(&serde_json::to_vec(&stale).unwrap()).is_err());
@@ -1318,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn value_shape_uses_the_v6_json_contract() {
+    fn value_shape_uses_the_v5_json_contract() {
         let response = BrowserResponse::ok(
             42,
             BrowserResponseBody::Chunk {
