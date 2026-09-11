@@ -46,6 +46,7 @@ use webrtc_stack::data::data_channel::DataChannel;
 use webrtc_stack::data_channel::RTCDataChannel;
 use webrtc_stack::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc_stack::dtls_transport::dtls_role::DTLSRole;
+use webrtc_stack::ice::mdns::MulticastDnsMode;
 use webrtc_stack::ice::network_type::NetworkType;
 use webrtc_stack::ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
 use webrtc_stack::ice::udp_network::UDPNetwork;
@@ -644,6 +645,8 @@ async fn create_inbound_connection(
     }
 
     let mut settings = SettingEngine::default();
+    // Direct peers use literal IP candidates; never open an mDNS socket.
+    settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     settings.set_lite(true);
     settings.disable_certificate_fingerprint_verification(true);
     settings
@@ -751,6 +754,8 @@ async fn create_outbound_client(
     let server_ufrag = format!("{ICE_CREDENTIAL_PREFIX_V2}{client_pwd}");
     let client_certificate = WebRtcCertificate::generate()?;
     let mut settings = SettingEngine::default();
+    // Direct peers use literal IP candidates; never open an mDNS socket.
+    settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     settings.set_ice_credentials(client_ufrag, client_pwd);
     settings.set_udp_network(UDPNetwork::Muxed(udp_mux as Arc<dyn UDPMux + Send + Sync>));
     settings.detach_data_channels();
