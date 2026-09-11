@@ -53,10 +53,20 @@ before accepting application RPCs: ephemeral ML-KEM-768, an ML-DSA-65 signed
 transcript bound to the expected peer ID, and ChaCha20-Poly1305 records with
 independent direction keys and strict sequence validation. The native listener
 API exposes raw binary channels; that API alone does not enforce the
-application handshake. Browser protocol v5, framing, payment metadata, and
+application handshake. Browser protocol v6, framing, payment metadata, and
 signature primitives live in the portable module so native and WASM adapters
 share the same contract. Payment verification and RPC authorization remain
 application responsibilities.
+
+Protocol v6 encodes each plaintext frame as a JSON object immediately followed
+by its raw binary body, removing v5's four-byte JSON-header length. The shared
+codec rejects complete frames larger than 5 MiB + 64 KiB before JSON parsing,
+and bounds the parser input to a fixed 64 KiB. The parser's consumed byte offset
+separates header from body; `content_length` must match the remaining bytes.
+The fixed header bound covers paid requests containing the signed quote and
+full storage commitment, and cannot be lowered through node configuration.
+The outer encrypted-record length remains for bounded DataChannel reassembly.
+The protocol name and DataChannel label advance to v6; v5 frames are rejected.
 
 Extended address encoding reserves type 12 for WebRTC; type 11 remains
 reserved for the earlier WebTransport experiment. Unknown layouts are rejected
