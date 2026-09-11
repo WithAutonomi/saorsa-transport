@@ -48,6 +48,15 @@ is needed. Disabled mode skips mDNS socket creation and `.local` resolution.
 The upstream WebRTC crates still include `webrtc-mdns` as a mandatory dependency;
 this setting disables its runtime use in our native connections.
 
+Native listeners expose a cloneable `WebRtcDiagnostics` handle with UDP-driver
+liveness, connection attempts/successes/failures/closures, capacity rejections,
+and live association state. Per-association metrics track DataChannel payload
+bytes and last application activity; cumulative traffic survives connection
+cleanup. Metrics do not retain closed-session records or ICE credentials.
+RTT and packet loss are `None`: upstream ICE RTT fields are placeholders and
+DataChannel loss is not exposed. They must not be reported as measured zeroes.
+These local diagnostics do not assert reachability or perform relay checks.
+
 The P-256 DTLS certificate is a transport credential, not an ANT identity.
 New certificates have five-year X.509 validity on every architecture. Runtime
 expiry is derived from the signed X.509 notAfter value, not upstream's artificial
