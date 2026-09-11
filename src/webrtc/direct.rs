@@ -22,6 +22,10 @@
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{ConnectionObserver, ConnectionTracker};
+pub use diagnostics::{WebRtcConnectionMetrics, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -250,7 +254,9 @@ impl WebRtcDirectListener {
         let (incoming_tx, incoming) = mpsc::channel(MAX_PENDING_ASSOCIATIONS);
         let mux = DirectUdpMux::with_limits(Arc::clone(&socket), local_addr, incoming_tx, limits);
         let driver_mux = Arc::clone(&mux);
+        let status = mux.diagnostics.driver_guard(mux.shutdown.clone());
         let driver = tokio::spawn(async move {
+            let _status = status;
             driver_mux.run(socket).await;
         });
         Ok(Self {
@@ -266,6 +272,11 @@ impl WebRtcDirectListener {
     /// Return the bound UDP socket address.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Return local listener and connection diagnostics.
+    pub fn diagnostics(&self) -> WebRtcDiagnostics {
+        self.mux.diagnostics.clone()
     }
 
     /// Return the listener certificate.
@@ -326,6 +337,9 @@ impl WebRtcDirectListener {
 
     /// Stop accepting connections and release the shared UDP mux.
     pub async fn close(&self) -> Result<(), WebRtcDirectError> {
+        if let Some(task) = &self.accepting {
+            task.abort();
+        }
         self.mux
             .close()
             .await
@@ -335,6 +349,9 @@ impl WebRtcDirectListener {
 
 impl Drop for WebRtcDirectListener {
     fn drop(&mut self) {
+        if let Some(task) = self.accepting.take() {
+            task.abort();
+        }
         self.mux.shutdown.cancel();
         self.driver.abort();
     }
@@ -426,6 +443,7 @@ impl Drop for AssociationOwner {
 
 /// One browser WebRTC association that can carry application DataChannels.
 pub struct WebRtcDirectConnection {
+    diagnostics: ConnectionTracker,
     remote_addr: SocketAddr,
     peer_connection: Arc<RTCPeerConnection>,
     incoming: mpsc::Receiver<WebRtcDataChannel>,
@@ -434,6 +452,11 @@ pub struct WebRtcDirectConnection {
 }
 
 impl WebRtcDirectConnection {
+    /// Snapshot this association's state and DataChannel traffic.
+    pub fn metrics(&self) -> Option<WebRtcConnectionMetrics> {
+        self.diagnostics.metrics()
+    }
+
     /// Return the browser's observed UDP address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
@@ -474,6 +497,7 @@ impl WebRtcDirectConnection {
 /// native integration tests and troubleshooting tools can verify listeners
 /// through the same ICE-lite, DTLS, SCTP, and DataChannel path.
 pub struct WebRtcDirectClient {
+    diagnostics: ConnectionTracker,
     local_addr: SocketAddr,
     peer_connection: Arc<RTCPeerConnection>,
     channel: WebRtcDataChannel,
@@ -515,14 +539,16 @@ impl WebRtcDirectClient {
         drop(incoming);
         let mux = DirectUdpMux::new(Arc::clone(&socket), local_addr, unused_incoming);
         let driver_mux = Arc::clone(&mux);
+        let status = mux.diagnostics.driver_guard(mux.shutdown.clone());
         let driver = UdpDriver {
             shutdown: mux.shutdown.clone(),
             task: tokio::spawn(async move {
+                let _status = status;
                 driver_mux.run(socket).await;
             }),
         };
 
-        let (peer_connection, channel) =
+        let (peer_connection, channel, diagnostics) =
             create_outbound_client(endpoint, data_channel_label, local_addr, Arc::clone(&mux))
                 .await?;
         Ok(Self {
@@ -531,12 +557,23 @@ impl WebRtcDirectClient {
             channel,
             mux,
             _driver: driver,
+            diagnostics,
         })
     }
 
     /// Return the local UDP address used for this association.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Snapshot this association's state and DataChannel traffic.
+    pub fn metrics(&self) -> Option<WebRtcConnectionMetrics> {
+        self.diagnostics.metrics()
+    }
+
+    /// Return local connection diagnostics, including closed totals.
+    pub fn diagnostics(&self) -> WebRtcDiagnostics {
+        self.mux.diagnostics.clone()
     }
 
     /// Return the open application DataChannel.
@@ -561,6 +598,7 @@ impl WebRtcDirectClient {
 /// A reliable ordered WebRTC DataChannel carrying binary application messages.
 #[derive(Clone)]
 pub struct WebRtcDataChannel {
+    diagnostics: ConnectionObserver,
     inner: Arc<DataChannel>,
     label: String,
     id: u16,
@@ -587,6 +625,7 @@ impl WebRtcDataChannel {
             .read_data_channel(&mut buffer)
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
+        self.diagnostics.received(length);
         if is_string {
             return Err(WebRtcDirectError::Protocol(
                 "text DataChannel messages are not supported".to_string(),
@@ -609,6 +648,7 @@ impl WebRtcDataChannel {
             .write(&Bytes::copy_from_slice(message))
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
+        self.diagnostics.sent(written);
         if written != message.len() {
             return Err(WebRtcDirectError::Session(format!(
                 "DataChannel wrote {written} of {} bytes",
@@ -644,6 +684,7 @@ async fn create_inbound_connection(
         ));
     }
 
+    let diagnostics = udp_mux.diagnostics.begin(remote_addr)?;
     let mut settings = SettingEngine::default();
     // Direct peers use literal IP candidates; never open an mDNS socket.
     settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
@@ -702,10 +743,12 @@ async fn create_inbound_connection(
         }
     });
     let (incoming_tx, incoming) = mpsc::channel(16);
-    register_data_channel_handler(&peer_connection, incoming_tx);
+    register_data_channel_handler(&peer_connection, incoming_tx, diagnostics.observer());
     let (closed_tx, closed) = watch::channel(false);
+    let observer = diagnostics.observer();
     peer_connection.on_peer_connection_state_change(Box::new(move |state| {
         let closed_tx = closed_tx.clone();
+        observer.transition(state);
         Box::pin(async move {
             use webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState;
             if matches!(
@@ -735,6 +778,7 @@ async fn create_inbound_connection(
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
 
     Ok(WebRtcDirectConnection {
+        diagnostics,
         remote_addr,
         owner: None,
         peer_connection,
@@ -748,7 +792,8 @@ async fn create_outbound_client(
     data_channel_label: &str,
     local_addr: SocketAddr,
     udp_mux: Arc<DirectUdpMux>,
-) -> Result<(Arc<RTCPeerConnection>, WebRtcDataChannel), WebRtcDirectError> {
+) -> Result<(Arc<RTCPeerConnection>, WebRtcDataChannel, ConnectionTracker), WebRtcDirectError> {
+    let diagnostics = udp_mux.diagnostics.begin(endpoint.socket_addr())?;
     let client_ufrag = random_ice_string(32);
     let client_pwd = random_ice_string(32);
     let server_ufrag = format!("{ICE_CREDENTIAL_PREFIX_V2}{client_pwd}");
@@ -782,6 +827,11 @@ async fn create_outbound_client(
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))?,
     );
+    let observer = diagnostics.observer();
+    peer_connection.on_peer_connection_state_change(Box::new(move |state| {
+        observer.transition(state);
+        Box::pin(async {})
+    }));
     let rtc_channel = peer_connection
         .create_data_channel(data_channel_label, None)
         .await
@@ -790,10 +840,12 @@ async fn create_outbound_client(
     let label = data_channel_label.to_string();
     let channel_id = rtc_channel.id();
     let open_channel = Arc::clone(&rtc_channel);
+    let observer = diagnostics.observer();
     rtc_channel.on_open(Box::new(move || {
         let open_channel = Arc::clone(&open_channel);
         let channel_tx = channel_tx.clone();
         let label = label.clone();
+        let diagnostics = observer.clone();
         Box::pin(async move {
             match open_channel.detach().await {
                 Ok(inner) => {
@@ -802,6 +854,7 @@ async fn create_outbound_client(
                             inner,
                             label,
                             id: channel_id,
+                            diagnostics,
                         })
                         .await;
                 }
@@ -837,15 +890,17 @@ async fn create_outbound_client(
             WebRtcDirectError::Session("DataChannel closed before opening".to_string())
         })?;
     tracing::debug!(%local_addr, remote = %endpoint.socket_addr(), "WebRTC Direct dial completed");
-    Ok((peer_connection, channel))
+    Ok((peer_connection, channel, diagnostics))
 }
 
 fn register_data_channel_handler(
     peer_connection: &RTCPeerConnection,
     incoming: mpsc::Sender<WebRtcDataChannel>,
+    diagnostics: ConnectionObserver,
 ) {
     peer_connection.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let incoming = incoming.clone();
+        let diagnostics = diagnostics.clone();
         Box::pin(async move {
             let reliable = channel.ordered()
                 && channel.max_retransmits().is_none()
@@ -857,6 +912,7 @@ fn register_data_channel_handler(
                 let incoming = incoming.clone();
                 let open_channel = Arc::clone(&open_channel);
                 let label = label.clone();
+                let diagnostics = diagnostics.clone();
                 Box::pin(async move {
                     match open_channel.detach().await {
                         Ok(inner) => {
@@ -867,7 +923,12 @@ fn register_data_channel_handler(
                                 inner.close().await.ok();
                                 return;
                             }
-                            let channel = WebRtcDataChannel { inner, label, id };
+                            let channel = WebRtcDataChannel {
+                                inner,
+                                label,
+                                id,
+                                diagnostics,
+                            };
                             if let Err(error) = incoming.try_send(channel) {
                                 let channel = error.into_inner();
                                 channel.close().await.ok();
@@ -1005,6 +1066,7 @@ struct IncomingAssociation {
 }
 
 struct DirectUdpMux {
+    diagnostics: WebRtcDiagnostics,
     local_addr: SocketAddr,
     conns: Mutex<HashMap<String, UDPMuxConn>>,
     address_map: RwLock<HashMap<SocketAddr, UDPMuxConn>>,
@@ -1040,6 +1102,7 @@ impl DirectUdpMux {
         limits: WebRtcAdmissionLimits,
     ) -> Arc<Self> {
         Arc::new(Self {
+            diagnostics: WebRtcDiagnostics::default(),
             local_addr,
             conns: Mutex::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
@@ -1071,6 +1134,7 @@ impl DirectUdpMux {
                 Ok(received) => received,
                 Err(error) if error.kind() == ErrorKind::ConnectionReset => continue,
                 Err(error) => {
+                    self.diagnostics.listener_error();
                     tracing::warn!(%error, "WebRTC Direct UDP listener failed");
                     break;
                 }
@@ -1114,8 +1178,10 @@ impl DirectUdpMux {
             association.generation = Some(generation);
             {
                 let mut admitted = self.admitted.write();
-                if admitted.contains_key(&association.server_ufrag)
-                    || admitted.len() >= self.limits.max_connections
+                if admitted.contains_key(&association.server_ufrag) {
+                    continue;
+                }
+                if admitted.len() >= self.limits.max_connections
                     || admitted
                         .values()
                         .filter(|addr| {
@@ -1125,12 +1191,14 @@ impl DirectUdpMux {
                         .count()
                         >= self.limits.max_connections_per_ip
                 {
+                    self.diagnostics.reject();
                     continue;
                 }
                 let mut pending = self.pending.write();
                 if pending.contains_key(&association.server_ufrag)
                     || pending.len() >= MAX_PENDING_ASSOCIATIONS
                 {
+                    self.diagnostics.reject();
                     continue;
                 }
                 admitted.insert(association.server_ufrag.clone(), (remote_addr, generation));
@@ -1158,6 +1226,7 @@ impl DirectUdpMux {
                 }
             });
             if let Err(error) = self.incoming.try_send(association.clone()) {
+                self.diagnostics.reject();
                 self.pending.write().remove(&association.server_ufrag);
                 self.admitted.write().remove(&association.server_ufrag);
                 tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is full");
@@ -1533,6 +1602,7 @@ mod tests {
             crate::transport::WebRtcCertificateHash::new(certificate_hash),
         )
         .unwrap();
+        let listener_diagnostics = listener.diagnostics();
         let accepted = tokio::spawn(async move {
             let mut connection = listener.accept().await.unwrap();
             let channel = connection.accept_data_channel().await.unwrap();
@@ -1540,6 +1610,14 @@ mod tests {
             assert_eq!(channel.receive().await.unwrap(), b"client-to-server");
             channel.send(b"server-to-client").await.unwrap();
             assert_eq!(channel.receive().await.unwrap(), b"client-finished");
+            let metrics = connection.metrics().unwrap();
+            assert_eq!(metrics.bytes_sent, b"server-to-client".len() as u64);
+            assert_eq!(
+                metrics.bytes_received,
+                (b"client-to-server".len() + b"client-finished".len()) as u64
+            );
+            assert!(metrics.connected_at.is_some());
+            assert!(metrics.last_activity.is_some());
             connection.close().await.unwrap();
         });
 
@@ -1560,7 +1638,23 @@ mod tests {
             .send(b"client-finished")
             .await
             .unwrap();
+        let client_metrics = client.metrics().unwrap();
+        assert_eq!(
+            client_metrics.bytes_received,
+            b"server-to-client".len() as u64
+        );
+        assert!(client_metrics.connected_at.is_some());
         accepted.await.unwrap();
+        let listener_metrics = listener_diagnostics.snapshot();
+        assert_eq!(listener_metrics.successful_connections, 1);
+        assert_eq!(listener_metrics.failed_connections, 0);
+        assert_eq!(listener_metrics.closed_connections, 1);
+        assert_eq!(listener_metrics.active_connections, 0);
+        assert!(listener_metrics.connections.is_empty());
+        assert_eq!(
+            listener_metrics.bytes_sent,
+            b"server-to-client".len() as u64
+        );
         client.close().await.unwrap();
     }
 
