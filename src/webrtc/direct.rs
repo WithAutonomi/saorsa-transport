@@ -508,6 +508,7 @@ pub struct WebRtcDirectClient {
 
 /// Close the entire RTC stack on cancellation, setup failure, or client drop.
 struct OutboundAssociationOwner {
+    runtime: tokio::runtime::Handle,
     peer: Arc<RTCPeerConnection>,
     mux: Arc<DirectUdpMux>,
 }
@@ -516,12 +517,10 @@ impl Drop for OutboundAssociationOwner {
     fn drop(&mut self) {
         let peer = Arc::clone(&self.peer);
         let mux = Arc::clone(&self.mux);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = peer.close().await;
-                let _ = mux.close().await;
-            });
-        }
+        self.runtime.spawn(async move {
+            let _ = peer.close().await;
+            let _ = mux.close().await;
+        });
     }
 }
 
@@ -850,6 +849,8 @@ async fn create_outbound_client(
     let first_ip = AtomicBool::new(true);
     settings.set_ip_filter(Box::new(move |_| first_ip.swap(false, Ordering::Relaxed)));
 
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     let peer_connection = Arc::new(
         APIBuilder::new()
             .with_setting_engine(settings)
@@ -862,6 +863,7 @@ async fn create_outbound_client(
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))?,
     );
     let owner = OutboundAssociationOwner {
+        runtime,
         peer: Arc::clone(&peer_connection),
         mux: udp_mux,
     };
@@ -1603,10 +1605,11 @@ mod tests {
                 .unwrap(),
         );
         let owner = OutboundAssociationOwner {
+            runtime: tokio::runtime::Handle::try_current().unwrap(),
             peer: Arc::clone(&peer),
             mux: Arc::clone(&mux),
         };
-        drop(owner);
+        std::thread::spawn(move || drop(owner)).join().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if peer.connection_state() == RTCPeerConnectionState::Closed
