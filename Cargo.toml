@@ -135,10 +135,11 @@ webrtc-direct = ["native", "webrtc", "dep:stun", "dep:webrtc-stack", "dep:webrtc
 webrtc = [
     "dep:saorsa-pqc", "dep:blake3", "dep:chacha20poly1305", "dep:hex",
     "dep:serde", "dep:serde_bytes", "dep:serde_json",
-    "dep:thiserror", "dep:zeroize",
+    "dep:thiserror", "dep:zeroize", "dep:web-time",
 ]
 
 [dependencies]
+web-time = { version = "1.1", optional = true }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }
 serde_bytes = { version = "0.11", optional = true }
 # Core dependencies

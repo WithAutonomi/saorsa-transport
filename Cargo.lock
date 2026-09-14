@@ -3353,6 +3353,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "web-time",
  "webpki-roots",
  "webrtc",
  "windows",

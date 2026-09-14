@@ -19,7 +19,9 @@ use saorsa_pqc::{
 };
 use std::time::Duration;
 
+mod deadline;
 mod session;
+pub use deadline::TransferDeadline;
 mod wire;
 pub use session::{
     PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
