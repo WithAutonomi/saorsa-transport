@@ -503,6 +503,26 @@ pub struct WebRtcDirectClient {
     channel: WebRtcDataChannel,
     mux: Arc<DirectUdpMux>,
     _driver: UdpDriver,
+    _owner: OutboundAssociationOwner,
+}
+
+/// Close the entire RTC stack on cancellation, setup failure, or client drop.
+struct OutboundAssociationOwner {
+    peer: Arc<RTCPeerConnection>,
+    mux: Arc<DirectUdpMux>,
+}
+
+impl Drop for OutboundAssociationOwner {
+    fn drop(&mut self) {
+        let peer = Arc::clone(&self.peer);
+        let mux = Arc::clone(&self.mux);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = peer.close().await;
+                let _ = mux.close().await;
+            });
+        }
+    }
 }
 
 /// Own the receive task even while a dial future is still being polled.
@@ -548,15 +568,16 @@ impl WebRtcDirectClient {
             }),
         };
 
-        let (peer_connection, channel, diagnostics) =
+        let (owner, channel, diagnostics) =
             create_outbound_client(endpoint, data_channel_label, local_addr, Arc::clone(&mux))
                 .await?;
         Ok(Self {
             local_addr,
-            peer_connection,
+            peer_connection: Arc::clone(&owner.peer),
             channel,
             mux,
             _driver: driver,
+            _owner: owner,
             diagnostics,
         })
     }
@@ -583,15 +604,19 @@ impl WebRtcDirectClient {
 
     /// Close the DataChannel, peer connection, and UDP mux.
     pub async fn close(&self) -> Result<(), WebRtcDirectError> {
-        self.channel.close().await?;
-        self.peer_connection
+        // Attempt every layer even if an earlier close reports an error.
+        let channel = self.channel.close().await;
+        let peer = self
+            .peer_connection
             .close()
             .await
-            .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
-        self.mux
+            .map_err(|error| WebRtcDirectError::Session(error.to_string()));
+        let mux = self
+            .mux
             .close()
             .await
-            .map_err(|error| WebRtcDirectError::Session(error.to_string()))
+            .map_err(|error| WebRtcDirectError::Session(error.to_string()));
+        channel.and(peer).and(mux)
     }
 }
 
@@ -792,7 +817,14 @@ async fn create_outbound_client(
     data_channel_label: &str,
     local_addr: SocketAddr,
     udp_mux: Arc<DirectUdpMux>,
-) -> Result<(Arc<RTCPeerConnection>, WebRtcDataChannel, ConnectionTracker), WebRtcDirectError> {
+) -> Result<
+    (
+        OutboundAssociationOwner,
+        WebRtcDataChannel,
+        ConnectionTracker,
+    ),
+    WebRtcDirectError,
+> {
     let diagnostics = udp_mux.diagnostics.begin(endpoint.socket_addr())?;
     let client_ufrag = random_ice_string(32);
     let client_pwd = random_ice_string(32);
@@ -802,7 +834,9 @@ async fn create_outbound_client(
     // Direct peers use literal IP candidates; never open an mDNS socket.
     settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     settings.set_ice_credentials(client_ufrag, client_pwd);
-    settings.set_udp_network(UDPNetwork::Muxed(udp_mux as Arc<dyn UDPMux + Send + Sync>));
+    settings.set_udp_network(UDPNetwork::Muxed(
+        Arc::clone(&udp_mux) as Arc<dyn UDPMux + Send + Sync>
+    ));
     settings.detach_data_channels();
     settings.set_srtp_protection_profiles(vec![
         SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
@@ -827,6 +861,10 @@ async fn create_outbound_client(
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))?,
     );
+    let owner = OutboundAssociationOwner {
+        peer: Arc::clone(&peer_connection),
+        mux: udp_mux,
+    };
     let observer = diagnostics.observer();
     peer_connection.on_peer_connection_state_change(Box::new(move |state| {
         observer.transition(state);
@@ -890,7 +928,7 @@ async fn create_outbound_client(
             WebRtcDirectError::Session("DataChannel closed before opening".to_string())
         })?;
     tracing::debug!(%local_addr, remote = %endpoint.socket_addr(), "WebRTC Direct dial completed");
-    Ok((peer_connection, channel, diagnostics))
+    Ok((owner, channel, diagnostics))
 }
 
 fn register_data_channel_handler(
@@ -1549,6 +1587,38 @@ mod tests {
         assert!(offer.contains(&format!("a=ice-ufrag:{client_ufrag}")));
         assert!(offer.contains(&format!("a=ice-pwd:{client_pwd}")));
         assert!(RTCSessionDescription::offer(offer).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropped_outbound_owner_closes_rtc_even_with_other_peer_references() {
+        use webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (incoming, _) = mpsc::channel(1);
+        let mux = DirectUdpMux::new(Arc::clone(&socket), socket.local_addr().unwrap(), incoming);
+        let peer = Arc::new(
+            APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let owner = OutboundAssociationOwner {
+            peer: Arc::clone(&peer),
+            mux: Arc::clone(&mux),
+        };
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if peer.connection_state() == RTCPeerConnectionState::Closed
+                    && mux.shutdown.is_cancelled()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outbound owner retained live RTC state");
     }
 
     #[tokio::test]
