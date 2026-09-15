@@ -175,7 +175,7 @@ dirs = { version = "6.0", optional = true }
 keyring = { version = "3", optional = true }
 
 # Crypto dependencies (required for PQC)
-rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
 aws-lc-rs = { version = "1.12", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 # PQC crypto - required in v0.12.0+
