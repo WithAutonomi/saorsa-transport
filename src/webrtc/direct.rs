@@ -879,14 +879,19 @@ async fn create_outbound_client(
     let (channel_tx, mut channel_rx) = mpsc::channel(1);
     let label = data_channel_label.to_string();
     let channel_id = rtc_channel.id();
-    let open_channel = Arc::clone(&rtc_channel);
+    // The channel owns this callback, even if setup ends before it opens.
+    // A strong capture would keep the channel and its mux alive after close.
+    let open_channel = Arc::downgrade(&rtc_channel);
     let observer = diagnostics.observer();
     rtc_channel.on_open(Box::new(move || {
-        let open_channel = Arc::clone(&open_channel);
+        let open_channel = open_channel.upgrade();
         let channel_tx = channel_tx.clone();
         let label = label.clone();
         let diagnostics = observer.clone();
         Box::pin(async move {
+            let Some(open_channel) = open_channel else {
+                return;
+            };
             match open_channel.detach().await {
                 Ok(inner) => {
                     let _ = channel_tx
@@ -947,13 +952,16 @@ fn register_data_channel_handler(
                 && channel.max_packet_lifetime().is_none();
             let label = channel.label().to_string();
             let id = channel.id();
-            let open_channel = Arc::clone(&channel);
+            let open_channel = Arc::downgrade(&channel);
             channel.on_open(Box::new(move || {
                 let incoming = incoming.clone();
-                let open_channel = Arc::clone(&open_channel);
+                let open_channel = open_channel.upgrade();
                 let label = label.clone();
                 let diagnostics = diagnostics.clone();
                 Box::pin(async move {
+                    let Some(open_channel) = open_channel else {
+                        return;
+                    };
                     match open_channel.detach().await {
                         Ok(inner) => {
                             // on_data_channel runs before the SCTP stream is
@@ -1316,15 +1324,12 @@ impl DirectUdpMux {
         self.pending.write().remove(credential);
         admitted.remove(credential);
         if let Some(connection) = removed {
-            let mut addresses = self.address_map.write();
-            for address in connection.get_addresses() {
-                if addresses
-                    .get(&address)
-                    .is_some_and(|current| current.key() == credential)
-                {
-                    addresses.remove(&address);
-                }
-            }
+            // ICE may already have closed the connection and cleared its
+            // address list. Remove ownership from our authoritative map instead.
+            // The admission lock and generation check above protect replacements.
+            self.address_map
+                .write()
+                .retain(|_, current| current.key() != credential);
             connection.close();
         }
     }
@@ -1663,6 +1668,60 @@ mod tests {
         .expect("cancelled dial retained its UDP socket");
     }
 
+    async fn assert_incomplete_dial_releases_mux(cancel: bool) {
+        use std::time::Duration;
+
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = WebRtcDirectAddr::new(remote.local_addr().unwrap(), [1; 32].into()).unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local_addr = socket.local_addr().unwrap();
+        let (incoming, _) = mpsc::channel(1);
+        let mux = DirectUdpMux::new(Arc::clone(&socket), local_addr, incoming);
+        let weak_mux = Arc::downgrade(&mux);
+        let dial = tokio::spawn(async move {
+            create_outbound_client(&endpoint, "incomplete-dial-test", local_addr, mux).await
+        });
+
+        // Wait until setup has installed the channel callback and started ICE.
+        // The silent endpoint never lets that callback run.
+        let mut buffer = [0; 2048];
+        tokio::time::timeout(Duration::from_secs(2), remote.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel {
+            dial.abort();
+            assert!(matches!(dial.await, Err(error) if error.is_cancelled()));
+        } else {
+            let result = tokio::time::timeout(Duration::from_secs(12), dial)
+                .await
+                .expect("dial did not time out")
+                .unwrap();
+            assert!(matches!(result, Err(WebRtcDirectError::Session(message))
+                if message == "DataChannel opening timed out"));
+        }
+
+        // Closing the socket alone is insufficient: a channel callback cycle
+        // also retains its settings and mux after asynchronous cleanup finishes.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_mux.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incomplete dial retained its channel settings and UDP mux");
+    }
+
+    #[tokio::test]
+    async fn cancelled_dial_releases_channel_and_mux() {
+        assert_incomplete_dial_releases_mux(true).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_dial_releases_channel_and_mux() {
+        assert_incomplete_dial_releases_mux(false).await;
+    }
+
     #[tokio::test]
     async fn native_v2_dial_opens_a_bidirectional_data_channel() {
         let certificate = WebRtcCertificate::generate().unwrap();
@@ -1838,6 +1897,64 @@ mod tests {
         assert_eq!(mux.pending.read().get(&credential), Some(&(remote, 2)));
         assert_eq!(mux.admitted.read().get(&credential), Some(&(remote, 2)));
         assert!(mux.conns.lock().await.is_empty());
+        mux.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ice_closed_connection_releases_routing_and_preserves_replacement() {
+        use std::time::Duration;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (incoming, _) = mpsc::channel(1);
+        let mux = DirectUdpMux::new(Arc::clone(&socket), socket.local_addr().unwrap(), incoming);
+        let credential = "reused-credential";
+        let remote = "127.0.0.1:45678".parse().unwrap();
+
+        for generation in 1..=2 {
+            mux.admitted
+                .write()
+                .insert(credential.into(), (remote, generation));
+            mux.pending
+                .write()
+                .insert(credential.into(), (remote, generation));
+            let association = Arc::new(AssociationMux {
+                mux: Arc::clone(&mux),
+                credential: credential.into(),
+                generation,
+            });
+            let _connection = association.clone().get_conn(credential).await.unwrap();
+            let connection = mux.conns.lock().await.get(credential).unwrap().clone();
+            connection.add_address(remote).await;
+
+            if generation == 2 {
+                // Late and repeated cleanup from the first generation must
+                // leave the replacement's source mapping and connection alive.
+                for _ in 0..2 {
+                    mux.remove_owned_connection(credential, Some(1)).await;
+                }
+                let routed = mux.connection_for_packet(&[0], remote).await.unwrap();
+                assert!(!routed.is_closed());
+                assert_eq!(mux.admitted.read().get(credential), Some(&(remote, 2)));
+            }
+
+            // ICE failure closes candidates before notifying the mux. Upstream
+            // clears the connection's address list as part of that close.
+            connection.close();
+            assert!(connection.get_addresses().is_empty());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while mux.conns.lock().await.contains_key(credential) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("closed connection was not removed");
+            assert!(mux.address_map.read().is_empty());
+            assert!(mux.pending.read().is_empty());
+            assert!(mux.admitted.read().is_empty());
+            assert!(mux.connection_for_packet(&[0], remote).await.is_none());
+            mux.remove_owned_connection(credential, Some(generation))
+                .await;
+        }
         mux.close().await.unwrap();
     }
 
