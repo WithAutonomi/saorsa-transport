@@ -309,20 +309,12 @@ impl WebRtcDirectListener {
                     generation: association.generation,
                     peer: None,
                 };
-                create_inbound_connection(
-                    association.remote_addr,
-                    &association.server_ufrag,
-                    &association.client_ufrag,
-                    &association.client_pwd,
-                    mux,
-                    &certificate,
-                    &mut owner,
-                )
-                .await
-                .map(|mut connection| {
-                    connection.owner = Some(owner);
-                    connection
-                })
+                create_inbound_connection(&association, mux, &certificate, &mut owner)
+                    .await
+                    .map(|mut connection| {
+                        connection.owner = Some(owner);
+                        connection
+                    })
             }));
         }
         let task = self.accepting.as_mut().ok_or(WebRtcDirectError::Closed)?;
@@ -385,6 +377,7 @@ impl UDPMux for AssociationMux {
         Arc::clone(&self.mux)
             .get_owned_conn(credential, Some(self.generation), writer)
             .await
+            .map(|connection| Arc::new(connection) as Arc<dyn Conn + Send + Sync>)
     }
 
     async fn remove_conn_by_ufrag(&self, credential: &str) {
@@ -692,14 +685,15 @@ impl WebRtcDataChannel {
 }
 
 async fn create_inbound_connection(
-    remote_addr: SocketAddr,
-    server_ufrag: &str,
-    client_ufrag: &str,
-    client_pwd: &str,
+    association: &IncomingAssociation,
     udp_mux: Arc<DirectUdpMux>,
     certificate: &WebRtcCertificate,
     owner: &mut AssociationOwner,
 ) -> Result<WebRtcDirectConnection, WebRtcDirectError> {
+    let remote_addr = association.remote_addr;
+    let server_ufrag = association.server_ufrag.as_str();
+    let client_ufrag = association.client_ufrag.as_str();
+    let client_pwd = association.client_pwd.as_str();
     if parse_profile_credentials(server_ufrag, client_ufrag)
         .is_none_or(|credentials| credentials.client_pwd != client_pwd)
     {
@@ -718,11 +712,26 @@ async fn create_inbound_connection(
         .set_answering_dtls_role(DTLSRole::Server)
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     settings.set_ice_credentials(server_ufrag.to_string(), server_ufrag.to_string());
-    settings.set_udp_network(UDPNetwork::Muxed(Arc::new(AssociationMux {
-        mux: udp_mux,
+    let generation = owner.generation.ok_or(WebRtcDirectError::Closed)?;
+    let association_mux = Arc::new(AssociationMux {
+        mux: Arc::clone(&udp_mux),
         credential: server_ufrag.to_string(),
-        generation: owner.generation.ok_or(WebRtcDirectError::Closed)?,
-    })));
+        generation,
+    });
+    // Admission consumed the authenticated Binding request that proved the
+    // return path. Deliver it to this generation's ICE agent before it starts,
+    // so nomination does not depend on the client's next retransmission.
+    // Keep this same writer alive in SettingEngine: UDPMuxConn holds it weakly.
+    let writer: Arc<dyn UDPMuxWriter + Send + Sync> = association_mux.clone();
+    let initial_conn = udp_mux
+        .get_owned_conn(server_ufrag, Some(generation), writer)
+        .await
+        .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
+    initial_conn
+        .write_packet(&association.initial_packet, remote_addr)
+        .await
+        .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
+    settings.set_udp_network(UDPNetwork::Muxed(association_mux));
     settings.detach_data_channels();
     settings.set_srtp_protection_profiles(vec![
         SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
@@ -1110,6 +1119,8 @@ struct IncomingAssociation {
     server_ufrag: String,
     client_ufrag: String,
     client_pwd: String,
+    // Bounded by the listener receive buffer and retained only after admission.
+    initial_packet: Vec<u8>,
     generation: Option<u64>,
 }
 
@@ -1339,7 +1350,7 @@ impl DirectUdpMux {
         ice_credential: &str,
         expected: Option<u64>,
         writer: Arc<dyn UDPMuxWriter + Send + Sync>,
-    ) -> Result<Arc<dyn Conn + Send + Sync>, WebRtcUtilError> {
+    ) -> Result<UDPMuxConn, WebRtcUtilError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
         }
@@ -1350,7 +1361,7 @@ impl DirectUdpMux {
             return Err(WebRtcUtilError::ErrUseClosedNetworkConn);
         }
         if let Some(connection) = connections.get(ice_credential) {
-            return Ok(Arc::new(connection.clone()));
+            return Ok(connection.clone());
         }
         let connection = UDPMuxConn::new(UDPMuxConnParams {
             local_addr: self.local_addr,
@@ -1366,7 +1377,7 @@ impl DirectUdpMux {
             mux.remove_owned_connection(&credential, generation).await;
         });
         connections.insert(ice_credential.to_string(), connection.clone());
-        Ok(Arc::new(connection))
+        Ok(connection)
     }
 
     fn register_owned_address(
@@ -1447,7 +1458,9 @@ impl UDPMux for DirectUdpMux {
         ice_credential: &str,
     ) -> Result<Arc<dyn Conn + Send + Sync>, WebRtcUtilError> {
         let writer: Arc<dyn UDPMuxWriter + Send + Sync> = self.clone();
-        self.get_owned_conn(ice_credential, None, writer).await
+        self.get_owned_conn(ice_credential, None, writer)
+            .await
+            .map(|connection| Arc::new(connection) as Arc<dyn Conn + Send + Sync>)
     }
 
     async fn remove_conn_by_ufrag(&self, ice_credential: &str) {
@@ -1979,6 +1992,7 @@ mod tests {
                 server_ufrag: credential.clone(),
                 client_ufrag: "client".into(),
                 client_pwd: "password".into(),
+                initial_packet: Vec::new(),
                 generation: Some(generation),
             };
             assert_eq!(mux.is_pending(&association), accepted);
@@ -1990,19 +2004,32 @@ mod tests {
         sender: &UdpSocket,
         listener: &WebRtcDirectListener,
         password: &str,
-    ) {
+    ) -> Vec<u8> {
         let packet = admission::tests::request(password);
         sender
             .send_to(&packet, listener.local_addr())
             .await
             .unwrap();
         let mut buffer = [0u8; 2048];
-        let (length, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sender.recv_from(&mut buffer),
-        )
+        let length = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (length, _) = sender.recv_from(&mut buffer).await.unwrap();
+                let mut message = StunMessage::new();
+                message.unmarshal_binary(&buffer[..length]).unwrap();
+                // A previous association can have already answered its admitted
+                // request. Wait for this association's admission challenge.
+                if message.typ == BINDING_REQUEST
+                    && stun::integrity::MessageIntegrity::new_short_term_integrity(
+                        password.to_string(),
+                    )
+                    .check(&mut message)
+                    .is_ok()
+                {
+                    break length;
+                }
+            }
+        })
         .await
-        .unwrap()
         .unwrap();
         let response =
             admission::tests::response(&buffer[..length], password, sender.local_addr().unwrap());
@@ -2014,6 +2041,52 @@ mod tests {
             .send_to(&packet, listener.local_addr())
             .await
             .unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn admitted_binding_request_reaches_ice_without_another_client_packet() {
+        use std::time::Duration;
+
+        let mut listener = WebRtcDirectListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            WebRtcCertificate::generate().unwrap(),
+        )
+        .await
+        .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let password = "browserPassword0123456789";
+        let admitted = prove_association(&sender, &listener, password).await;
+        let mut request = StunMessage::new();
+        request.unmarshal_binary(&admitted).unwrap();
+        let connection = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // No retransmit: ICE must answer the exact request consumed by admission.
+        // The generous deadline is for slow CI, not a throughput assertion.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0u8; 2048];
+            loop {
+                let (length, _) = sender.recv_from(&mut buffer).await.unwrap();
+                let mut response = StunMessage::new();
+                response.unmarshal_binary(&buffer[..length]).unwrap();
+                if response.typ == BINDING_SUCCESS {
+                    assert_eq!(response.transaction_id, request.transaction_id);
+                    stun::integrity::MessageIntegrity::new_short_term_integrity(format!(
+                        "{ICE_CREDENTIAL_PREFIX_V2}{password}"
+                    ))
+                    .check(&mut response)
+                    .unwrap();
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ICE waited for a retransmission after admission");
+        connection.close().await.unwrap();
+        listener.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2038,6 +2111,7 @@ mod tests {
                         ),
                         client_ufrag: "browserClientUfrag".to_string(),
                         client_pwd: "browserPassword0123456789".to_string(),
+                        initial_packet: Vec::new(),
                         generation: None,
                     })
                     .unwrap();
@@ -2210,9 +2284,13 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-            assert_eq!(listener.mux.pending.read().len(), 1);
+            // ICE can now consume the admitted request and register its source
+            // before accept returns, releasing the pending reservation early.
+            assert_eq!(listener.mux.admitted.read().len(), 1);
             connection.close().await.unwrap();
             assert!(listener.mux.pending.read().is_empty());
+            assert!(listener.mux.admitted.read().is_empty());
+            assert!(listener.mux.conns.lock().await.is_empty());
         }
         listener.close().await.unwrap();
     }

@@ -37,6 +37,11 @@ request supplies the credentials used to check the response MESSAGE-INTEGRITY
 before admission. This cache is bounded globally and per canonical IP, evicts
 the oldest returned proof when full, and contains no RTC state. ICE request
 retransmission completes admission without browser-specific signalling.
+The admitted Binding request is retained in the bounded pending queue and
+delivered unchanged to that association's ICE mux before the ICE agent starts.
+ICE can therefore answer and nominate from the admission-completing request
+without waiting for another client retransmission. Generation ownership still
+guards mux creation, routing and cleanup; rejected probes never reach an ICE agent.
 Challenges never exceed the triggering packet size. This is reachability proof,
 not protection against an on-path attacker or many genuinely reachable sources.
 Existing associations are pinned to their validated source; moving to a new

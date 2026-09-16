@@ -161,6 +161,7 @@ impl Admission {
                     server_ufrag: server,
                     client_ufrag: client,
                     client_pwd: credentials.client_pwd,
+                    initial_packet: packet.to_vec(),
                     generation: None,
                 });
             }
