@@ -32,6 +32,7 @@ use super::{
     send_stream::SendStream,
     udp_transmit,
 };
+use crate::traffic::FAILED_DIAL_TRAFFIC;
 use crate::{
     ConnectionError, ConnectionHandle, ConnectionStats, DatagramDropStats, Dir, Duration,
     EndpointEvent, Instant, Side, StreamEvent, StreamId, VarInt, congestion::Controller,
@@ -147,7 +148,12 @@ impl Connecting {
 
         if is_ok {
             match self.conn.take() {
-                Some(conn) => Ok((Connection(conn), ZeroRttAccepted(self.connected))),
+                Some(conn) => {
+                    // `Connecting` implements `Drop`, so `connected` cannot be
+                    // moved out; swap in a receiver that will never resolve.
+                    let connected = std::mem::replace(&mut self.connected, oneshot::channel().1);
+                    Ok((Connection(conn), ZeroRttAccepted(connected)))
+                }
                 None => {
                     tracing::error!("Connection state missing during 0-RTT acceptance");
                     Err(self)
@@ -272,6 +278,9 @@ impl Future for Connecting {
                 drop(inner);
                 Ok(Connection(conn))
             } else {
+                // V2-834: the caller never sees this connection, so its
+                // handshake bytes would otherwise vanish from every fold.
+                fold_abandoned_dial(&inner);
                 Err(inner.error.clone().unwrap_or_else(|| {
                     ConnectionError::TransportError(crate::transport_error::Error::INTERNAL_ERROR(
                         "connection failed without error".to_string(),
@@ -280,6 +289,25 @@ impl Future for Connecting {
             }
         })
     }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        // V2-834: a `Connecting` dropped while it still owns the connection was
+        // abandoned before resolving — a dial timeout, a cancelled task or a
+        // happy-eyeballs loser. Fold its bytes so abandoned dials are itemised
+        // rather than silently absent. Resolved futures have already `take()`n
+        // the connection, so this is exactly-once per dial.
+        if let Some(conn) = self.conn.as_ref() {
+            fold_abandoned_dial(&conn.state.lock("connecting_drop"));
+        }
+    }
+}
+
+/// Fold an abandoned dial's UDP totals into [`FAILED_DIAL_TRAFFIC`].
+fn fold_abandoned_dial(state: &State) {
+    let stats = state.inner.stats();
+    FAILED_DIAL_TRAFFIC.record(stats.udp_tx.bytes, stats.udp_rx.bytes);
 }
 
 /// Future that completes when a connection is fully established
@@ -834,6 +862,15 @@ impl Connection {
     /// fixed for the lifetime of the connection.
     pub fn stable_id(&self) -> usize {
         self.0.stable_id()
+    }
+
+    /// Whether this connection's datagrams go through a virtual socket (a
+    /// MASQUE relay tunnel) rather than a real UDP socket.
+    ///
+    /// Traffic accounting keeps such connections out of the real-socket
+    /// totals: their bytes are already counted on the carrier connection.
+    pub fn is_virtual_socket(&self) -> bool {
+        self.0.state.lock("is_virtual_socket").socket.is_virtual()
     }
 
     /// Get the low-level connection handle index. This can be compared against
