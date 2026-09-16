@@ -3,6 +3,7 @@
 
 //! Stateless STUN reachability challenges; these do not authenticate peer identity.
 use super::{IncomingAssociation, parse_profile_credentials, stun_ice_credentials};
+use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -25,6 +26,7 @@ struct ReturnedProof {
 
 pub(super) struct Admission {
     secret: [u8; 32],
+    tie_breaker: u64,
     born: Instant,
     verified: HashMap<SocketAddr, ReturnedProof>,
 }
@@ -33,6 +35,9 @@ impl Default for Admission {
     fn default() -> Self {
         Self {
             secret: rand::random(),
+            // Keep one random value for this listener. Avoid zero because libjuice
+            // interprets it as a missing ICE role attribute.
+            tie_breaker: rand::thread_rng().gen_range(1..=u64::MAX),
             born: Instant::now(),
             verified: HashMap::new(),
         }
@@ -171,7 +176,7 @@ impl Admission {
         {
             return Decision::Ignore;
         }
-        challenge.add(ATTR_ICE_CONTROLLED, &0u64.to_be_bytes());
+        challenge.add(ATTR_ICE_CONTROLLED, &self.tie_breaker.to_be_bytes());
         challenge.add(ATTR_PRIORITY, &1u32.to_be_bytes());
         if MessageIntegrity::new_short_term_integrity(credentials.client_pwd)
             .add_to(&mut challenge)
@@ -236,6 +241,45 @@ pub(super) mod tests {
             ])
             .unwrap();
         response.raw
+    }
+
+    #[test]
+    fn challenge_has_stable_nonzero_ice_role_and_valid_integrity() {
+        let mut admission = Admission::default();
+        let now = Instant::now();
+        let source = "127.0.0.1:5000".parse().unwrap();
+        let password = "browserPassword0123456789";
+        let packet = request(password);
+        let mut first_role = None;
+        // Retries, including a new cookie bucket, retain the listener's ICE role value.
+        for elapsed in [Duration::ZERO, Duration::from_millis(100), PROBE_LIFETIME] {
+            let now = now + elapsed;
+            let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+                panic!("expected challenge")
+            };
+            assert!(challenge.len() <= packet.len());
+            let mut decoded = Message::new();
+            decoded.unmarshal_binary(&challenge).unwrap();
+            let role = decoded.get(ATTR_ICE_CONTROLLED).unwrap();
+            let tie_breaker = u64::from_be_bytes(role.try_into().unwrap());
+            // libjuice rejects zero as though ICE-CONTROLLED were absent.
+            assert_ne!(tie_breaker, 0);
+            assert_eq!(*first_role.get_or_insert(tie_breaker), tie_breaker);
+            assert!(decoded.get(ATTR_ICE_CONTROLLING).is_err());
+            FINGERPRINT.check(&decoded).unwrap();
+            MessageIntegrity::new_short_term_integrity(password.to_string())
+                .check(&mut decoded)
+                .unwrap();
+        }
+        let now = now + PROBE_LIFETIME;
+        let Decision::Challenge(challenge) = admission.receive(&packet, source, now) else {
+            panic!("expected challenge")
+        };
+        admission.receive(&response(&challenge, password, source), source, now);
+        assert!(matches!(
+            admission.receive(&packet, source, now),
+            Decision::Admit(_)
+        ));
     }
 
     #[test]
