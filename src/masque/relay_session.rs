@@ -145,6 +145,187 @@ impl RelaySessionStats {
     }
 }
 
+/// Number of destination addresses tracked per relay session (V2-1202).
+///
+/// A relay session fans out to many targets, so attributing an egress spike
+/// needs per-destination counters, not just a session total. The table is
+/// bounded so a peer that sprays datagrams at thousands of destinations can
+/// neither grow this node's memory nor widen its log lines.
+pub const RELAY_SESSION_TARGET_SLOTS: usize = 8;
+
+/// Cumulative relayed-byte counters for one destination address.
+#[derive(Debug)]
+struct TargetEntry {
+    addr: SocketAddr,
+    /// Raw payload bytes forwarded client → target.
+    to_target_bytes: AtomicU64,
+    to_target_count: AtomicU64,
+    /// Raw payload bytes forwarded target → client.
+    to_client_bytes: AtomicU64,
+    to_client_count: AtomicU64,
+}
+
+impl TargetEntry {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            to_target_bytes: AtomicU64::new(0),
+            to_target_count: AtomicU64::new(0),
+            to_client_bytes: AtomicU64::new(0),
+            to_client_count: AtomicU64::new(0),
+        }
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.to_target_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.to_client_bytes.load(Ordering::Relaxed))
+    }
+}
+
+/// A snapshot of one destination's cumulative counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetTraffic {
+    /// Destination address.
+    pub addr: SocketAddr,
+    /// Raw payload bytes forwarded client → target.
+    pub to_target_bytes: u64,
+    /// Datagrams forwarded client → target.
+    pub to_target_count: u64,
+    /// Raw payload bytes forwarded target → client.
+    pub to_client_bytes: u64,
+    /// Datagrams forwarded target → client.
+    pub to_client_count: u64,
+}
+
+impl TargetTraffic {
+    /// Total bytes relayed in both directions for this destination.
+    pub fn total_bytes(&self) -> u64 {
+        self.to_target_bytes.saturating_add(self.to_client_bytes)
+    }
+}
+
+/// Bounded per-destination byte accounting for a single relay session (V2-1202).
+///
+/// The forwarding hot path takes only a shared read lock plus two relaxed
+/// `fetch_add`s once a destination is known; inserting a newly-seen destination
+/// is the sole write-lock path. When all [`RELAY_SESSION_TARGET_SLOTS`] are
+/// occupied the *smallest* accumulator is evicted — the destinations worth
+/// reporting are the largest ones, so they can never be displaced by transient
+/// noise.
+#[derive(Debug, Default)]
+pub struct RelayTargetTable {
+    entries: parking_lot::RwLock<Vec<TargetEntry>>,
+    /// Destinations dropped because the table was full.
+    evictions: AtomicU64,
+}
+
+impl RelayTargetTable {
+    /// Create an empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `bytes` forwarded client → target for `addr`.
+    pub fn record_to_target(&self, addr: SocketAddr, bytes: u64) {
+        self.record(addr, bytes, true);
+    }
+
+    /// Record `bytes` forwarded target → client for `addr`.
+    pub fn record_to_client(&self, addr: SocketAddr, bytes: u64) {
+        self.record(addr, bytes, false);
+    }
+
+    fn record(&self, addr: SocketAddr, bytes: u64, to_target: bool) {
+        // Fast path: destination already tracked. Shared lock, no allocation.
+        {
+            let entries = self.entries.read();
+            if let Some(entry) = entries.iter().find(|e| e.addr == addr) {
+                if to_target {
+                    entry.to_target_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    entry.to_target_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    entry.to_client_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    entry.to_client_count.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+        }
+
+        // Slow path: first sight of this destination. Re-check under the write
+        // lock in case a racing writer inserted it between our read and write.
+        let mut entries = self.entries.write();
+        if let Some(entry) = entries.iter().find(|e| e.addr == addr) {
+            if to_target {
+                entry.to_target_bytes.fetch_add(bytes, Ordering::Relaxed);
+                entry.to_target_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                entry.to_client_bytes.fetch_add(bytes, Ordering::Relaxed);
+                entry.to_client_count.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        if entries.len() >= RELAY_SESSION_TARGET_SLOTS {
+            // Evict the smallest accumulator, but only if the newcomer would not
+            // immediately become the smallest itself — otherwise a spray of
+            // one-datagram destinations would churn the table and evict nothing
+            // of interest.
+            let Some((idx, min_bytes)) = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.total_bytes()))
+                .min_by_key(|(_, total)| *total)
+            else {
+                return;
+            };
+            if bytes <= min_bytes {
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            entries.swap_remove(idx);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let entry = TargetEntry::new(addr);
+        if to_target {
+            entry.to_target_bytes.store(bytes, Ordering::Relaxed);
+            entry.to_target_count.store(1, Ordering::Relaxed);
+        } else {
+            entry.to_client_bytes.store(bytes, Ordering::Relaxed);
+            entry.to_client_count.store(1, Ordering::Relaxed);
+        }
+        entries.push(entry);
+    }
+
+    /// Destinations currently tracked, ordered by total bytes descending.
+    pub fn snapshot(&self) -> Vec<TargetTraffic> {
+        let entries = self.entries.read();
+        let mut out: Vec<TargetTraffic> = entries
+            .iter()
+            .map(|e| TargetTraffic {
+                addr: e.addr,
+                to_target_bytes: e.to_target_bytes.load(Ordering::Relaxed),
+                to_target_count: e.to_target_count.load(Ordering::Relaxed),
+                to_client_bytes: e.to_client_bytes.load(Ordering::Relaxed),
+                to_client_count: e.to_client_count.load(Ordering::Relaxed),
+            })
+            .collect();
+        out.sort_unstable_by_key(|t| std::cmp::Reverse(t.total_bytes()));
+        out
+    }
+
+    /// Number of destinations currently tracked.
+    pub fn tracked(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    /// Cumulative count of destinations dropped because the table was full.
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+}
+
 /// A MASQUE relay session
 ///
 /// 32-byte BLAKE3 fingerprint of a relayed peer's authenticated ML-DSA-65
@@ -182,6 +363,8 @@ pub struct RelaySession {
     last_activity: Instant,
     /// Session statistics
     stats: Arc<RelaySessionStats>,
+    /// Per-destination relayed-byte accounting (V2-1202)
+    targets: Arc<RelayTargetTable>,
     /// Whether this session is bridging between IPv4 and IPv6
     is_bridging: bool,
     /// Bound UDP socket for this session (relay data plane)
@@ -208,6 +391,7 @@ impl RelaySession {
             created_at: now,
             last_activity: now,
             stats: Arc::new(RelaySessionStats::new()),
+            targets: Arc::new(RelayTargetTable::new()),
             is_bridging: false,
             udp_socket: None,
             bytes_in_window: AtomicU64::new(0),
@@ -254,6 +438,14 @@ impl RelaySession {
     /// Get session statistics
     pub fn stats(&self) -> Arc<RelaySessionStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Get this session's per-destination byte accounting (V2-1202).
+    ///
+    /// Cloned out of the session once at forwarding-loop start so the hot path
+    /// never re-acquires the server's session map lock.
+    pub fn targets(&self) -> Arc<RelayTargetTable> {
+        Arc::clone(&self.targets)
     }
 
     /// Get session duration
@@ -630,6 +822,124 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), port)
+    }
+
+    /// V2-1202: distinct destination for slot-exhaustion tests.
+    fn target_addr(n: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, n as u8)), 9000)
+    }
+
+    #[test]
+    fn target_table_records_both_directions() {
+        let table = RelayTargetTable::new();
+        let a = target_addr(1);
+
+        table.record_to_target(a, 100);
+        table.record_to_target(a, 50);
+        table.record_to_client(a, 20);
+
+        let snap = table.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].addr, a);
+        assert_eq!(snap[0].to_target_bytes, 150);
+        assert_eq!(snap[0].to_target_count, 2);
+        assert_eq!(snap[0].to_client_bytes, 20);
+        assert_eq!(snap[0].to_client_count, 1);
+        assert_eq!(snap[0].total_bytes(), 170);
+        assert_eq!(table.tracked(), 1);
+        assert_eq!(table.evictions(), 0);
+    }
+
+    #[test]
+    fn target_table_separates_destinations() {
+        let table = RelayTargetTable::new();
+        let (a, b) = (target_addr(1), target_addr(2));
+
+        table.record_to_target(a, 1_000);
+        table.record_to_target(b, 25);
+
+        let snap = table.snapshot();
+        assert_eq!(snap.len(), 2);
+        // Sorted by total bytes descending, so the heavy destination leads.
+        assert_eq!(snap[0].addr, a);
+        assert_eq!(snap[0].to_target_bytes, 1_000);
+        assert_eq!(snap[1].addr, b);
+        assert_eq!(snap[1].to_target_bytes, 25);
+    }
+
+    #[test]
+    fn target_table_is_bounded() {
+        let table = RelayTargetTable::new();
+        // Twice the slot count, all equal weight.
+        for n in 0..(RELAY_SESSION_TARGET_SLOTS as u16 * 2) {
+            table.record_to_target(target_addr(n), 10);
+        }
+        assert_eq!(table.tracked(), RELAY_SESSION_TARGET_SLOTS);
+        assert!(table.evictions() > 0);
+    }
+
+    #[test]
+    fn target_table_evicts_the_smallest_accumulator() {
+        let table = RelayTargetTable::new();
+        // Fill every slot, giving destination 0 by far the most bytes.
+        table.record_to_target(target_addr(0), 1_000_000);
+        for n in 1..RELAY_SESSION_TARGET_SLOTS as u16 {
+            table.record_to_target(target_addr(n), 10);
+        }
+        assert_eq!(table.tracked(), RELAY_SESSION_TARGET_SLOTS);
+
+        // A heavier newcomer displaces the smallest entry, never the largest.
+        let newcomer = target_addr(200);
+        table.record_to_target(newcomer, 5_000);
+
+        let snap = table.snapshot();
+        assert_eq!(snap.len(), RELAY_SESSION_TARGET_SLOTS);
+        assert_eq!(
+            snap[0].addr,
+            target_addr(0),
+            "largest must never be evicted"
+        );
+        assert!(
+            snap.iter().any(|t| t.addr == newcomer),
+            "heavier newcomer should have been admitted"
+        );
+    }
+
+    #[test]
+    fn target_table_ignores_noise_once_full() {
+        let table = RelayTargetTable::new();
+        for n in 0..RELAY_SESSION_TARGET_SLOTS as u16 {
+            table.record_to_target(target_addr(n), 1_000);
+        }
+        let before = table.snapshot();
+
+        // A single-datagram spray must not churn out established destinations.
+        for n in 100..160u16 {
+            table.record_to_target(target_addr(n), 1);
+        }
+
+        let after = table.snapshot();
+        assert_eq!(after.len(), RELAY_SESSION_TARGET_SLOTS);
+        for entry in &before {
+            assert!(
+                after.iter().any(|t| t.addr == entry.addr),
+                "established destination {} was evicted by noise",
+                entry.addr
+            );
+        }
+    }
+
+    #[test]
+    fn session_target_table_is_shared_by_handle() {
+        let session = RelaySession::new(1, RelaySessionConfig::default(), test_addr(9000));
+        // The forwarding loop clones this handle once and uses it for the life
+        // of the session, so writes through it must be visible on the session.
+        let handle = session.targets();
+        handle.record_to_target(target_addr(1), 4_096);
+
+        let snap = session.targets().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].to_target_bytes, 4_096);
     }
 
     #[test]

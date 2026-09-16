@@ -321,6 +321,12 @@ const RELAY_TUNNEL_LOST_CODE: u32 = 0x52_4c_4f_53; // "RLOS"
 /// shipping pipeline only carries INFO+, so this line is emitted at INFO.
 const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Cadence of the `relay traffic summary (cumulative)` INFO lines (V2-1202).
+/// Matches [`ENDPOINT_TRAFFIC_SUMMARY_INTERVAL`]; a `const` so testnets can
+/// drop it to 60s. On an idle relay this is one line per interval, rising to at
+/// most eleven while sessions are actually moving bytes.
+const RELAY_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Accumulator backing the endpoint traffic summary (V2-623).
 ///
 /// Holds the cumulative UDP bytes of connections that have already closed. The
@@ -2483,6 +2489,7 @@ impl NatTraversalEndpoint {
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
         endpoint.spawn_endpoint_traffic_summary();
+        endpoint.spawn_relay_traffic_summary();
 
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
@@ -2920,6 +2927,7 @@ impl NatTraversalEndpoint {
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
         endpoint.spawn_endpoint_traffic_summary();
+        endpoint.spawn_relay_traffic_summary();
 
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
@@ -5048,6 +5056,35 @@ impl NatTraversalEndpoint {
             }
 
             debug!("Endpoint traffic-summary task shut down");
+        });
+    }
+
+    /// V2-1202: periodically emit this node's relay-transit traffic summary.
+    ///
+    /// Separate from [`Self::spawn_endpoint_traffic_summary`] because relayed
+    /// bytes do not appear in the endpoint's own QUIC connection counters —
+    /// they are forwarded on a per-session UDP socket, so an episode shows up
+    /// as raw host network I/O and nowhere else. No-op on a node with relay
+    /// service disabled.
+    fn spawn_relay_traffic_summary(&self) {
+        let Some(relay_server) = self.relay_server.clone() else {
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RELAY_TRAFFIC_SUMMARY_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+
+            loop {
+                ticker.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                relay_server.log_traffic_summary().await;
+            }
+
+            debug!("Relay traffic-summary task shut down");
         });
     }
 
