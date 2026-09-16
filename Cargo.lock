@@ -2949,7 +2949,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "core-foundation 0.9.4",
+ "core-foundation 0.10.1",
  "criterion",
  "dashmap 6.2.1",
  "dirs",
