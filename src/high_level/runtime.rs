@@ -93,6 +93,16 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     fn may_fragment(&self) -> bool {
         true
     }
+
+    /// Whether this socket is a virtual socket whose datagrams ride another
+    /// connection rather than a real UDP socket (e.g. a MASQUE relay tunnel).
+    ///
+    /// Traffic accounting uses this to keep virtual-socket connections out of
+    /// the real-socket totals, since their bytes are already counted on the
+    /// carrier connection.
+    fn is_virtual(&self) -> bool {
+        false
+    }
 }
 
 /// An object polled to detect when an associated [`AsyncUdpSocket`] is writable
