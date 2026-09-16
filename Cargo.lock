@@ -3342,12 +3342,12 @@ dependencies = [
 
 [[package]]
 name = "system-configuration"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
+checksum = "501336eb7ba9e417300a6a0fa985721065467aa83a6dcf0422a8e43e4c0328fa"
 dependencies = [
  "bitflags",
- "core-foundation 0.9.4",
+ "core-foundation 0.10.1",
  "system-configuration-sys",
 ]
 
