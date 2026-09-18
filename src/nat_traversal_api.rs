@@ -5284,9 +5284,10 @@ impl NatTraversalEndpoint {
                 );
 
                 // V2-834 Part A: syscall-boundary totals over every real UDP
-                // socket in the process, plus the abandoned-dial itemisation.
-                // Invariant: sock_tx/rx ≈ this process's NIC UDP traffic minus
-                // relay-server raw sockets (reported on the relay summary).
+                // socket in the process (QUIC sockets and the relay server's
+                // per-session sockets), plus the abandoned-dial itemisation.
+                // Invariant: sock_tx/rx + link-layer headers ≈ this process's
+                // NIC UDP traffic.
                 let sock = &crate::traffic::SOCKET_TRAFFIC;
                 let failed = &crate::traffic::FAILED_DIAL_TRAFFIC;
                 info!(

@@ -39,6 +39,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+
+use crate::traffic::SOCKET_TRAFFIC;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -348,13 +350,13 @@ pub struct MasqueRelayStats {
     pub rate_limit_rejections: AtomicU64,
 
     // ---- V2-834: raw-socket and stream-leg ground truth ----
-    /// Bytes returned by `recv_from` on per-session raw UDP sockets (third
-    /// party → relay ingress at the syscall boundary). Together with
-    /// `forwarded_to_target_bytes` (egress) this is the relay's raw-socket
-    /// share of the host NIC.
-    pub raw_rx_bytes: AtomicU64,
-    /// Datagrams returned by `recv_from` on per-session raw UDP sockets.
-    pub raw_rx_count: AtomicU64,
+    /// Bytes received from third-party targets on the relay's per-session
+    /// plain UDP sockets (the rx-side counterpart of `forwarded_to_target_*`).
+    /// These sockets are real sockets, so the same bytes are also in the
+    /// process-wide `sock_rx_bytes`; this field is the attribution.
+    pub relay_target_rx_bytes: AtomicU64,
+    /// Datagrams received from targets on the per-session plain UDP sockets.
+    pub relay_target_rx_count: AtomicU64,
     /// Payload bytes the relay tried to send to a target but the kernel
     /// refused (EMSGSIZE or other error) — not on the wire, not in
     /// `forwarded_to_target_bytes`.
@@ -435,10 +437,11 @@ impl MasqueRelayStats {
         self.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a datagram returned by `recv_from` on a session's raw socket.
-    pub fn record_raw_rx(&self, bytes: u64) {
-        self.raw_rx_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.raw_rx_count.fetch_add(1, Ordering::Relaxed);
+    /// Record a datagram received from a target on a session's plain socket.
+    pub fn record_relay_target_rx(&self, bytes: u64) {
+        self.relay_target_rx_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.relay_target_rx_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a datagram the kernel refused to send to a target.
@@ -1517,9 +1520,12 @@ impl MasqueRelayServer {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
-                        // V2-834 Part A: syscall-boundary ingress on the raw
-                        // socket, before any framing.
-                        stats.record_raw_rx(len as u64);
+                        // V2-834 Part A: this is a real socket, so it counts
+                        // towards the process-wide socket totals like every
+                        // QUIC socket does; the relay-specific field below is
+                        // the attribution of the same bytes.
+                        SOCKET_TRAFFIC.record_rx(len);
+                        stats.record_relay_target_rx(len as u64);
                         let payload = Bytes::copy_from_slice(&buf[..len]);
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
@@ -1713,6 +1719,9 @@ impl MasqueRelayServer {
                             match socket2.send_to(&datagram.payload, target).await {
                                 Ok(_) => {
                                     // Confirmed forwarded to the third-party target.
+                                    // Real socket: part of the process-wide
+                                    // socket totals (V2-834 Part A).
+                                    SOCKET_TRAFFIC.record_tx(payload_len);
                                     stats2.record_forwarded_to_target(payload_len as u64, 1);
                                     // V2-1202: per-session and per-destination
                                     // accounting, raw payload bytes.
@@ -1720,6 +1729,7 @@ impl MasqueRelayServer {
                                     sess_targets.record_to_target(target, payload_len as u64);
                                 }
                                 Err(e) if is_message_too_large(&e) => {
+                                    SOCKET_TRAFFIC.record_tx_error();
                                     stats2.record_target_send_failed(payload_len as u64);
                                     // Path-MTU exceeded.  Emit a PmtuUpdate
                                     // control frame back through the tunnel
@@ -1752,6 +1762,7 @@ impl MasqueRelayServer {
                                     }
                                 }
                                 Err(e) => {
+                                    SOCKET_TRAFFIC.record_tx_error();
                                     stats2.record_target_send_failed(payload_len as u64);
                                     tracing::warn!(
                                         session_id, target = %target, error = %e,
@@ -2090,10 +2101,10 @@ impl MasqueRelayServer {
             forwarded_to_client_count = self.stats.forwarded_to_client_count.load(Ordering::Relaxed),
             bytes_relayed = self.stats.bytes_relayed.load(Ordering::Relaxed),
             datagrams_forwarded = self.stats.datagrams_forwarded.load(Ordering::Relaxed),
-            // V2-834: raw-socket ground truth (`raw_rx` + `forwarded_to_target`
-            // = this relay's raw-socket NIC share) and exact stream-leg bytes.
-            raw_rx_bytes = self.stats.raw_rx_bytes.load(Ordering::Relaxed),
-            raw_rx_count = self.stats.raw_rx_count.load(Ordering::Relaxed),
+            // V2-834: the relay's plain-socket legs (both already inside the
+            // process-wide `sock_*` totals) and exact stream-leg bytes.
+            relay_target_rx_bytes = self.stats.relay_target_rx_bytes.load(Ordering::Relaxed),
+            relay_target_rx_count = self.stats.relay_target_rx_count.load(Ordering::Relaxed),
             target_send_failed_bytes = self.stats.target_send_failed_bytes.load(Ordering::Relaxed),
             target_send_failed_count = self.stats.target_send_failed_count.load(Ordering::Relaxed),
             stream_rx_bytes = self.stats.stream_rx_bytes.load(Ordering::Relaxed),
