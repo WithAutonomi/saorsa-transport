@@ -21,6 +21,7 @@ use tokio::{
 
 use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper, UdpPoller};
 use crate::Instant;
+use crate::traffic::SOCKET_TRAFFIC;
 
 /// Tokio runtime implementation
 #[derive(Debug)]
@@ -83,9 +84,25 @@ impl AsyncUdpSocket for UdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn_udp::Transmit) -> io::Result<()> {
-        self.inner
-            .try_send_to(transmit.contents, transmit.destination)?;
-        Ok(())
+        // V2-834: this is the one real-socket send path in the process, so
+        // counting here gives syscall-boundary ground truth for every QUIC
+        // socket (main, per-dial relay carriers, rebind leftovers) and
+        // excludes virtual relay sockets by construction.
+        match self
+            .inner
+            .try_send_to(transmit.contents, transmit.destination)
+        {
+            Ok(_) => {
+                SOCKET_TRAFFIC.record_tx(transmit.contents.len());
+                Ok(())
+            }
+            Err(e) => {
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    SOCKET_TRAFFIC.record_tx_error();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn poll_recv(
@@ -109,6 +126,8 @@ impl AsyncUdpSocket for UdpSocket {
         };
 
         let len = buf.filled().len();
+        // V2-834: true ingress, before any connection matching.
+        SOCKET_TRAFFIC.record_rx(len);
         let mut recv_meta = quinn_udp::RecvMeta::default();
         recv_meta.len = len;
         recv_meta.stride = len;

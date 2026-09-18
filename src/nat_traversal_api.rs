@@ -327,6 +327,16 @@ const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// most eleven while sessions are actually moving bytes.
 const RELAY_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Whether some endpoint's summary task currently owns the emission of the
+/// process-global traffic lines (`socket traffic summary`, `relay client
+/// traffic summary`). A process can hold more than one
+/// [`NatTraversalEndpoint`] (saorsa-core's dual-stack node binds v4 and v6
+/// separately), and the first DEV-01 run of V2-834 showed each of them
+/// emitting the global lines — identical values twice per tick. The first
+/// task to claim this emits them; it releases the claim when it exits so a
+/// surviving endpoint takes over.
+static GLOBAL_TRAFFIC_EMITTER: AtomicBool = AtomicBool::new(false);
+
 /// Accumulator backing the endpoint traffic summary (V2-623).
 ///
 /// Holds the cumulative UDP bytes of connections that have already closed. The
@@ -343,14 +353,193 @@ const RELAY_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// live sum while a straggler alias key is still present, and is pruned to only
 /// currently-live ids each tick (an id absent from the live map has had every
 /// key removed, so it can never be folded again — safe to forget).
+///
+/// V2-834 widened the accumulator from two UDP byte totals to the full
+/// [`ConnTotals`] itemisation (path loss, per-frame-type counts), routed the
+/// UDP bytes by [`ConnKind`] so virtual-socket connections no longer double
+/// count against their carrier, and made the dedicated relay carrier
+/// connections (which live in `relay_sessions`, not `connections`) fold here
+/// too.
 #[derive(Debug, Default)]
 struct EndpointTraffic {
-    /// Cumulative UDP tx bytes of connections that have closed.
-    closed_udp_tx_bytes: AtomicU64,
-    /// Cumulative UDP rx bytes of connections that have closed.
-    closed_udp_rx_bytes: AtomicU64,
+    /// Cumulative totals of connections that have closed.
+    closed: ParkingMutex<ConnTotals>,
     /// `stable_id`s already folded into the closed totals (idempotency guard).
     folded_ids: dashmap::DashSet<usize>,
+}
+
+impl EndpointTraffic {
+    /// Fold a connection's final stats exactly once (by `stable_id`).
+    fn fold(&self, conn: &InnerConnection, kind: ConnKind) {
+        if !self.folded_ids.insert(conn.stable_id()) {
+            return;
+        }
+        let totals = ConnTotals::from_stats(&conn.stats(), kind);
+        self.closed.lock().add(&totals);
+    }
+}
+
+/// Which byte bucket a connection's UDP totals belong to (V2-834).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnKind {
+    /// Ordinary connection on a real UDP socket, tracked in `connections`.
+    Real,
+    /// Connection on a virtual `MasqueRelaySocket`: its datagrams ride a
+    /// carrier connection that is counted separately, so its UDP bytes are
+    /// itemised as `virtual_udp_*` rather than added to `udp_*`.
+    Virtual,
+    /// Dedicated CONNECT-UDP control connection to a relay server (tracked in
+    /// `relay_sessions`). Carries every byte of this node's relay leg.
+    RelayCarrier,
+}
+
+impl ConnKind {
+    fn of(conn: &InnerConnection) -> Self {
+        if conn.is_virtual_socket() {
+            Self::Virtual
+        } else {
+            Self::Real
+        }
+    }
+}
+
+macro_rules! conn_totals {
+    ($($field:ident),* $(,)?) => {
+        /// Cumulative per-connection figures summed across connections
+        /// (V2-834 Part B itemisation). Every field is a monotone counter
+        /// derived from `ConnectionStats`.
+        #[derive(Debug, Default, Clone, Copy)]
+        struct ConnTotals {
+            $(pub $field: u64,)*
+        }
+
+        impl ConnTotals {
+            /// Element-wise sum.
+            fn add(&mut self, other: &Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)*
+            }
+
+            /// Element-wise monotonic clamp against a previous emit.
+            fn clamp_monotonic(&mut self, last: &Self) {
+                $(self.$field = self.$field.max(last.$field);)*
+            }
+        }
+    };
+}
+
+conn_totals!(
+    udp_tx_bytes,
+    udp_rx_bytes,
+    virtual_udp_tx_bytes,
+    virtual_udp_rx_bytes,
+    relay_carrier_udp_tx_bytes,
+    relay_carrier_udp_rx_bytes,
+    lost_bytes,
+    lost_packets,
+    congestion_events,
+    black_holes_detected,
+    sent_plpmtud_probes,
+    lost_plpmtud_probes,
+    tx_acks,
+    tx_ping,
+    tx_crypto,
+    tx_observed_address,
+    tx_add_address,
+    tx_punch_me_now,
+    tx_datagram,
+    tx_stream,
+    rx_acks,
+    rx_ping,
+    rx_crypto,
+    rx_observed_address,
+    rx_add_address,
+    rx_punch_me_now,
+    rx_datagram,
+    rx_stream,
+);
+
+impl ConnTotals {
+    /// Project one connection's stats, routing its UDP bytes by `kind`.
+    /// Frame and path figures are overhead regardless of socket kind, so they
+    /// are always included.
+    fn from_stats(stats: &crate::ConnectionStats, kind: ConnKind) -> Self {
+        let mut t = Self::default();
+        match kind {
+            ConnKind::Real => {
+                t.udp_tx_bytes = stats.udp_tx.bytes;
+                t.udp_rx_bytes = stats.udp_rx.bytes;
+            }
+            ConnKind::Virtual => {
+                t.virtual_udp_tx_bytes = stats.udp_tx.bytes;
+                t.virtual_udp_rx_bytes = stats.udp_rx.bytes;
+            }
+            ConnKind::RelayCarrier => {
+                t.relay_carrier_udp_tx_bytes = stats.udp_tx.bytes;
+                t.relay_carrier_udp_rx_bytes = stats.udp_rx.bytes;
+            }
+        }
+        t.lost_bytes = stats.path.lost_bytes;
+        t.lost_packets = stats.path.lost_packets;
+        t.congestion_events = stats.path.congestion_events;
+        t.black_holes_detected = stats.path.black_holes_detected;
+        t.sent_plpmtud_probes = stats.path.sent_plpmtud_probes;
+        t.lost_plpmtud_probes = stats.path.lost_plpmtud_probes;
+        t.tx_acks = stats.frame_tx.acks;
+        t.tx_ping = stats.frame_tx.ping;
+        t.tx_crypto = stats.frame_tx.crypto;
+        t.tx_observed_address = stats.frame_tx.observed_address;
+        t.tx_add_address = stats.frame_tx.add_address;
+        t.tx_punch_me_now = stats.frame_tx.punch_me_now;
+        t.tx_datagram = stats.frame_tx.datagram;
+        t.tx_stream = stats.frame_tx.stream;
+        t.rx_acks = stats.frame_rx.acks;
+        t.rx_ping = stats.frame_rx.ping;
+        t.rx_crypto = stats.frame_rx.crypto;
+        t.rx_observed_address = stats.frame_rx.observed_address;
+        t.rx_add_address = stats.frame_rx.add_address;
+        t.rx_punch_me_now = stats.frame_rx.punch_me_now;
+        t.rx_datagram = stats.frame_rx.datagram;
+        t.rx_stream = stats.frame_rx.stream;
+        t
+    }
+}
+
+/// Folds an established-but-not-yet-registered connection if it is dropped
+/// before the caller hands it to a table that folds on removal (V2-834).
+///
+/// Disarm once the connection is registered; `folded_ids` makes a fold from
+/// either path exactly-once.
+struct UnregisteredConnGuard {
+    conn: InnerConnection,
+    traffic: Arc<EndpointTraffic>,
+    kind: ConnKind,
+    armed: bool,
+}
+
+impl UnregisteredConnGuard {
+    fn new(conn: InnerConnection, traffic: Arc<EndpointTraffic>, kind: ConnKind) -> Self {
+        Self {
+            conn,
+            traffic,
+            kind,
+            armed: true,
+        }
+    }
+
+    /// Stop guarding and hand the connection back to the caller, which now
+    /// owns its fold-on-close path.
+    fn disarm_into(mut self) -> InnerConnection {
+        self.armed = false;
+        self.conn.clone()
+    }
+}
+
+impl Drop for UnregisteredConnGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.traffic.fold(&self.conn, self.kind);
+        }
+    }
 }
 
 /// An active relay session for MASQUE CONNECT-UDP
@@ -392,6 +581,10 @@ struct RelaySessionOwner {
     relay_server_addr: SocketAddr,
     public_address: Option<SocketAddr>,
     relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    /// Where the carrier connection's final stats are folded on removal
+    /// (V2-834): relay carriers are not in `connections`, so this is their
+    /// only fold-on-close path.
+    endpoint_traffic: Arc<EndpointTraffic>,
     stable_id: usize,
     cleanup_armed: bool,
 }
@@ -401,12 +594,14 @@ impl RelaySessionOwner {
         relay_server_addr: SocketAddr,
         public_address: Option<SocketAddr>,
         relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+        endpoint_traffic: Arc<EndpointTraffic>,
         stable_id: usize,
     ) -> Self {
         Self {
             relay_server_addr,
             public_address,
             relay_sessions,
+            endpoint_traffic,
             stable_id,
             cleanup_armed: true,
         }
@@ -434,6 +629,8 @@ impl RelaySessionOwner {
             session
                 .connection
                 .close(crate::VarInt::from_u32(RELAY_TUNNEL_LOST_CODE), reason);
+            self.endpoint_traffic
+                .fold(&session.connection, ConnKind::RelayCarrier);
         }
         self.cleanup_armed = false;
     }
@@ -4573,6 +4770,7 @@ impl NatTraversalEndpoint {
                         relay_addr,
                         public_address,
                         Arc::clone(&self.relay_sessions),
+                        Arc::clone(&self.endpoint_traffic),
                         stable_id,
                     ),
                 });
@@ -4597,6 +4795,14 @@ impl NatTraversalEndpoint {
             "relay session: creating dedicated control connection"
         );
         let connection = self.connect_new_to_relay(relay_addr).await?;
+        // V2-834: until the session is inserted, any early return below drops
+        // an established carrier without a fold-on-close path.
+        let carrier_guard = UnregisteredConnGuard::new(
+            connection,
+            Arc::clone(&self.endpoint_traffic),
+            ConnKind::RelayCarrier,
+        );
+        let connection = &carrier_guard.conn;
 
         // Cap on the end-to-end CONNECT-UDP handshake (open_bi → write
         // request → read_exact response). Without a cap, reusing a peer
@@ -4716,8 +4922,11 @@ impl NatTraversalEndpoint {
             relay_addr,
             public_address,
             Arc::clone(&self.relay_sessions),
+            Arc::clone(&self.endpoint_traffic),
             stable_id,
         );
+        // From here the owner folds the carrier on removal.
+        let connection = carrier_guard.disarm_into();
         let session = RelaySession {
             connection,
             public_address,
@@ -4931,16 +5140,7 @@ impl NatTraversalEndpoint {
     /// folded exactly once. `DashSet::insert` returns `false` when the id was
     /// already present.
     fn fold_closed_connection_bytes(&self, conn: &InnerConnection) {
-        if !self.endpoint_traffic.folded_ids.insert(conn.stable_id()) {
-            return;
-        }
-        let stats = conn.stats();
-        self.endpoint_traffic
-            .closed_udp_tx_bytes
-            .fetch_add(stats.udp_tx.bytes, Ordering::Relaxed);
-        self.endpoint_traffic
-            .closed_udp_rx_bytes
-            .fetch_add(stats.udp_rx.bytes, Ordering::Relaxed);
+        self.endpoint_traffic.fold(conn, ConnKind::of(conn));
     }
 
     /// Spawn the periodic endpoint traffic-summary task (V2-623).
@@ -4970,18 +5170,39 @@ impl NatTraversalEndpoint {
     /// connection that opens and closes entirely within one interval is not
     /// counted. Its bytes are still captured whenever it closes through a
     /// removal site (final stats folded there); only the count is missed.
+    ///
+    /// V2-834 extends the same tick with three sibling lines under the same
+    /// target: `socket traffic summary` (process-wide real-socket totals and
+    /// abandoned dials), `connection overhead summary` (path loss, per-frame
+    /// counts, handshakes; two `group`s) and `relay client traffic summary`
+    /// (client-side tunnel legs). Virtual-socket connections and dedicated
+    /// relay carriers are itemised separately from `udp_*` so nothing is
+    /// counted both on a tunnel and on its carrier.
     fn spawn_endpoint_traffic_summary(&self) {
         let connections = self.connections.clone();
+        let relay_sessions = self.relay_sessions.clone();
         let endpoint_traffic = self.endpoint_traffic.clone();
+        let inner_endpoint = self.inner_endpoint.clone();
         let shutdown = self.shutdown.clone();
+        // Discriminator for the per-endpoint lines: a process may run one
+        // endpoint per address family, and their series must not be read as
+        // one. The bind address is stable for the endpoint's lifetime.
+        let endpoint_label = inner_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ENDPOINT_TRAFFIC_SUMMARY_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
+            let endpoint = endpoint_label.as_str();
+            // Claimed lazily on the first tick so a task that never ticks
+            // (shut down during warm-up) never holds it.
+            let mut emits_global = false;
 
-            // Monotonic guards for the emitted byte totals.
-            let mut last_tx: u64 = 0;
-            let mut last_rx: u64 = 0;
+            // Monotonic guard for every emitted cumulative figure.
+            let mut last = ConnTotals::default();
             // Cumulative open/close counts (sampling granularity).
             let mut connections_opened: u64 = 0;
             let mut connections_closed: u64 = 0;
@@ -4993,19 +5214,23 @@ impl NatTraversalEndpoint {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                if !emits_global {
+                    emits_global = GLOBAL_TRAFFIC_EMITTER
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                }
 
                 // Snapshot the closed accumulator BEFORE scanning live
                 // connections. Reading it afterwards would let a connection be
                 // summed live, then removed and folded mid-tick, then counted
                 // again in the closed total — a double count the monotonic
                 // clamp would make permanent.
-                let closed_tx = endpoint_traffic.closed_udp_tx_bytes.load(Ordering::Relaxed);
-                let closed_rx = endpoint_traffic.closed_udp_rx_bytes.load(Ordering::Relaxed);
+                let mut totals = *endpoint_traffic.closed.lock();
 
-                let mut live_tx: u64 = 0;
-                let mut live_rx: u64 = 0;
                 let mut live_ids: std::collections::HashSet<usize> =
                     std::collections::HashSet::new();
+                let mut live_min_mtu: u16 = u16::MAX;
+                let mut live_virtual: u64 = 0;
                 for entry in connections.iter() {
                     let conn = entry.value();
                     let id = conn.stable_id();
@@ -5015,14 +5240,41 @@ impl NatTraversalEndpoint {
                         continue;
                     }
                     // Skip a connection already folded into the closed total
-                    // (its bytes are in `closed_*`). Happens while a straggler
+                    // (its bytes are in `closed`). Happens while a straggler
                     // alias key lingers after one of its keys was removed.
                     if endpoint_traffic.folded_ids.contains(&id) {
                         continue;
                     }
+                    let kind = ConnKind::of(conn);
+                    if kind == ConnKind::Virtual {
+                        live_virtual += 1;
+                    }
                     let stats = conn.stats();
-                    live_tx += stats.udp_tx.bytes;
-                    live_rx += stats.udp_rx.bytes;
+                    live_min_mtu = live_min_mtu.min(stats.path.current_mtu);
+                    totals.add(&ConnTotals::from_stats(&stats, kind));
+                }
+
+                let active_connections = live_ids.len();
+                connections_opened += live_ids.difference(&seen).count() as u64;
+                connections_closed += seen.difference(&live_ids).count() as u64;
+                seen = live_ids.clone();
+
+                // Dedicated relay carriers live in `relay_sessions`, not in
+                // `connections`; they are folded by `RelaySessionOwner` on
+                // removal and summed live here (V2-834). Added to `live_ids`
+                // only after the open/close counts above, so those shipped
+                // series keep their meaning (peer connections only).
+                let mut live_relay_sessions: u64 = 0;
+                for entry in relay_sessions.iter() {
+                    let conn = &entry.value().connection;
+                    let id = conn.stable_id();
+                    if !live_ids.insert(id) || endpoint_traffic.folded_ids.contains(&id) {
+                        continue;
+                    }
+                    live_relay_sessions += 1;
+                    let stats = conn.stats();
+                    live_min_mtu = live_min_mtu.min(stats.path.current_mtu);
+                    totals.add(&ConnTotals::from_stats(&stats, ConnKind::RelayCarrier));
                 }
 
                 // Forget folded ids no longer present in the live map: every key
@@ -5032,29 +5284,132 @@ impl NatTraversalEndpoint {
                     .folded_ids
                     .retain(|id| live_ids.contains(id));
 
-                let active_connections = live_ids.len();
-                connections_opened += live_ids.difference(&seen).count() as u64;
-                connections_closed += seen.difference(&live_ids).count() as u64;
-                seen = live_ids;
-
-                // Cumulative = bytes of already-closed connections + live sum,
-                // clamped monotonic against the previous emit.
-                let udp_tx_bytes = closed_tx.saturating_add(live_tx).max(last_tx);
-                let udp_rx_bytes = closed_rx.saturating_add(live_rx).max(last_rx);
-                last_tx = udp_tx_bytes;
-                last_rx = udp_rx_bytes;
+                // Cumulative = closed + live, clamped monotonic per field
+                // against the previous emit.
+                totals.clamp_monotonic(&last);
+                last = totals;
+                let live_min_mtu = if live_min_mtu == u16::MAX {
+                    0
+                } else {
+                    live_min_mtu
+                };
 
                 info!(
                     target: "saorsa_transport::traffic",
-                    udp_tx_bytes,
-                    udp_rx_bytes,
+                    endpoint,
+                    udp_tx_bytes = totals.udp_tx_bytes,
+                    udp_rx_bytes = totals.udp_rx_bytes,
+                    virtual_udp_tx_bytes = totals.virtual_udp_tx_bytes,
+                    virtual_udp_rx_bytes = totals.virtual_udp_rx_bytes,
+                    relay_carrier_udp_tx_bytes = totals.relay_carrier_udp_tx_bytes,
+                    relay_carrier_udp_rx_bytes = totals.relay_carrier_udp_rx_bytes,
                     connections_opened,
                     connections_closed,
                     active_connections,
+                    active_virtual_connections = live_virtual,
+                    active_relay_sessions = live_relay_sessions,
                     "endpoint traffic summary (cumulative)"
+                );
+
+                // V2-834 Part A: syscall-boundary totals over every real UDP
+                // socket in the process (QUIC sockets and the relay server's
+                // per-session sockets), plus the abandoned-dial itemisation.
+                // Invariant: sock_tx/rx + link-layer headers ≈ this process's
+                // NIC UDP traffic.
+                let sock = &crate::traffic::SOCKET_TRAFFIC;
+                let failed = &crate::traffic::FAILED_DIAL_TRAFFIC;
+                if emits_global {
+                    info!(
+                        target: "saorsa_transport::traffic",
+                        sock_tx_bytes = sock.tx_bytes.load(Ordering::Relaxed),
+                        sock_tx_datagrams = sock.tx_datagrams.load(Ordering::Relaxed),
+                        sock_tx_errors = sock.tx_errors.load(Ordering::Relaxed),
+                        sock_rx_bytes = sock.rx_bytes.load(Ordering::Relaxed),
+                        sock_rx_datagrams = sock.rx_datagrams.load(Ordering::Relaxed),
+                        stateless_tx_bytes = sock.stateless_tx_bytes.load(Ordering::Relaxed),
+                        stateless_tx_count = sock.stateless_tx_count.load(Ordering::Relaxed),
+                        failed_dial_tx_bytes = failed.tx_bytes.load(Ordering::Relaxed),
+                        failed_dial_rx_bytes = failed.rx_bytes.load(Ordering::Relaxed),
+                        failed_dial_count = failed.count.load(Ordering::Relaxed),
+                        "socket traffic summary (cumulative)"
+                    );
+                }
+
+                // V2-834 Part B: itemised transport overhead. `tracing` caps an
+                // event at 32 fields, so path/handshake and frame figures are
+                // split across two lines sharing target and message,
+                // distinguished by `group`.
+                let ep_stats = inner_endpoint.as_ref().map(|ep| ep.stats());
+                let ep = |f: fn(&crate::high_level::EndpointStats) -> u64| {
+                    ep_stats.as_ref().map(f).unwrap_or(0)
+                };
+                info!(
+                    target: "saorsa_transport::traffic",
+                    endpoint,
+                    group = 1,
+                    lost_bytes = totals.lost_bytes,
+                    lost_packets = totals.lost_packets,
+                    congestion_events = totals.congestion_events,
+                    black_holes_detected = totals.black_holes_detected,
+                    sent_plpmtud_probes = totals.sent_plpmtud_probes,
+                    lost_plpmtud_probes = totals.lost_plpmtud_probes,
+                    live_min_mtu,
+                    outgoing_handshakes = ep(|s| s.outgoing_handshakes),
+                    accepted_handshakes = ep(|s| s.accepted_handshakes),
+                    refused_handshakes = ep(|s| s.refused_handshakes),
+                    ignored_handshakes = ep(|s| s.ignored_handshakes),
+                    dropped_conn_events = ep(|s| s.dropped_conn_events),
+                    "connection overhead summary (cumulative)"
+                );
+                info!(
+                    target: "saorsa_transport::traffic",
+                    endpoint,
+                    group = 2,
+                    tx_acks = totals.tx_acks,
+                    tx_ping = totals.tx_ping,
+                    tx_crypto = totals.tx_crypto,
+                    tx_observed_address = totals.tx_observed_address,
+                    tx_add_address = totals.tx_add_address,
+                    tx_punch_me_now = totals.tx_punch_me_now,
+                    tx_datagram = totals.tx_datagram,
+                    tx_stream = totals.tx_stream,
+                    rx_acks = totals.rx_acks,
+                    rx_ping = totals.rx_ping,
+                    rx_crypto = totals.rx_crypto,
+                    rx_observed_address = totals.rx_observed_address,
+                    rx_add_address = totals.rx_add_address,
+                    rx_punch_me_now = totals.rx_punch_me_now,
+                    rx_datagram = totals.rx_datagram,
+                    rx_stream = totals.rx_stream,
+                    "connection overhead summary (cumulative)"
+                );
+
+                // V2-834 Part C: client-side relay tunnel legs and the virtual
+                // socket's silent-drop paths, summed over every relay socket.
+                let rc = &crate::traffic::RELAY_CLIENT_TRAFFIC;
+                if !emits_global {
+                    continue;
+                }
+                info!(
+                    target: "saorsa_transport::traffic",
+                    stream_tx_bytes = rc.stream_tx_bytes.load(Ordering::Relaxed),
+                    stream_rx_bytes = rc.stream_rx_bytes.load(Ordering::Relaxed),
+                    keepalive_tx_count = rc.keepalive_tx_count.load(Ordering::Relaxed),
+                    keepalive_rx_count = rc.keepalive_rx_count.load(Ordering::Relaxed),
+                    control_rx_bytes = rc.control_rx_bytes.load(Ordering::Relaxed),
+                    control_rx_count = rc.control_rx_count.load(Ordering::Relaxed),
+                    dropped_oversized_bytes = rc.dropped_oversized_bytes.load(Ordering::Relaxed),
+                    dropped_oversized_count = rc.dropped_oversized_count.load(Ordering::Relaxed),
+                    dropped_writer_stopped_bytes = rc.dropped_writer_stopped_bytes.load(Ordering::Relaxed),
+                    dropped_writer_stopped_count = rc.dropped_writer_stopped_count.load(Ordering::Relaxed),
+                    dropped_recv_oversized_count = rc.dropped_recv_oversized_count.load(Ordering::Relaxed),
+                    "relay client traffic summary (cumulative)"
                 );
             }
 
+            if emits_global {
+                GLOBAL_TRAFFIC_EMITTER.store(false, Ordering::Release);
+            }
             debug!("Endpoint traffic-summary task shut down");
         });
     }
@@ -8810,6 +9165,7 @@ mod tests {
                     relay_server_addr,
                     public_address: Some(relay_public_addr),
                     relay_sessions: Arc::new(dashmap::DashMap::new()),
+                    endpoint_traffic: Arc::new(EndpointTraffic::default()),
                     stable_id: usize::MAX,
                     cleanup_armed: false,
                 },
@@ -9312,6 +9668,7 @@ mod tests {
                 relay_server_addr: "127.0.0.1:1".parse().expect("relay server address"),
                 public_address: Some(public_addr),
                 relay_sessions: Arc::new(dashmap::DashMap::new()),
+                endpoint_traffic: Arc::new(EndpointTraffic::default()),
                 stable_id: usize::MAX,
                 cleanup_armed: false,
             },
@@ -9478,6 +9835,7 @@ mod tests {
             server_addr,
             public_addr,
             Arc::clone(&sessions),
+            Arc::new(EndpointTraffic::default()),
             original.stable_id(),
         );
 
@@ -9500,6 +9858,7 @@ mod tests {
             server_addr,
             public_addr,
             Arc::clone(&sessions),
+            Arc::new(EndpointTraffic::default()),
             replacement.stable_id(),
         );
         drop(replacement_owner);

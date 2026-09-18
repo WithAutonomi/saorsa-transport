@@ -26,6 +26,7 @@ use super::{
     udp_transmit,
 };
 use crate::Instant;
+use crate::traffic::SOCKET_TRAFFIC;
 use crate::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointEvent,
     ServerConfig,
@@ -959,7 +960,16 @@ fn respond(transmit: crate::Transmit, response_buffer: &[u8], socket: &dyn Async
     // to transmit. This is morally equivalent to the packet getting
     // lost due to congestion further along the link, which
     // similarly relies on peer retries for recovery.
-    _ = socket.try_send(&udp_transmit(&transmit, &response_buffer[..transmit.size]));
+    //
+    // V2-834: these packets are counted in the socket totals like any other
+    // send, but they belong to no connection, so itemise them here to keep
+    // "endpoint total minus connection totals" explainable.
+    if socket
+        .try_send(&udp_transmit(&transmit, &response_buffer[..transmit.size]))
+        .is_ok()
+    {
+        SOCKET_TRAFFIC.record_stateless_tx(transmit.size);
+    }
 }
 
 #[inline]

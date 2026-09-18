@@ -42,18 +42,33 @@ pub struct UdpTransport {
     online: AtomicBool,
     /// Whether the socket has been delegated to Quinn (recv handled externally)
     delegated_to_quinn: AtomicBool,
-    stats: UdpTransportStats,
+    stats: Arc<UdpTransportStats>,
     inbound_tx: mpsc::Sender<InboundDatagram>,
     shutdown_tx: mpsc::Sender<()>,
 }
 
-struct UdpTransportStats {
-    datagrams_sent: AtomicU64,
-    datagrams_received: AtomicU64,
-    bytes_sent: AtomicU64,
-    bytes_received: AtomicU64,
-    send_errors: AtomicU64,
-    receive_errors: AtomicU64,
+/// Live counters for one [`UdpTransport`] socket (V2-834 Part A.5).
+///
+/// Relaxed atomics bumped on the send and receive paths; a snapshot is
+/// available through [`TransportProvider::stats`] and the live handle through
+/// [`UdpTransport::raw_stats`]. When the socket has been delegated to the QUIC
+/// endpoint the receive side is driven by the endpoint instead, so the
+/// `*_received` counters stay at zero and the bytes appear in the endpoint's
+/// socket totals.
+#[derive(Debug)]
+pub struct UdpTransportStats {
+    /// Datagrams accepted by the kernel on `send_to`.
+    pub datagrams_sent: AtomicU64,
+    /// Datagrams returned by `recv_from` on the transport's own recv loop.
+    pub datagrams_received: AtomicU64,
+    /// Bytes accepted by the kernel on `send_to`.
+    pub bytes_sent: AtomicU64,
+    /// Bytes returned by `recv_from` on the transport's own recv loop.
+    pub bytes_received: AtomicU64,
+    /// Failed `send_to` calls.
+    pub send_errors: AtomicU64,
+    /// Failed `recv_from` calls.
+    pub receive_errors: AtomicU64,
 }
 
 impl Default for UdpTransportStats {
@@ -93,7 +108,7 @@ impl UdpTransport {
             local_addr,
             online: AtomicBool::new(true),
             delegated_to_quinn: AtomicBool::new(false),
-            stats: UdpTransportStats::default(),
+            stats: Arc::new(UdpTransportStats::default()),
             inbound_tx,
             shutdown_tx,
         };
@@ -144,7 +159,7 @@ impl UdpTransport {
             local_addr,
             online: AtomicBool::new(true),
             delegated_to_quinn: AtomicBool::new(true), // Quinn handles recv
-            stats: UdpTransportStats::default(),
+            stats: Arc::new(UdpTransportStats::default()),
             inbound_tx,
             shutdown_tx,
         };
@@ -169,7 +184,7 @@ impl UdpTransport {
             local_addr,
             online: AtomicBool::new(true),
             delegated_to_quinn: AtomicBool::new(false),
-            stats: UdpTransportStats::default(),
+            stats: Arc::new(UdpTransportStats::default()),
             inbound_tx,
             shutdown_tx,
         };
@@ -186,8 +201,14 @@ impl UdpTransport {
         self.delegated_to_quinn.load(Ordering::SeqCst)
     }
 
+    /// Live counters for this socket.
+    pub fn raw_stats(&self) -> Arc<UdpTransportStats> {
+        Arc::clone(&self.stats)
+    }
+
     fn spawn_recv_loop(&self, socket: Arc<UdpSocket>, mut shutdown_rx: mpsc::Receiver<()>) {
         let inbound_tx = self.inbound_tx.clone();
+        let stats = Arc::clone(&self.stats);
         let online = self.online.load(Ordering::SeqCst);
 
         if !online {
@@ -205,6 +226,8 @@ impl UdpTransport {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, source)) => {
+                                stats.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                                stats.bytes_received.fetch_add(len as u64, Ordering::Relaxed);
                                 let datagram = InboundDatagram {
                                     data: buf[..len].to_vec(),
                                     source: TransportAddr::Quic(source),
@@ -217,6 +240,7 @@ impl UdpTransport {
                             }
                             Err(_) => {
                                 // Receive error, but continue trying
+                                stats.receive_errors.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
                         }

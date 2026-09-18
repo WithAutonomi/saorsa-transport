@@ -109,7 +109,7 @@ pub use provider::{
 };
 
 // Re-export UDP transport provider
-pub use udp::UdpTransport;
+pub use udp::{UdpTransport, UdpTransportStats};
 
 // Re-export BLE transport provider when feature is enabled
 #[cfg(feature = "ble")]

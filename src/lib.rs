@@ -271,6 +271,9 @@ pub mod token_v2;
 // High-level async API modules (ported from quinn crate)
 pub mod high_level;
 
+/// Process-global traffic accumulators at the socket boundary (V2-834).
+pub mod traffic;
+
 // Re-export high-level API types for easier usage
 pub use high_level::{
     Accept, Connecting, Connection as HighLevelConnection, Endpoint,
@@ -383,6 +386,7 @@ pub use transport::{
     BandwidthClass, InboundDatagram, LinkQuality, LoRaParams, ProtocolEngine, ProviderError,
     TransportAddr, TransportCapabilities, TransportCapabilitiesBuilder, TransportDiagnostics,
     TransportProvider, TransportRegistry, TransportStats, TransportType, UdpTransport,
+    UdpTransportStats,
 };
 
 #[cfg(feature = "ble")]

@@ -39,6 +39,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+
+use crate::traffic::SOCKET_TRAFFIC;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +48,6 @@ use tokio_util::sync::CancellationToken;
 use std::os::unix::io::AsRawFd;
 
 use crate::VarInt;
-use crate::high_level::Connection as QuicConnection;
 use crate::masque::ip_policy::IpPolicy;
 use crate::masque::tunnel_control::{CONTROL_FRAME_MARKER, TunnelControlFrame};
 use crate::masque::{
@@ -347,6 +348,35 @@ pub struct MasqueRelayStats {
     pub auth_failures: AtomicU64,
     /// Rate limit rejections
     pub rate_limit_rejections: AtomicU64,
+
+    // ---- V2-834: raw-socket and stream-leg ground truth ----
+    /// Bytes received from third-party targets on the relay's per-session
+    /// plain UDP sockets (the rx-side counterpart of `forwarded_to_target_*`).
+    /// These sockets are real sockets, so the same bytes are also in the
+    /// process-wide `sock_rx_bytes`; this field is the attribution.
+    pub relay_target_rx_bytes: AtomicU64,
+    /// Datagrams received from targets on the per-session plain UDP sockets.
+    pub relay_target_rx_count: AtomicU64,
+    /// Payload bytes the relay tried to send to a target but the kernel
+    /// refused (EMSGSIZE or other error) — not on the wire, not in
+    /// `forwarded_to_target_bytes`.
+    pub target_send_failed_bytes: AtomicU64,
+    /// Datagrams refused by the kernel on the way to a target.
+    pub target_send_failed_count: AtomicU64,
+    /// Stream bytes read from clients' tunnel streams: every length prefix
+    /// and frame, including zero-length keepalives.
+    pub stream_rx_bytes: AtomicU64,
+    /// Zero-length keepalive frames received from clients.
+    pub stream_rx_keepalive_count: AtomicU64,
+    /// Stream bytes written to clients' tunnel streams as handed to
+    /// `write_all`: batch framing, control frames and keepalives included.
+    pub stream_tx_bytes: AtomicU64,
+    /// Zero-length keepalive frames written to clients.
+    pub stream_tx_keepalive_count: AtomicU64,
+    /// Bytes of tunnel control frames (PmtuUpdate) written, framing included.
+    pub control_tx_bytes: AtomicU64,
+    /// Tunnel control frames written.
+    pub control_tx_count: AtomicU64,
 }
 
 impl MasqueRelayStats {
@@ -405,6 +435,50 @@ impl MasqueRelayStats {
     /// Record rate limit rejection
     pub fn record_rate_limit(&self) {
         self.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a datagram received from a target on a session's plain socket.
+    pub fn record_relay_target_rx(&self, bytes: u64) {
+        self.relay_target_rx_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.relay_target_rx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a datagram the kernel refused to send to a target.
+    pub fn record_target_send_failed(&self, bytes: u64) {
+        self.target_send_failed_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.target_send_failed_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record bytes read from a client's tunnel stream.
+    pub fn record_stream_rx(&self, bytes: u64) {
+        self.stream_rx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a zero-length keepalive read from a client's tunnel stream.
+    pub fn record_stream_rx_keepalive(&self) {
+        self.stream_rx_keepalive_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record bytes written to a client's tunnel stream (after `write_all`
+    /// succeeds).
+    pub fn record_stream_tx(&self, bytes: u64) {
+        self.stream_tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a zero-length keepalive written to a client's tunnel stream.
+    pub fn record_stream_tx_keepalive(&self) {
+        self.stream_tx_keepalive_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a tunnel control frame written to a client (framed length).
+    pub fn record_control_tx(&self, bytes: u64) {
+        self.control_tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.control_tx_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get current active session count
@@ -1338,171 +1412,6 @@ impl MasqueRelayServer {
         Ok((client_addr, encoded))
     }
 
-    /// Run the bidirectional forwarding loop for a relay session.
-    ///
-    /// Bridges traffic between the QUIC connection to the client and the session's
-    /// bound UDP socket. Runs until the connection closes or an unrecoverable error occurs.
-    ///
-    /// - **QUIC → UDP**: Client sends HTTP Datagrams via QUIC; the relay decapsulates
-    ///   the target address and payload and sends raw UDP from the bound socket.
-    /// - **UDP → QUIC**: External peers send raw UDP to the bound socket; the relay
-    ///   encapsulates source address + payload as an HTTP Datagram and sends via QUIC.
-    pub async fn run_forwarding_loop(
-        self: &Arc<Self>,
-        session_id: u64,
-        connection: QuicConnection,
-    ) {
-        // Get the UDP socket for this session
-        let udp_socket = {
-            let sessions = self.sessions.read().await;
-            match sessions.get(&session_id) {
-                Some(s) => s.udp_socket().cloned(),
-                None => {
-                    tracing::warn!(session_id, "Cannot start forwarding: session not found");
-                    return;
-                }
-            }
-        };
-
-        let socket = match udp_socket {
-            Some(s) => s,
-            None => {
-                tracing::warn!(session_id, "Cannot start forwarding: no UDP socket bound");
-                return;
-            }
-        };
-
-        tracing::info!(
-            session_id,
-            bound_addr = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
-            "Starting relay forwarding loop"
-        );
-
-        let server = Arc::clone(self);
-        let server2 = Arc::clone(self);
-        let socket2 = Arc::clone(&socket);
-        let conn2 = connection.clone();
-
-        // Run both directions concurrently; exit when either side finishes.
-        tokio::select! {
-            // Direction 1: UDP → QUIC (target responses → relay → client)
-            _ = async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((len, source)) => {
-                            let payload = Bytes::copy_from_slice(&buf[..len]);
-
-                            // Encode as uncompressed datagram (includes source address
-                            // so client can decode without context registration)
-                            let datagram = UncompressedDatagram::new(
-                                VarInt::from_u32(0),
-                                source,
-                                payload.clone(),
-                            );
-                            let encoded = datagram.encode();
-
-                            // Record stats
-                            server.stats.record_bytes(encoded.len() as u64);
-                            server.stats.record_datagram();
-
-                            if let Err(e) = connection.send_datagram(encoded) {
-                                let err_str = e.to_string();
-                                if err_str.contains("too large") || err_str.contains("TooLarge") {
-                                    // Skip oversized datagrams (e.g., jumbo UDP from scanners)
-                                    tracing::trace!(
-                                        session_id,
-                                        len,
-                                        "Skipping oversized datagram for relay"
-                                    );
-                                    continue;
-                                } else {
-                                    tracing::debug!(
-                                        session_id,
-                                        error = %e,
-                                        "Fatal datagram send error, stopping UDP→QUIC"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                session_id,
-                                error = %e,
-                                "UDP socket recv error, stopping UDP→QUIC"
-                            );
-                            break;
-                        }
-                    }
-                }
-            } => {},
-
-            // Direction 2: QUIC → UDP (client requests → relay → target)
-            //
-            // Uses `RelaySession::resolve_raw_datagram` to dispatch
-            // compressed vs. uncompressed in a single decode pass,
-            // using the session's context table as the source of
-            // truth. This avoids the previous try-uncompressed-then-
-            // try-compressed fallback (which both doubled decode
-            // work and could mis-interpret compressed payloads whose
-            // first byte happened to look like an IP-version tag).
-            _ = async {
-                loop {
-                    match conn2.read_datagram().await {
-                        Ok(data) => {
-                            let resolved = {
-                                let sessions = server2.sessions.read().await;
-                                sessions
-                                    .get(&session_id)
-                                    .and_then(|s| s.resolve_raw_datagram(&data))
-                            };
-                            match resolved {
-                                Some((target, payload)) => {
-                                    server2.stats.record_bytes(payload.len() as u64);
-                                    server2.stats.record_datagram();
-                                    match socket2.send_to(&payload, target).await {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                session_id,
-                                                target = %target,
-                                                error = %e,
-                                                "Failed to send UDP to target"
-                                            );
-                                        }
-                                    }
-                                }
-                                None => {
-                                    tracing::debug!(
-                                        session_id,
-                                        len = data.len(),
-                                        "Failed to decode/resolve relay datagram, skipping"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                session_id,
-                                error = %e,
-                                "QUIC connection closed, stopping QUIC→UDP"
-                            );
-                            break;
-                        }
-                    }
-                }
-            } => {},
-        }
-
-        tracing::info!(session_id, "Relay forwarding loop ended");
-
-        // Clean up the session
-        if let Err(e) = self.close_session(session_id).await {
-            tracing::debug!(session_id, error = %e, "Error closing session after forwarding ended");
-        }
-    }
-
     /// Stream-based forwarding loop — uses a persistent bidi QUIC stream instead
     /// of unreliable QUIC datagrams. This avoids the MTU limitation that causes
     /// "datagram too large" errors for QUIC Initial packets (1200+ bytes).
@@ -1611,6 +1520,12 @@ impl MasqueRelayServer {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, source)) => {
+                        // V2-834 Part A: this is a real socket, so it counts
+                        // towards the process-wide socket totals like every
+                        // QUIC socket does; the relay-specific field below is
+                        // the attribution of the same bytes.
+                        SOCKET_TRAFFIC.record_rx(len);
+                        stats.record_relay_target_rx(len as u64);
                         let payload = Bytes::copy_from_slice(&buf[..len]);
                         let datagram =
                             UncompressedDatagram::new(VarInt::from_u32(0), source, payload);
@@ -1658,6 +1573,9 @@ impl MasqueRelayServer {
                                 // bytes the relayed peer actually receives.
                                 let mut fwd_bytes = encoded.len() as u64;
                                 append_relay_frame(&mut batch, &encoded);
+                                // Framed length of a control frame appended
+                                // to this batch, if any (V2-834 C.4).
+                                let mut control_len: u64 = 0;
 
                                 let mut frames = 1usize;
                                 while frames < RELAY_STREAM_BATCH_MAX_FRAMES
@@ -1670,7 +1588,9 @@ impl MasqueRelayServer {
                                             frames += 1;
                                         }
                                         Ok(WriterItem::Control(body)) => {
+                                            let before = batch.len();
                                             append_control_frame(&mut batch, &body);
+                                            control_len = (batch.len() - before) as u64;
                                             break;
                                         }
                                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -1684,6 +1604,11 @@ impl MasqueRelayServer {
                                 }
                                 // Confirmed delivered to the relayed peer.
                                 stats_writer.record_forwarded_to_client(fwd_bytes, frames as u64);
+                                // V2-834 C.3/C.4: exact stream bytes written.
+                                stats_writer.record_stream_tx(batch.len() as u64);
+                                if control_len > 0 {
+                                    stats_writer.record_control_tx(control_len);
+                                }
                             }
                             WriterItem::Control(body) => {
                                 let mut frame = Vec::with_capacity(
@@ -1695,6 +1620,8 @@ impl MasqueRelayServer {
                                     tracing::debug!(session_id, error = %e, "Stream write error (control frame)");
                                     return "stream_control_write_error";
                                 }
+                                stats_writer.record_stream_tx(frame.len() as u64);
+                                stats_writer.record_control_tx(frame.len() as u64);
                             }
                         }
                     }
@@ -1703,6 +1630,8 @@ impl MasqueRelayServer {
                             tracing::debug!(session_id, error = %e, "Keepalive write error");
                             return "keepalive_write_error";
                         }
+                        stats_writer.record_stream_tx(keepalive_bytes.len() as u64);
+                        stats_writer.record_stream_tx_keepalive();
                     }
                 }
             }
@@ -1747,9 +1676,13 @@ impl MasqueRelayServer {
                         return "stream_read_length_error";
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
+                    // V2-834 C.3: count the wire bytes of every frame,
+                    // prefix included, keepalives included.
+                    stats2.record_stream_rx(len_buf.len() as u64);
 
                     // Zero-length frame = keepalive ping, skip.
                     if frame_len == 0 {
+                        stats2.record_stream_rx_keepalive();
                         continue;
                     }
 
@@ -1773,6 +1706,7 @@ impl MasqueRelayServer {
                         tracing::debug!(session_id, error = %e, "Stream read error (data)");
                         return "stream_read_data_error";
                     }
+                    stats2.record_stream_rx(frame_len as u64);
 
                     // Decode and forward
                     let mut cursor = Bytes::from(frame_buf);
@@ -1785,6 +1719,9 @@ impl MasqueRelayServer {
                             match socket2.send_to(&datagram.payload, target).await {
                                 Ok(_) => {
                                     // Confirmed forwarded to the third-party target.
+                                    // Real socket: part of the process-wide
+                                    // socket totals (V2-834 Part A).
+                                    SOCKET_TRAFFIC.record_tx(payload_len);
                                     stats2.record_forwarded_to_target(payload_len as u64, 1);
                                     // V2-1202: per-session and per-destination
                                     // accounting, raw payload bytes.
@@ -1792,6 +1729,8 @@ impl MasqueRelayServer {
                                     sess_targets.record_to_target(target, payload_len as u64);
                                 }
                                 Err(e) if is_message_too_large(&e) => {
+                                    SOCKET_TRAFFIC.record_tx_error();
+                                    stats2.record_target_send_failed(payload_len as u64);
                                     // Path-MTU exceeded.  Emit a PmtuUpdate
                                     // control frame back through the tunnel
                                     // so the relay-client's MasqueRelaySocket
@@ -1823,6 +1762,8 @@ impl MasqueRelayServer {
                                     }
                                 }
                                 Err(e) => {
+                                    SOCKET_TRAFFIC.record_tx_error();
+                                    stats2.record_target_send_failed(payload_len as u64);
                                     tracing::warn!(
                                         session_id, target = %target, error = %e,
                                         "Failed to send UDP to target"
@@ -2160,6 +2101,18 @@ impl MasqueRelayServer {
             forwarded_to_client_count = self.stats.forwarded_to_client_count.load(Ordering::Relaxed),
             bytes_relayed = self.stats.bytes_relayed.load(Ordering::Relaxed),
             datagrams_forwarded = self.stats.datagrams_forwarded.load(Ordering::Relaxed),
+            // V2-834: the relay's plain-socket legs (both already inside the
+            // process-wide `sock_*` totals) and exact stream-leg bytes.
+            relay_target_rx_bytes = self.stats.relay_target_rx_bytes.load(Ordering::Relaxed),
+            relay_target_rx_count = self.stats.relay_target_rx_count.load(Ordering::Relaxed),
+            target_send_failed_bytes = self.stats.target_send_failed_bytes.load(Ordering::Relaxed),
+            target_send_failed_count = self.stats.target_send_failed_count.load(Ordering::Relaxed),
+            stream_rx_bytes = self.stats.stream_rx_bytes.load(Ordering::Relaxed),
+            stream_rx_keepalive_count = self.stats.stream_rx_keepalive_count.load(Ordering::Relaxed),
+            stream_tx_bytes = self.stats.stream_tx_bytes.load(Ordering::Relaxed),
+            stream_tx_keepalive_count = self.stats.stream_tx_keepalive_count.load(Ordering::Relaxed),
+            control_tx_bytes = self.stats.control_tx_bytes.load(Ordering::Relaxed),
+            control_tx_count = self.stats.control_tx_count.load(Ordering::Relaxed),
             "relay traffic summary (cumulative)"
         );
 

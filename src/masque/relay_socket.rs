@@ -59,6 +59,7 @@ use crate::masque::UncompressedDatagram;
 use crate::masque::tunnel_control::{
     CONTROL_FRAME_MARKER, MAX_CONTROL_FRAME_BODY, TunnelControlFrame,
 };
+use crate::traffic::RELAY_CLIENT_TRAFFIC;
 
 /// Interval at which the relay client sends a zero-length keepalive
 /// frame through the relay stream.  Must be shorter than the NAT
@@ -439,10 +440,17 @@ impl MasqueRelaySocket {
                     break;
                 }
                 let frame_len = u32::from_be_bytes(len_buf);
+                // V2-834 C.4: exact stream bytes read, prefix included.
+                RELAY_CLIENT_TRAFFIC
+                    .stream_rx_bytes
+                    .fetch_add(len_buf.len() as u64, Ordering::Relaxed);
 
                 // Zero-length frame = keepalive ping from the relay
                 // server, skip without trying to decode a datagram.
                 if frame_len == 0 {
+                    RELAY_CLIENT_TRAFFIC
+                        .keepalive_rx_count
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -471,6 +479,17 @@ impl MasqueRelaySocket {
                         tracing::debug!(error = %e, "MasqueRelaySocket: control frame read error (body)");
                         break;
                     }
+                    // Marker was already counted as the length prefix.
+                    let control_len = (body_len_buf.len() + body.len()) as u64;
+                    RELAY_CLIENT_TRAFFIC
+                        .stream_rx_bytes
+                        .fetch_add(control_len, Ordering::Relaxed);
+                    RELAY_CLIENT_TRAFFIC
+                        .control_rx_bytes
+                        .fetch_add(len_buf.len() as u64 + control_len, Ordering::Relaxed);
+                    RELAY_CLIENT_TRAFFIC
+                        .control_rx_count
+                        .fetch_add(1, Ordering::Relaxed);
                     match TunnelControlFrame::decode_body(&body) {
                         Some(TunnelControlFrame::PmtuUpdate { target, mtu }) => {
                             tracing::debug!(
@@ -503,6 +522,9 @@ impl MasqueRelaySocket {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (data)");
                     break;
                 }
+                RELAY_CLIENT_TRAFFIC
+                    .stream_rx_bytes
+                    .fetch_add(frame_len as u64, Ordering::Relaxed);
 
                 let mut cursor = Bytes::from(frame_buf);
                 match UncompressedDatagram::decode(&mut cursor) {
@@ -552,6 +574,8 @@ impl MasqueRelaySocket {
                     Vec::with_capacity(encoded.len().saturating_add(std::mem::size_of::<u32>()));
                 append_relay_frame(&mut batch, &encoded);
                 writer_capacity.send_capacity_freed.notify_one();
+                // Zero-length frames are keepalives (V2-834 C.4).
+                let mut keepalives: u64 = u64::from(encoded.is_empty());
 
                 let mut frames = 1usize;
                 while frames < RELAY_STREAM_BATCH_MAX_FRAMES
@@ -559,6 +583,7 @@ impl MasqueRelaySocket {
                 {
                     match send_rx.try_recv() {
                         Ok(next) => {
+                            keepalives += u64::from(next.is_empty());
                             append_relay_frame(&mut batch, &next);
                             writer_capacity.send_capacity_freed.notify_one();
                             frames += 1;
@@ -571,6 +596,15 @@ impl MasqueRelaySocket {
                 if let Err(e) = send_stream.write_all(&batch).await {
                     tracing::debug!(error = %e, frames, bytes = batch.len(), "MasqueRelaySocket: stream batch write error");
                     break;
+                }
+                // V2-834 C.4: exact stream bytes written to the carrier.
+                RELAY_CLIENT_TRAFFIC
+                    .stream_tx_bytes
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                if keepalives > 0 {
+                    RELAY_CLIENT_TRAFFIC
+                        .keepalive_tx_count
+                        .fetch_add(keepalives, Ordering::Relaxed);
                 }
             }
             // Writer exited (stream error or receiver dropped). Dropping
@@ -648,13 +682,19 @@ impl MasqueRelaySocket {
     fn enqueue_outbound(&self, encoded: Bytes) -> io::Result<()> {
         match self.send_tx.try_send(encoded) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(encoded)) => {
                 if self.state.writer_stopped() {
                     // This queue will never drain, and `writable_or_finished`
                     // has already told Quinn the socket is writable, so
                     // `WouldBlock` here would put it into an immediate,
                     // unyielding retry. Drop the datagram instead — which is
                     // what an undeliverable packet is.
+                    RELAY_CLIENT_TRAFFIC
+                        .dropped_writer_stopped_bytes
+                        .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+                    RELAY_CLIENT_TRAFFIC
+                        .dropped_writer_stopped_count
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(io::Error::new(
@@ -703,6 +743,14 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                     cap = *cap,
                     "RELAY_TUNNEL[clt]: try_send dropping oversized packet (per-target MTU exceeded)"
                 );
+                // V2-834 C.2: quinn counts this as sent; nothing reaches
+                // the wire. Itemise so `udp_tx` can be corrected.
+                RELAY_CLIENT_TRAFFIC
+                    .dropped_oversized_bytes
+                    .fetch_add(transmit.contents.len() as u64, Ordering::Relaxed);
+                RELAY_CLIENT_TRAFFIC
+                    .dropped_oversized_count
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
         }
@@ -754,6 +802,9 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                             buf_len = bufs[filled].len(),
                             "MasqueRelaySocket: payload exceeds receive buffer; dropping packet"
                         );
+                        RELAY_CLIENT_TRAFFIC
+                            .dropped_recv_oversized_count
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     let len = payload.len();
@@ -817,6 +868,10 @@ impl AsyncUdpSocket for MasqueRelaySocket {
 
     fn may_fragment(&self) -> bool {
         false
+    }
+
+    fn is_virtual(&self) -> bool {
+        true
     }
 }
 
