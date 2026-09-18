@@ -327,6 +327,16 @@ const ENDPOINT_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// most eleven while sessions are actually moving bytes.
 const RELAY_TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Whether some endpoint's summary task currently owns the emission of the
+/// process-global traffic lines (`socket traffic summary`, `relay client
+/// traffic summary`). A process can hold more than one
+/// [`NatTraversalEndpoint`] (saorsa-core's dual-stack node binds v4 and v6
+/// separately), and the first DEV-01 run of V2-834 showed each of them
+/// emitting the global lines — identical values twice per tick. The first
+/// task to claim this emits them; it releases the claim when it exits so a
+/// surviving endpoint takes over.
+static GLOBAL_TRAFFIC_EMITTER: AtomicBool = AtomicBool::new(false);
+
 /// Accumulator backing the endpoint traffic summary (V2-623).
 ///
 /// Holds the cumulative UDP bytes of connections that have already closed. The
@@ -5174,10 +5184,22 @@ impl NatTraversalEndpoint {
         let endpoint_traffic = self.endpoint_traffic.clone();
         let inner_endpoint = self.inner_endpoint.clone();
         let shutdown = self.shutdown.clone();
+        // Discriminator for the per-endpoint lines: a process may run one
+        // endpoint per address family, and their series must not be read as
+        // one. The bind address is stable for the endpoint's lifetime.
+        let endpoint_label = inner_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ENDPOINT_TRAFFIC_SUMMARY_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
+            let endpoint = endpoint_label.as_str();
+            // Claimed lazily on the first tick so a task that never ticks
+            // (shut down during warm-up) never holds it.
+            let mut emits_global = false;
 
             // Monotonic guard for every emitted cumulative figure.
             let mut last = ConnTotals::default();
@@ -5191,6 +5213,11 @@ impl NatTraversalEndpoint {
                 ticker.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
+                }
+                if !emits_global {
+                    emits_global = GLOBAL_TRAFFIC_EMITTER
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
                 }
 
                 // Snapshot the closed accumulator BEFORE scanning live
@@ -5269,6 +5296,7 @@ impl NatTraversalEndpoint {
 
                 info!(
                     target: "saorsa_transport::traffic",
+                    endpoint,
                     udp_tx_bytes = totals.udp_tx_bytes,
                     udp_rx_bytes = totals.udp_rx_bytes,
                     virtual_udp_tx_bytes = totals.virtual_udp_tx_bytes,
@@ -5290,20 +5318,22 @@ impl NatTraversalEndpoint {
                 // NIC UDP traffic.
                 let sock = &crate::traffic::SOCKET_TRAFFIC;
                 let failed = &crate::traffic::FAILED_DIAL_TRAFFIC;
-                info!(
-                    target: "saorsa_transport::traffic",
-                    sock_tx_bytes = sock.tx_bytes.load(Ordering::Relaxed),
-                    sock_tx_datagrams = sock.tx_datagrams.load(Ordering::Relaxed),
-                    sock_tx_errors = sock.tx_errors.load(Ordering::Relaxed),
-                    sock_rx_bytes = sock.rx_bytes.load(Ordering::Relaxed),
-                    sock_rx_datagrams = sock.rx_datagrams.load(Ordering::Relaxed),
-                    stateless_tx_bytes = sock.stateless_tx_bytes.load(Ordering::Relaxed),
-                    stateless_tx_count = sock.stateless_tx_count.load(Ordering::Relaxed),
-                    failed_dial_tx_bytes = failed.tx_bytes.load(Ordering::Relaxed),
-                    failed_dial_rx_bytes = failed.rx_bytes.load(Ordering::Relaxed),
-                    failed_dial_count = failed.count.load(Ordering::Relaxed),
-                    "socket traffic summary (cumulative)"
-                );
+                if emits_global {
+                    info!(
+                        target: "saorsa_transport::traffic",
+                        sock_tx_bytes = sock.tx_bytes.load(Ordering::Relaxed),
+                        sock_tx_datagrams = sock.tx_datagrams.load(Ordering::Relaxed),
+                        sock_tx_errors = sock.tx_errors.load(Ordering::Relaxed),
+                        sock_rx_bytes = sock.rx_bytes.load(Ordering::Relaxed),
+                        sock_rx_datagrams = sock.rx_datagrams.load(Ordering::Relaxed),
+                        stateless_tx_bytes = sock.stateless_tx_bytes.load(Ordering::Relaxed),
+                        stateless_tx_count = sock.stateless_tx_count.load(Ordering::Relaxed),
+                        failed_dial_tx_bytes = failed.tx_bytes.load(Ordering::Relaxed),
+                        failed_dial_rx_bytes = failed.rx_bytes.load(Ordering::Relaxed),
+                        failed_dial_count = failed.count.load(Ordering::Relaxed),
+                        "socket traffic summary (cumulative)"
+                    );
+                }
 
                 // V2-834 Part B: itemised transport overhead. `tracing` caps an
                 // event at 32 fields, so path/handshake and frame figures are
@@ -5315,6 +5345,7 @@ impl NatTraversalEndpoint {
                 };
                 info!(
                     target: "saorsa_transport::traffic",
+                    endpoint,
                     group = 1,
                     lost_bytes = totals.lost_bytes,
                     lost_packets = totals.lost_packets,
@@ -5332,6 +5363,7 @@ impl NatTraversalEndpoint {
                 );
                 info!(
                     target: "saorsa_transport::traffic",
+                    endpoint,
                     group = 2,
                     tx_acks = totals.tx_acks,
                     tx_ping = totals.tx_ping,
@@ -5355,6 +5387,9 @@ impl NatTraversalEndpoint {
                 // V2-834 Part C: client-side relay tunnel legs and the virtual
                 // socket's silent-drop paths, summed over every relay socket.
                 let rc = &crate::traffic::RELAY_CLIENT_TRAFFIC;
+                if !emits_global {
+                    continue;
+                }
                 info!(
                     target: "saorsa_transport::traffic",
                     stream_tx_bytes = rc.stream_tx_bytes.load(Ordering::Relaxed),
@@ -5372,6 +5407,9 @@ impl NatTraversalEndpoint {
                 );
             }
 
+            if emits_global {
+                GLOBAL_TRAFFIC_EMITTER.store(false, Ordering::Release);
+            }
             debug!("Endpoint traffic-summary task shut down");
         });
     }
