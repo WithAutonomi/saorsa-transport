@@ -17,10 +17,12 @@
 //! totals match the host NIC by construction:
 //!
 //! * [`SOCKET_TRAFFIC`] — bumped inside the one real
-//!   [`AsyncUdpSocket`](crate::high_level::AsyncUdpSocket) implementation, so
-//!   it covers every real QUIC socket and excludes the virtual
-//!   `MasqueRelaySocket` (whose bytes ride a carrier connection that *is*
-//!   counted here) without any per-call-site discrimination.
+//!   [`AsyncUdpSocket`](crate::high_level::AsyncUdpSocket) implementation
+//!   (every QUIC socket) and at the relay server's per-session plain UDP
+//!   sockets (its `recv_from` / `send_to`), i.e. every real UDP socket the
+//!   process owns. The virtual `MasqueRelaySocket` is excluded without any
+//!   per-call-site discrimination: its bytes ride a carrier connection that
+//!   *is* counted here.
 //! * [`FAILED_DIAL_TRAFFIC`] — the handshake bytes of dials that never became
 //!   a registered connection. Folded from inside `Connecting`, because callers
 //!   never hold a `Connection` for a failed or timed-out dial.
@@ -33,17 +35,22 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Bytes and datagrams crossing the real UDP sockets owned by QUIC endpoints.
+/// Bytes and datagrams crossing every real UDP socket the process owns: the
+/// QUIC endpoints' sockets and the relay server's per-session plain sockets.
+/// Invariant: per process, `tx_bytes`/`rx_bytes` plus link-layer headers ≈
+/// the NIC's UDP share.
 #[derive(Debug)]
 pub struct SocketTraffic {
-    /// Bytes handed to `sendto` and accepted by the kernel.
+    /// Bytes handed to `sendto` and accepted by the kernel (QUIC sockets and
+    /// the relay's forwards to targets).
     pub tx_bytes: AtomicU64,
     /// Datagrams accepted by the kernel.
     pub tx_datagrams: AtomicU64,
     /// Datagrams the kernel refused with a non-`WouldBlock` error (dropped).
     pub tx_errors: AtomicU64,
     /// Bytes returned by `recvfrom`, before any connection matching — this is
-    /// true ingress including scanner, malformed and unmatched datagrams.
+    /// true ingress including scanner, malformed and unmatched datagrams, and
+    /// the relay's receives from targets.
     pub rx_bytes: AtomicU64,
     /// Datagrams returned by `recvfrom`.
     pub rx_datagrams: AtomicU64,
