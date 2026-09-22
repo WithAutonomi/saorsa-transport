@@ -72,4 +72,9 @@ ignore = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    # saorsa-pqc is pinned to the browser WASM support revision (saorsa-pqc PR #7,
+    # merged and tagged v0.5.2) until that release reaches crates.io. The same
+    # rev is pinned across the sibling web-support crates.
+    "https://github.com/saorsa-labs/saorsa-pqc",
+]
