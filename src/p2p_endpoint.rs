@@ -55,6 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -785,28 +786,36 @@ fn send_failed(
     }
 }
 
+/// Hand `data` to the stream without copying it.
+///
+/// `write_chunks` moves the caller's `Bytes` into the stream's send buffer
+/// (splitting off whatever flow control accepts per call), so the frame is
+/// held once for the transfer instead of once by the caller and once by the
+/// stream. Each call still has to make progress within
+/// `STREAM_WRITE_PROGRESS_TIMEOUT`, exactly as the slice-based write did.
 async fn write_stream_with_progress_timeout(
     send_stream: &mut crate::high_level::SendStream,
     addr: SocketAddr,
-    data: &[u8],
+    data: Bytes,
 ) -> Result<usize, EndpointError> {
+    let total_len = data.len();
+    let mut pending = [data];
     let mut bytes_written = 0usize;
     let write_started = Instant::now();
 
     debug!(
         "send({}): starting QUIC stream write ({} bytes)",
-        addr,
-        data.len()
+        addr, total_len
     );
 
-    while bytes_written < data.len() {
+    while bytes_written < total_len {
         match timeout(
             STREAM_WRITE_PROGRESS_TIMEOUT,
-            send_stream.write(&data[bytes_written..]),
+            send_stream.write_chunks(&mut pending),
         )
         .await
         {
-            Ok(Ok(0)) => {
+            Ok(Ok(written)) if written.bytes == 0 => {
                 return Err(send_failed(
                     SendFailureStage::Write,
                     bytes_written,
@@ -814,15 +823,12 @@ async fn write_stream_with_progress_timeout(
                 ));
             }
             Ok(Ok(written)) => {
-                bytes_written += written;
+                bytes_written += written.bytes;
             }
             Ok(Err(e)) => {
                 warn!(
                     "send({}): stream write failed after {}/{} bytes: {}",
-                    addr,
-                    bytes_written,
-                    data.len(),
-                    e
+                    addr, bytes_written, total_len, e
                 );
                 return Err(send_failed(
                     SendFailureStage::Write,
@@ -833,10 +839,7 @@ async fn write_stream_with_progress_timeout(
             Err(_elapsed) => {
                 warn!(
                     "send({}): stream write made no progress for {:?} after {}/{} bytes",
-                    addr,
-                    STREAM_WRITE_PROGRESS_TIMEOUT,
-                    bytes_written,
-                    data.len()
+                    addr, STREAM_WRITE_PROGRESS_TIMEOUT, bytes_written, total_len
                 );
                 return Err(send_failed(
                     SendFailureStage::WriteProgressTimeout,
@@ -3058,10 +3061,19 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
+        self.send_bytes(addr, Bytes::copy_from_slice(data)).await
+    }
+
+    /// Send an owned buffer to a peer without copying it.
+    ///
+    /// Same semantics as [`send`](Self::send), but the QUIC stream takes over
+    /// `data` directly, so large frames are not duplicated between the caller
+    /// and the stream's send buffer for the duration of the transfer.
+    pub async fn send_bytes(&self, addr: &SocketAddr, data: Bytes) -> Result<(), EndpointError> {
         self.send_inner(addr, data).await
     }
 
-    async fn send_inner(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
+    async fn send_inner(&self, addr: &SocketAddr, data: Bytes) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -3195,7 +3207,9 @@ impl P2pEndpoint {
                 );
 
                 let bytes_written =
-                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
+                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data.clone())
+                        .await
+                    {
                         Ok(bytes_written) => bytes_written,
                         Err(e) => {
                             let _ =
@@ -3245,7 +3259,7 @@ impl P2pEndpoint {
                     let responses = {
                         let mut engine = engine.lock();
                         engine
-                            .send(conn_id, data)
+                            .send(conn_id, &data)
                             .map_err(|e| EndpointError::Connection(e.to_string()))?
                     };
 
@@ -3266,7 +3280,7 @@ impl P2pEndpoint {
                 } else {
                     // No established connection - send directly via transport
                     self.transport_registry
-                        .send(data, &transport_addr)
+                        .send(&data, &transport_addr)
                         .await
                         .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
