@@ -793,6 +793,11 @@ fn send_failed(
 /// held once for the transfer instead of once by the caller and once by the
 /// stream. Each call still has to make progress within
 /// `STREAM_WRITE_PROGRESS_TIMEOUT`, exactly as the slice-based write did.
+///
+/// Because every stream chunk is a slice of the one shared allocation, that
+/// allocation is released when the last segment is acknowledged rather than
+/// progressively per acknowledged segment as the copying write did. Peak
+/// memory is one frame either way.
 async fn write_stream_with_progress_timeout(
     send_stream: &mut crate::high_level::SendStream,
     addr: SocketAddr,
@@ -3077,6 +3082,8 @@ impl P2pEndpoint {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
+        // Recorded up front: the QUIC path gives `data` away to the stream.
+        let total_len = data.len();
 
         // Get peer's transport address and optionally capture the connection
         // for hole-punched peers that bypassed normal registration.
@@ -3206,10 +3213,9 @@ impl P2pEndpoint {
                     open_uni_started.elapsed()
                 );
 
+                // Moved, not cloned: from here on only the stream holds the frame.
                 let bytes_written =
-                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data.clone())
-                        .await
-                    {
+                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
                         Ok(bytes_written) => bytes_written,
                         Err(e) => {
                             let _ =
@@ -3233,13 +3239,13 @@ impl P2pEndpoint {
                     finish_started.elapsed()
                 );
 
-                if data.len() >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
+                if total_len >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
                     wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
                 }
 
                 debug!(
                     "Sent {} bytes to {} via QUIC (send path took {:?})",
-                    data.len(),
+                    total_len,
                     addr,
                     send_started.elapsed()
                 );
