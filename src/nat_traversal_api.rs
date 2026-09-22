@@ -6084,8 +6084,9 @@ impl NatTraversalEndpoint {
     ///
     /// This method broadcasts the transport address to all active connections
     /// using ADD_ADDRESS frames. For UDP transports, this falls back to the
-    /// standard socket address advertising. For other transports (BLE, LoRa, etc.),
-    /// the transport type and optional capability flags are included in the advertisement.
+    /// standard socket address advertising. Other transports return an error:
+    /// this API does not negotiate or transmit extended transport advertisements.
+    /// WebRTC endpoints are advertised through the application's peer records.
     ///
     /// # Arguments
     /// * `address` - The transport address to advertise
@@ -6132,31 +6133,11 @@ impl NatTraversalEndpoint {
             return Ok(());
         }
 
-        // For non-UDP transports, we need to store the transport candidate
-        // and advertise it via the extended ADD_ADDRESS frames
-        let candidate = TransportCandidate {
-            address: address.clone(),
-            priority,
-            source: CandidateSource::Local,
-            state: CandidateState::New,
-            capabilities,
-        };
-
-        info!(
-            "Advertising {:?} transport address with priority {} (capabilities: {:?})",
-            candidate.transport_type(),
-            priority,
-            capabilities
-        );
-
-        // For now, log the advertisement - full frame transmission for non-UDP
-        // transports will be implemented when we have multi-transport connections
-        debug!(
-            "Transport candidate registered: {:?}, capabilities: {:?}",
-            address, capabilities
-        );
-
-        Ok(())
+        let _ = capabilities;
+        Err(NatTraversalError::ConfigError(format!(
+            "transport advertisement is unsupported for {}; use the application's peer-record address plane",
+            address.transport_type()
+        )))
     }
 
     /// Advertise a transport address with full capability information
@@ -6295,6 +6276,7 @@ impl NatTraversalEndpoint {
         // Transport type bonus (0-10000)
         let transport_bonus = match candidate.transport_type() {
             TransportType::Quic => 10000,
+            TransportType::WebRtcDirect => 9750,
             TransportType::Tcp => 9500,
             TransportType::Udp => 9000,
             TransportType::Yggdrasil => 8000,
@@ -8683,9 +8665,19 @@ mod tests {
 
     use super::*;
 
+    use std::io::{self, IoSliceMut};
     use std::task::{Context, Poll, Wake, Waker};
 
+    use quinn_udp::RecvMeta;
+
     use crate::high_level::AsyncUdpSocket;
+
+    /// How long a live relay test waits for the tunnel, the endpoint driver, or
+    /// the socket to react to the relay peer going away.
+    const TUNNEL_LOSS_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Interval between hand-polls of the tunnel socket while waiting for it to
+    /// report the loss.
+    const TUNNEL_LOSS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
     /// A waker that records whether it was woken, for driving a poller by hand
     /// and then checking that the code under test actually notified it.
@@ -9207,46 +9199,73 @@ mod tests {
     }
 
     /// The quiet path must stay scoped to teardowns we asked for: a tunnel that
-    /// breaks on its own is still a transport failure and must still be logged.
+    /// breaks on its own is still a transport failure. The socket must report
+    /// it as a receive error rather than parking, and that error must end the
+    /// relay endpoint's driver through its I/O-failure path — which is what
+    /// logs `ERROR ... I/O error: relay recv stream closed`.
+    ///
+    /// Checked on the endpoint and the socket, not on captured logs. The
+    /// `I/O error` line comes from one callsite shared by every endpoint driver
+    /// in this test binary, and `tracing` caches a callsite's interest
+    /// process-wide from whichever thread hits it first. When a neighbouring
+    /// test's driver hits it on a thread with no subscriber, the cache reads
+    /// `never` and a subscriber scoped to this thread never sees the event.
     #[tokio::test(flavor = "current_thread")]
     async fn unexpected_tunnel_loss_still_reports_a_transport_error() {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_writer(logs.clone())
-            .with_ansi(false)
-            .finish();
-        let _log_guard = tracing::subscriber::set_default(subscriber);
-
         let live = live_proactive_relay().await;
 
         // The relay peer goes away; the tunnel reader's stream read fails.
         live.relay_peer.shutdown().await.expect("relay peer down");
-        tokio::time::timeout(Duration::from_secs(5), live.relay.tunnel.closed())
+        timeout(TUNNEL_LOSS_TIMEOUT, live.relay.tunnel.closed())
             .await
             .expect("reader task should observe the broken relay stream");
+        assert!(
+            !live.relay.tunnel.shutdown_requested(),
+            "a tunnel that broke on its own is a failure, not a requested teardown"
+        );
 
-        // `closed()` fires when the cause settles, which is before the reader
-        // drops `recv_tx` and before the driver has necessarily logged. Wait for
-        // the line itself rather than guessing at a sleep.
-        let captured = tokio::time::timeout(Duration::from_secs(10), async {
+        // The driver ends through its failure path while the endpoint is still
+        // held, so `accept` yields `None`. On the quiet path it would park
+        // instead and this would time out.
+        let accepted = timeout(TUNNEL_LOSS_TIMEOUT, live.relay.endpoint.accept())
+            .await
+            .expect("the relay endpoint driver must end once the tunnel socket fails");
+        assert!(
+            accepted.is_none(),
+            "the relay endpoint accepted a connection instead of losing its driver"
+        );
+
+        // Only poll the socket by hand once the driver has retired: a hand poll
+        // replaces the waker registered on the receive channel, and the driver
+        // would otherwise never learn that the channel closed. `closed()` fires
+        // when the cause settles, before the reader drops its end of the
+        // channel, so keep polling until the socket reports the loss.
+        let error = timeout(TUNNEL_LOSS_TIMEOUT, async {
             loop {
-                let captured = logs.text();
-                if captured.contains("relay recv stream closed") {
-                    return captured;
+                match poll_recv_once(&live.socket) {
+                    Poll::Ready(Err(error)) => return error,
+                    Poll::Ready(Ok(_)) | Poll::Pending => {
+                        sleep(TUNNEL_LOSS_POLL_INTERVAL).await;
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| logs.text());
-
-        assert!(
-            captured.contains("relay recv stream closed"),
-            "a tunnel that broke on its own must still surface as a transport failure; got:\n{captured}"
-        );
+        .expect("a tunnel that broke on its own must surface as a receive error, not park");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "relay recv stream closed");
 
         let _ = live.local.shutdown().await;
+    }
+
+    /// One hand-driven `poll_recv` on a tunnel socket, with a single receive
+    /// buffer and a no-op waker.
+    fn poll_recv_once(socket: &crate::masque::MasqueRelaySocket) -> Poll<io::Result<usize>> {
+        let mut buffer = [0u8; crate::MAX_UDP_PAYLOAD as usize];
+        let mut bufs = [IoSliceMut::new(&mut buffer)];
+        let mut meta = [RecvMeta::default()];
+        let mut cx = Context::from_waker(Waker::noop());
+        socket.poll_recv(&mut cx, &mut bufs, &mut meta)
     }
 
     /// `is_relay_healthy` can condemn a relay from the outer session's state
