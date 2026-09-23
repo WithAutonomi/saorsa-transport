@@ -55,6 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -785,28 +786,74 @@ fn send_failed(
     }
 }
 
+/// Frame handed to the send path by either public entry point.
+///
+/// Only the QUIC branch needs an owned buffer, because the stream takes it
+/// over for the transfer. A borrowed frame from [`P2pEndpoint::send`] is
+/// therefore copied exactly once, inside that branch, and never before the
+/// shutdown/peer-lookup checks or on the constrained/datagram paths, which
+/// only read it.
+enum SendPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl SendPayload<'_> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+
+    /// Owned frame for the QUIC stream; copies only a borrowed payload.
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Borrowed(data) => Bytes::copy_from_slice(data),
+            Self::Owned(data) => data,
+        }
+    }
+}
+
+/// Hand `data` to the stream without copying it.
+///
+/// `write_chunks` moves the caller's `Bytes` into the stream's send buffer
+/// (splitting off whatever flow control accepts per call), so the frame is
+/// held once for the transfer instead of once by the caller and once by the
+/// stream. Each call still has to make progress within
+/// `STREAM_WRITE_PROGRESS_TIMEOUT`, exactly as the slice-based write did.
+///
+/// Because every stream chunk is a slice of the one shared allocation, that
+/// allocation is released when the last segment is acknowledged rather than
+/// progressively per acknowledged segment as the copying write did. Peak
+/// memory is one frame either way.
 async fn write_stream_with_progress_timeout(
     send_stream: &mut crate::high_level::SendStream,
     addr: SocketAddr,
-    data: &[u8],
+    data: Bytes,
 ) -> Result<usize, EndpointError> {
+    let total_len = data.len();
+    let mut pending = [data];
     let mut bytes_written = 0usize;
     let write_started = Instant::now();
 
     debug!(
         "send({}): starting QUIC stream write ({} bytes)",
-        addr,
-        data.len()
+        addr, total_len
     );
 
-    while bytes_written < data.len() {
+    while bytes_written < total_len {
         match timeout(
             STREAM_WRITE_PROGRESS_TIMEOUT,
-            send_stream.write(&data[bytes_written..]),
+            send_stream.write_chunks(&mut pending),
         )
         .await
         {
-            Ok(Ok(0)) => {
+            Ok(Ok(written)) if written.bytes == 0 => {
                 return Err(send_failed(
                     SendFailureStage::Write,
                     bytes_written,
@@ -814,15 +861,12 @@ async fn write_stream_with_progress_timeout(
                 ));
             }
             Ok(Ok(written)) => {
-                bytes_written += written;
+                bytes_written += written.bytes;
             }
             Ok(Err(e)) => {
                 warn!(
                     "send({}): stream write failed after {}/{} bytes: {}",
-                    addr,
-                    bytes_written,
-                    data.len(),
-                    e
+                    addr, bytes_written, total_len, e
                 );
                 return Err(send_failed(
                     SendFailureStage::Write,
@@ -833,10 +877,7 @@ async fn write_stream_with_progress_timeout(
             Err(_elapsed) => {
                 warn!(
                     "send({}): stream write made no progress for {:?} after {}/{} bytes",
-                    addr,
-                    STREAM_WRITE_PROGRESS_TIMEOUT,
-                    bytes_written,
-                    data.len()
+                    addr, STREAM_WRITE_PROGRESS_TIMEOUT, bytes_written, total_len
                 );
                 return Err(send_failed(
                     SendFailureStage::WriteProgressTimeout,
@@ -3058,13 +3099,28 @@ impl P2pEndpoint {
     /// - No suitable transport provider is available
     /// - The send operation fails
     pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
-        self.send_inner(addr, data).await
+        self.send_inner(addr, SendPayload::Borrowed(data)).await
     }
 
-    async fn send_inner(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
+    /// Send an owned buffer to a peer without copying it.
+    ///
+    /// Same semantics as [`send`](Self::send), but the QUIC stream takes over
+    /// `data` directly, so large frames are not duplicated between the caller
+    /// and the stream's send buffer for the duration of the transfer.
+    pub async fn send_bytes(&self, addr: &SocketAddr, data: Bytes) -> Result<(), EndpointError> {
+        self.send_inner(addr, SendPayload::Owned(data)).await
+    }
+
+    async fn send_inner(
+        &self,
+        addr: &SocketAddr,
+        data: SendPayload<'_>,
+    ) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
+        // Recorded up front: the QUIC path gives `data` away to the stream.
+        let total_len = data.len();
 
         // Get peer's transport address and optionally capture the connection
         // for hole-punched peers that bypassed normal registration.
@@ -3194,15 +3250,21 @@ impl P2pEndpoint {
                     open_uni_started.elapsed()
                 );
 
-                let bytes_written =
-                    match write_stream_with_progress_timeout(&mut send_stream, *addr, data).await {
-                        Ok(bytes_written) => bytes_written,
-                        Err(e) => {
-                            let _ =
-                                send_stream.reset(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
-                            return Err(e);
-                        }
-                    };
+                // Moved, not cloned: from here on only the stream holds the
+                // frame (a borrowed `send(&[u8])` payload is copied here, once).
+                let bytes_written = match write_stream_with_progress_timeout(
+                    &mut send_stream,
+                    *addr,
+                    data.into_bytes(),
+                )
+                .await
+                {
+                    Ok(bytes_written) => bytes_written,
+                    Err(e) => {
+                        let _ = send_stream.reset(crate::VarInt::from_u32(STREAM_RESET_ABORT_CODE));
+                        return Err(e);
+                    }
+                };
 
                 let finish_started = Instant::now();
                 debug!(
@@ -3219,13 +3281,13 @@ impl P2pEndpoint {
                     finish_started.elapsed()
                 );
 
-                if data.len() >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
+                if total_len >= LARGE_SEND_DELIVERY_ACK_THRESHOLD {
                     wait_for_stream_delivery_ack(&send_stream, *addr, bytes_written).await?;
                 }
 
                 debug!(
                     "Sent {} bytes to {} via QUIC (send path took {:?})",
-                    data.len(),
+                    total_len,
                     addr,
                     send_started.elapsed()
                 );
@@ -3245,7 +3307,7 @@ impl P2pEndpoint {
                     let responses = {
                         let mut engine = engine.lock();
                         engine
-                            .send(conn_id, data)
+                            .send(conn_id, data.as_slice())
                             .map_err(|e| EndpointError::Connection(e.to_string()))?
                     };
 
@@ -3259,20 +3321,20 @@ impl P2pEndpoint {
 
                     debug!(
                         "Sent {} bytes to {} via constrained engine ({})",
-                        data.len(),
+                        total_len,
                         addr,
                         transport_addr.transport_type()
                     );
                 } else {
                     // No established connection - send directly via transport
                     self.transport_registry
-                        .send(data, &transport_addr)
+                        .send(data.as_slice(), &transport_addr)
                         .await
                         .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
                     debug!(
                         "Sent {} bytes to {} via constrained transport (direct, {})",
-                        data.len(),
+                        total_len,
                         addr,
                         transport_addr.transport_type()
                     );
