@@ -1578,27 +1578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hpke"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65d16b699dd1a1fa2d851c970b0c971b388eeeb40f744252b8de48860980c8f"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "digest",
- "generic-array",
- "hkdf",
- "hmac",
- "p256",
- "rand_core 0.9.5",
- "sha2",
- "subtle",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3247,8 +3226,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-pqc"
-version = "0.5.1"
-source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=29a2b272c4ee8b72c17102da00033dbfe1ddcd37#29a2b272c4ee8b72c17102da00033dbfe1ddcd37"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "211578bef9588f0f57162139f1c214bcc6207fb632e9368040d52e4e36471938"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -3262,7 +3242,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hkdf",
  "hmac",
- "hpke",
  "log",
  "pbkdf2",
  "postcard",
@@ -3283,7 +3262,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.4"
+version = "0.37.0-rc.1"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -3842,7 +3821,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
