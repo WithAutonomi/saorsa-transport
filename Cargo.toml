@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "saorsa-transport"
-version = "0.36.4"
+version = "0.37.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
@@ -160,7 +160,7 @@ serde_yaml = { version = "0.9", optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 
 # Post-Quantum Cryptography - required in v0.12.0+
-saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "29a2b272c4ee8b72c17102da00033dbfe1ddcd37", default-features = false, optional = true }
+saorsa-pqc = { version = "0.5.2", default-features = false, optional = true }
 
 # Data structures
 slab = { version = "0.4.11", optional = true }
