@@ -136,14 +136,17 @@ jobs:
 
     - name: Check license headers
       run: |
-        # Every tracked Rust file must state its licence in a `//` comment in
-        # its first 15 lines: the crate's MIT OR Apache-2.0 notice, an SPDX
-        # identifier, or the BSD notices kept on the vendored quiche files.
+        # Every tracked Rust file must open one of the licence headers in use
+        # within its first 15 lines: the crate's MIT OR Apache-2.0 notice (in
+        # either wording or as an SPDX identifier), or the Chromium or
+        # Cloudflare BSD notice kept on the vendored quiche files. Code under
+        # any other terms needs review, and its header line added below.
+        headers='^// (This software is licensed under the MIT license <LICENSE-MIT or|Licensed under the MIT license <https://opensource\.org/licenses/MIT> or the|SPDX-License-Identifier: MIT OR Apache-2\.0|Use of this source code is governed by a BSD-style license that can be|Redistribution and use in source and binary forms, with or without)$'
         checked=0
         missing_headers=0
         while IFS= read -r -d '' file; do
           checked=$((checked + 1))
-          if ! head -n 15 -- "$file" | grep -i -E '^// (SPDX-License-Identifier: .+|(This software is )?licensed under .+|Use of this source code is governed by a .*licen[cs]e.*|Redistribution and use in source and binary forms, with or without)$' > /dev/null; then
+          if ! head -n 15 -- "$file" | grep -E "$headers" > /dev/null; then
             echo "::error file=$file::Missing license header"
             missing_headers=$((missing_headers + 1))
           fi
