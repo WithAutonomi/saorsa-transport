@@ -24,6 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// The saorsa-transport modifications to this file are licensed under the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT> or the Apache
+// License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, at your option. The code taken
+// from cloudflare/quiche remains under the BSD terms above, whose full text is
+// in COPYING in this directory.
+
 use std::time::Duration;
 
 const NUM_MILLIS_PER_SECOND: u64 = 1000;
