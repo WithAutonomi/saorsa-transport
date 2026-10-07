@@ -2,10 +2,10 @@
 
 Saorsa's BBRv2 congestion controller. The state machine (startup, drain,
 probe_bw with UP/DOWN/CRUISE/REFILL phases, probe_rtt) and per-packet
-bandwidth sampler are vendored verbatim from cloudflare/quiche; the only
-net-new code here is the shim types and the `Bbr2Adapter` that implements
-saorsa's streaming `Controller` trait on top of quiche's batched
-`CongestionControl` interface.
+bandwidth sampler are vendored from cloudflare/quiche and adapted for
+saorsa-transport; the net-new code here is the shim types, the smoke tests
+and the `Bbr2Adapter` that implements saorsa's streaming `Controller` trait
+on top of quiche's batched `CongestionControl` interface.
 
 ## Usage
 
@@ -26,10 +26,26 @@ let factory: Arc<dyn ControllerFactory + Send + Sync> = Arc::new(cc);
 
 ## Licensing & attribution
 
-All vendored files preserve their original **Chromium BSD-2-Clause** +
-**Cloudflare BSD-2-Clause** copyright headers. Saorsa's modifications
-(imports, shim types, adapter, test stripping) are marked in each file
-and are dual-licensed under saorsa-transport's license.
+All vendored files preserve their original copyright notices. The code
+attributed to The Chromium Authors is under the BSD-3-Clause licence in
+[`LICENSE`](LICENSE), and the code by Cloudflare, Inc. is under the
+BSD-2-Clause licence in [`COPYING`](COPYING). Both files are unmodified
+copies of the upstream licence files:
+
+- `LICENSE` is the licence file of Google's QUICHE, whose C++ BBRv2,
+  bandwidth sampler and windowed filter sources carry the same Chromium
+  notice ("found in the LICENSE file"); Chromium's
+  `net/third_party/quiche/README.chromium` names this file as QUICHE's
+  licence. Taken from <https://quiche.googlesource.com/quiche> at commit
+  `733621a62805d32997524d2e3997a690ff791e4e`.
+- `COPYING` is cloudflare/quiche's licence file, taken from
+  <https://github.com/cloudflare/quiche> at commit
+  `ee20378bb2bd829baa77baa0da9a2a90c26fc17d`.
+
+Saorsa's modifications to the vendored files and its own additions are
+licensed under saorsa-transport's MIT OR Apache-2.0 terms. `mod.rs` and
+`bandwidth.rs` state this under their notices; `adapter.rs`, `types.rs` and
+`smoke_tests.rs` are saorsa-transport's own code under those terms.
 
 ## File inventory
 

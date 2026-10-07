@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Regression coverage for the owned-buffer send path (`P2pEndpoint::send_bytes`).
 //!
 //! `send_bytes` hands the caller's `Bytes` to the QUIC stream through

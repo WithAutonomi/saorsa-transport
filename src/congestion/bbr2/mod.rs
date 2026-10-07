@@ -1,4 +1,5 @@
-// Vendored from cloudflare/quiche (gcongestion/bbr2.rs), BSD-2-Clause.
+// Vendored from cloudflare/quiche (gcongestion/bbr2.rs), under the BSD
+// licences below (BSD-3-Clause in LICENSE, BSD-2-Clause in COPYING).
 // Adapted for saorsa-transport — see src/congestion/bbr2/README.md.
 //
 // Copyright (c) 2015 The Chromium Authors. All rights reserved.
@@ -30,6 +31,14 @@
 // LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// The saorsa-transport modifications to this file are licensed under the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT> or the Apache
+// License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, at your option. The code taken
+// from cloudflare/quiche remains under the BSD terms above, whose full texts
+// are in LICENSE (The Chromium Authors) and COPYING (Cloudflare, Inc.) in this
+// directory.
 
 // Vendored quiche code uses `unwrap()`, `expect()`, indexing, etc., which
 // are idiomatic in that codebase but tripped by saorsa's workspace-level
