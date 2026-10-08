@@ -3262,7 +3262,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.37.0"
+version = "0.38.0-rc.1"
 dependencies = [
  "anyhow",
  "arbitrary",
