@@ -1128,12 +1128,17 @@ async fn refuse(
     association: &IncomingAssociation,
     refusal: admission::Refusal,
 ) {
-    if let Some(response) = admission::refusal_response(
+    let remote_addr = association.remote_addr;
+    let Some(response) = admission::refusal_response(
         &association.initial_packet,
         &association.server_ufrag,
         refusal,
-    ) {
-        let _ = socket.send_to(&response, association.remote_addr).await;
+    ) else {
+        tracing::debug!(%remote_addr, ?refusal, "WebRTC Direct refusal would exceed its request");
+        return;
+    };
+    if let Err(error) = socket.send_to(&response, remote_addr).await {
+        tracing::debug!(%remote_addr, %error, "failed to send WebRTC Direct refusal");
     }
 }
 
@@ -1265,8 +1270,8 @@ impl DirectUdpMux {
                     continue;
                 }
                 let mut pending = self.pending.write();
-                // A duplicate belongs to an association already being built.
-                // Refusing it would fail that browser's live candidate pair.
+                // Pending credentials are also admitted, so this only guards
+                // that invariant. Never refuse a live association's credential.
                 if pending.contains_key(&association.server_ufrag) {
                     self.diagnostics.reject();
                     continue;
@@ -1308,8 +1313,11 @@ impl DirectUdpMux {
                 self.diagnostics.reject();
                 self.pending.write().remove(&association.server_ufrag);
                 self.admitted.write().remove(&association.server_ufrag);
-                tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is full");
-                refuse(&socket, &association, admission::Refusal::Capacity).await;
+                tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is unavailable");
+                // A closed queue means the listener is shutting down, not busy.
+                if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                    refuse(&socket, &association, admission::Refusal::Capacity).await;
+                }
             }
         }
     }
@@ -1322,10 +1330,10 @@ impl DirectUdpMux {
         pending: usize,
         remote_addr: SocketAddr,
     ) -> Option<admission::Refusal> {
-        let source = super::source_ip_bucket(remote_addr.ip());
         if admitted.len() >= self.limits.max_connections || pending >= MAX_PENDING_ASSOCIATIONS {
             return Some(admission::Refusal::Capacity);
         }
+        let source = super::source_ip_bucket(remote_addr.ip());
         let source_connections = admitted
             .values()
             .filter(|addr| super::source_ip_bucket(addr.0.ip()) == source)
@@ -2438,7 +2446,13 @@ mod tests {
             let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             prove_association(&first, &listener, "browserPasswordFirst012345").await;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while listener.mux.admitted.read().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
             let password = "browserPasswordSecond01234";
             let request = prove_association(&second, &listener, password).await;
             let mut refusal = receive_refusal(&second).await;
