@@ -1118,6 +1118,25 @@ fn parse_profile_credentials(server_ufrag: &str, client_ufrag: &str) -> Option<P
     })
 }
 
+/// Answer a proven association that found no free slot.
+///
+/// Silence would leave the browser retransmitting checks until its ICE timeout
+/// and then treating a busy node as unreachable. An answered check fails at
+/// once, so the client can try another holder of the same record.
+async fn refuse(
+    socket: &UdpSocket,
+    association: &IncomingAssociation,
+    refusal: admission::Refusal,
+) {
+    if let Some(response) = admission::refusal_response(
+        &association.initial_packet,
+        &association.server_ufrag,
+        refusal,
+    ) {
+        let _ = socket.send_to(&response, association.remote_addr).await;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IncomingAssociation {
     remote_addr: SocketAddr,
@@ -1240,36 +1259,32 @@ impl DirectUdpMux {
                 continue;
             };
             association.generation = Some(generation);
-            {
+            let refusal = {
                 let mut admitted = self.admitted.write();
                 if admitted.contains_key(&association.server_ufrag) {
                     continue;
                 }
-                if admitted.len() >= self.limits.max_connections
-                    || admitted
-                        .values()
-                        .filter(|addr| {
-                            super::source_ip_bucket(addr.0.ip())
-                                == super::source_ip_bucket(remote_addr.ip())
-                        })
-                        .count()
-                        >= self.limits.max_connections_per_ip
-                {
-                    self.diagnostics.reject();
-                    continue;
-                }
                 let mut pending = self.pending.write();
-                if pending.contains_key(&association.server_ufrag)
-                    || pending.len() >= MAX_PENDING_ASSOCIATIONS
-                {
+                // A duplicate belongs to an association already being built.
+                // Refusing it would fail that browser's live candidate pair.
+                if pending.contains_key(&association.server_ufrag) {
                     self.diagnostics.reject();
                     continue;
                 }
-                admitted.insert(association.server_ufrag.clone(), (remote_addr, generation));
-                pending.insert(
-                    association.server_ufrag.clone(),
-                    (association.remote_addr, generation),
-                );
+                let refusal = self.refusal(&admitted, pending.len(), remote_addr);
+                if refusal.is_none() {
+                    admitted.insert(association.server_ufrag.clone(), (remote_addr, generation));
+                    pending.insert(
+                        association.server_ufrag.clone(),
+                        (association.remote_addr, generation),
+                    );
+                }
+                refusal
+            };
+            if let Some(refusal) = refusal {
+                self.diagnostics.reject();
+                refuse(&socket, &association, refusal).await;
+                continue;
             }
             let expiry_mux = Arc::downgrade(&self);
             let expiry_credential = association.server_ufrag.clone();
@@ -1294,8 +1309,29 @@ impl DirectUdpMux {
                 self.pending.write().remove(&association.server_ufrag);
                 self.admitted.write().remove(&association.server_ufrag);
                 tracing::debug!(%remote_addr, %error, "WebRTC Direct accept queue is full");
+                refuse(&socket, &association, admission::Refusal::Capacity).await;
             }
         }
+    }
+
+    /// The refusal owed to a proven association from `remote_addr`, or `None`
+    /// while the listener and that source both have a free slot.
+    fn refusal(
+        &self,
+        admitted: &HashMap<String, (SocketAddr, u64)>,
+        pending: usize,
+        remote_addr: SocketAddr,
+    ) -> Option<admission::Refusal> {
+        let source = super::source_ip_bucket(remote_addr.ip());
+        if admitted.len() >= self.limits.max_connections || pending >= MAX_PENDING_ASSOCIATIONS {
+            return Some(admission::Refusal::Capacity);
+        }
+        let source_connections = admitted
+            .values()
+            .filter(|addr| super::source_ip_bucket(addr.0.ip()) == source)
+            .count();
+        (source_connections >= self.limits.max_connections_per_ip)
+            .then_some(admission::Refusal::SourceQuota)
     }
 
     async fn connection_for_packet(
@@ -2356,6 +2392,72 @@ mod tests {
         .unwrap();
         assert!(listener.mux.pending.read().is_empty());
         listener.close().await.unwrap();
+    }
+
+    async fn receive_refusal(receiver: &UdpSocket) -> StunMessage {
+        let mut buffer = [0u8; 2048];
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (length, _) = receiver.recv_from(&mut buffer).await.unwrap();
+                let mut message = StunMessage::new();
+                message.unmarshal_binary(&buffer[..length]).unwrap();
+                if message.typ == stun::message::BINDING_ERROR {
+                    break message;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_listener_answers_a_proven_check_with_a_refusal() {
+        for (limits, reason) in [
+            (
+                WebRtcAdmissionLimits {
+                    max_connections: 1,
+                    max_connections_per_ip: 1,
+                },
+                "Insufficient Capacity",
+            ),
+            (
+                WebRtcAdmissionLimits {
+                    max_connections: 2,
+                    max_connections_per_ip: 1,
+                },
+                "Source Quota Reached",
+            ),
+        ] {
+            let listener = WebRtcDirectListener::bind_with_limits(
+                "127.0.0.1:0".parse().unwrap(),
+                WebRtcCertificate::generate().unwrap(),
+                limits,
+            )
+            .await
+            .unwrap();
+            let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            prove_association(&first, &listener, "browserPasswordFirst012345").await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let password = "browserPasswordSecond01234";
+            let request = prove_association(&second, &listener, password).await;
+            let mut refusal = receive_refusal(&second).await;
+            let mut original = StunMessage::new();
+            original.unmarshal_binary(&request).unwrap();
+            assert_eq!(refusal.transaction_id, original.transaction_id);
+            let mut error = stun::error_code::ErrorCodeAttribute::default();
+            stun::message::Getter::get_from(&mut error, &refusal).unwrap();
+            assert_eq!(error.code.0, stun::error_code::CODE_ALLOC_QUOTA_REACHED.0);
+            assert_eq!(error.reason, reason.as_bytes());
+            stun::integrity::MessageIntegrity::new_short_term_integrity(format!(
+                "{ICE_CREDENTIAL_PREFIX_V2}{password}"
+            ))
+            .check(&mut refusal)
+            .unwrap();
+            assert_eq!(listener.mux.admitted.read().len(), 1);
+            assert_eq!(listener.diagnostics().snapshot().rejected_connections, 1);
+            listener.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
