@@ -292,6 +292,27 @@ impl Controller for Bbr2Adapter {
         self.mark_packet_removed(pn);
     }
 
+    fn on_least_unacked(&mut self, least_unacked: u64) {
+        // Anything still tracked below the connection's oldest outstanding
+        // packet missed its ack/loss/abandon call. Left in place it pins
+        // `least_unacked()`, so the sampler can never drop the state of the
+        // packets sent after it.
+        while let Some(&pn) = self.unacked_packets.first()
+            && pn < least_unacked
+        {
+            self.inner.on_packet_neutered(pn);
+            self.mark_packet_removed(pn);
+        }
+        // Neutering leaves the entries of packets already acked behind the
+        // stale one in place until the next congestion event trims them, and
+        // a batch made only of abandoned packets never raises one. Trim now,
+        // but only between batches: acks still waiting to be flushed need
+        // their entries for bandwidth samples.
+        if self.pending_acked.is_empty() && self.pending_lost.is_empty() {
+            self.inner.remove_obsolete_packets(self.least_unacked());
+        }
+    }
+
     fn on_end_acks(
         &mut self,
         now: Instant,
@@ -357,6 +378,11 @@ impl Controller for Bbr2Adapter {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+
+    #[cfg(test)]
+    fn debug_tracked_packets(&self) -> usize {
+        self.inner.tracked_packets()
     }
 }
 

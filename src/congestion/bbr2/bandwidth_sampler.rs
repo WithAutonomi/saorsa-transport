@@ -855,6 +855,13 @@ impl BandwidthSampler {
         // BandwidthSampler.
         self.connection_state_map.remove_obsolete(least_acked);
     }
+
+    /// Entries in the per-packet state map, counting the holes left by
+    /// packets resolved behind an older one that is still tracked.
+    #[cfg(test)]
+    pub(crate) fn tracked_packets(&self) -> usize {
+        self.connection_state_map.packet_map.len()
+    }
 }
 
 // vendored #[cfg(test)] mod blocks stripped — relied on rstest + quiche test infra

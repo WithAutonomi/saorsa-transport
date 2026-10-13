@@ -660,6 +660,19 @@ impl BBRv2 {
     pub(crate) fn ack_rate(&self) -> Option<Bandwidth> {
         self.mode.network_model().ack_rate()
     }
+
+    /// Drops the sampler's state for every packet below `least_unacked`,
+    /// as the end of a congestion event does.
+    pub(super) fn remove_obsolete_packets(&mut self, least_unacked: u64) {
+        self.mode
+            .network_model_mut()
+            .remove_obsolete_packets(least_unacked);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_packets(&self) -> usize {
+        self.mode.network_model().tracked_packets()
+    }
 }
 
 impl CongestionControl for BBRv2 {

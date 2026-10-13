@@ -831,6 +831,27 @@ impl Connection {
             .clone_box()
     }
 
+    /// The peer's address on the current path, which follows migrations.
+    #[cfg(test)]
+    pub(crate) fn current_remote_address(&self) -> SocketAddr {
+        self.0
+            .state
+            .lock("current_remote_address")
+            .inner
+            .remote_address()
+    }
+
+    /// Per-packet state entries held by the current path's congestion controller.
+    #[cfg(test)]
+    pub(crate) fn congestion_tracked_packets(&self) -> usize {
+        self.0
+            .state
+            .lock("congestion_tracked_packets")
+            .inner
+            .congestion_state()
+            .debug_tracked_packets()
+    }
+
     /// Parameters negotiated during the handshake
     ///
     /// Guaranteed to return `Some` on fully established connections or after

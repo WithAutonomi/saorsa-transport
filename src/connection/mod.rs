@@ -80,6 +80,9 @@ mod datagrams;
 use datagrams::DatagramState;
 pub use datagrams::{Datagrams, SendDatagramError};
 
+#[cfg(test)]
+mod migration_congestion_tests;
+
 mod mtud;
 
 mod pacing;
@@ -1940,6 +1943,20 @@ impl Connection {
         pn
     }
 
+    /// The smallest sample packet number still in any space's sent-packet map, or the next one to
+    /// be allocated if those maps are empty. Every ack-eliciting packet below it has been acked,
+    /// declared lost or abandoned.
+    fn least_unacked_sample_pn(&self) -> u64 {
+        // Sample packet numbers rise in send order, as do the wire numbers within each space, so
+        // each space's first entry holds its smallest sample packet number.
+        self.spaces
+            .iter()
+            .filter_map(|space| space.sent_packets.first_key_value())
+            .map(|(_, packet)| packet.sample_pn)
+            .min()
+            .unwrap_or(self.next_sample_pn)
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
@@ -2209,6 +2226,13 @@ impl Connection {
             self.spaces[space].largest_acked_packet,
         );
 
+        // Backstop for the per-packet calls above, as `on_end_acks` is for the byte count: a path
+        // restored after failed validation never heard about the packets resolved while it was
+        // inactive. Every ack-eliciting packet below the connection's oldest tracked one has been
+        // resolved, whether or not this controller saw it.
+        let least_unacked = self.least_unacked_sample_pn();
+        self.path.congestion.on_least_unacked(least_unacked);
+
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
         }
@@ -2266,17 +2290,27 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, pn: u64, info: SentPacket) {
         self.remove_in_flight(pn, &info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
-            // Only pass ACKs to the congestion controller if we are not validating the current
-            // path, so as to ignore any ACKs from older paths still coming in.
-            self.path.congestion.on_ack(
-                now,
-                info.time_sent,
-                info.size.into(),
-                self.app_limited,
-                &self.path.rtt,
-                info.sample_pn,
-            );
+        if info.ack_eliciting {
+            if self.path.challenge.is_none() {
+                // Only pass ACKs to the congestion controller if we are not validating the current
+                // path, so as to ignore any ACKs from older paths still coming in.
+                self.path.congestion.on_ack(
+                    now,
+                    info.time_sent,
+                    info.size.into(),
+                    self.app_limited,
+                    &self.path.rtt,
+                    info.sample_pn,
+                );
+            } else {
+                // The packet has left recovery even though its ACK is withheld. A per-packet
+                // controller (BBRv2) must still drop its state for it, or it stays the oldest
+                // packet tracked and pins a sampler-map slot for every later ack-eliciting packet
+                // until this path's controller is discarded. Neutering leaves the controller's own
+                // count of bytes in flight unchanged: the packet may predate this path's
+                // controller, which then never counted it.
+                self.path.congestion.on_packet_neutered(info.sample_pn);
+            }
         }
 
         // Update state for confirmed delivery of frames
