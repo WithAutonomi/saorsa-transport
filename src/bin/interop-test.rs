@@ -89,17 +89,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Loaded test matrix: {} bytes", matrix_content.len());
 
     // Parse YAML
-    let matrix: serde_yaml::Value = serde_yaml::from_str(&matrix_content)?;
+    let matrix: serde_json::Value = serde_saphyr::from_str(&matrix_content)?;
 
     // Extract implementations
     let implementations = matrix["implementations"]
-        .as_mapping()
+        .as_object()
         .ok_or("Invalid matrix format: missing implementations")?;
 
     info!("Found {} implementations to test", implementations.len());
 
     for (impl_name, impl_data) in implementations {
-        let name = impl_name.as_str().unwrap_or("unknown");
+        let name = impl_name.as_str();
 
         // Skip if specific implementation requested and this isn't it
         if let Some(ref target) = args.implementation
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!("Testing implementation: {}", name);
 
-        if let Some(endpoints) = impl_data["endpoints"].as_sequence() {
+        if let Some(endpoints) = impl_data["endpoints"].as_array() {
             for endpoint in endpoints {
                 if let Some(endpoint_str) = endpoint.as_str() {
                     info!("  Endpoint: {}", endpoint_str);
