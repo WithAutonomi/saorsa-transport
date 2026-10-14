@@ -421,7 +421,7 @@ async fn test_endpoint(
 async fn run_validation(args: Args) -> Result<ValidationResults, Box<dyn Error>> {
     // Load configuration
     let config_content = fs::read_to_string(&args.config)?;
-    let config: EndpointDatabase = serde_yaml::from_str(&config_content)?;
+    let config: EndpointDatabase = serde_saphyr::from_str(&config_content)?;
 
     // Create client configuration
     let mut roots = rustls::RootCertStore::empty();
