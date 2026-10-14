@@ -156,10 +156,11 @@ pub trait Controller: Send + Sync {
     /// Convert this controller to Any for downcasting
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 
-    /// Per-packet state entries this controller holds (BBRv2's sampler map).
+    /// Per-packet state entries this controller holds (BBRv2's sampler map),
+    /// or `None` for a controller that keeps no per-packet state.
     #[cfg(test)]
-    fn debug_tracked_packets(&self) -> usize {
-        0
+    fn debug_tracked_packets(&self) -> Option<usize> {
+        None
     }
 }
 

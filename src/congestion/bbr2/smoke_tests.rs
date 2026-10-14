@@ -178,7 +178,7 @@ mod tests {
         ack_packets(&mut a, t0, 2..=200, 1200);
 
         assert_eq!(a.debug_least_unacked(), 1);
-        assert_eq!(a.debug_tracked_packets(), 200);
+        assert_eq!(a.debug_tracked_packets(), Some(200));
     }
 
     #[test]
@@ -192,7 +192,7 @@ mod tests {
         ack_packets(&mut a, t0, 2..=200, 0);
 
         assert_eq!(a.debug_least_unacked(), 201);
-        assert_eq!(a.debug_tracked_packets(), 0);
+        assert_eq!(a.debug_tracked_packets(), Some(0));
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
 
         assert!(!a.debug_is_unacked(1));
         assert_eq!(a.debug_least_unacked(), 201);
-        assert_eq!(a.debug_tracked_packets(), 0);
+        assert_eq!(a.debug_tracked_packets(), Some(0));
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(a.debug_least_unacked(), 5);
         assert!(!a.debug_is_unacked(4));
         assert!(a.debug_is_unacked(5));
-        assert_eq!(a.debug_tracked_packets(), 6);
+        assert_eq!(a.debug_tracked_packets(), Some(6));
     }
 
     #[test]

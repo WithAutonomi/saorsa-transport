@@ -30,6 +30,8 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
 
+use crate::high_level::Connection;
+use crate::nat_traversal_api::CongestionAlgorithm;
 use crate::{NatConfig, P2pConfig, P2pEndpoint, PqcConfig};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -52,6 +54,9 @@ fn node_config() -> TestResult<P2pConfig> {
         .bind_addr(loopback())
         .nat(NatConfig {
             enable_relay_fallback: false,
+            // The only controller that keeps per-packet state, so the only one
+            // this test can check.
+            congestion_algorithm: CongestionAlgorithm::Bbr2,
             ..Default::default()
         })
         .pqc(PqcConfig::default())
@@ -135,6 +140,22 @@ async fn send_messages(
     Ok(())
 }
 
+/// Waits for the last ACKs to land: polls the per-packet state of the
+/// connection's current path until it is down to `MAX_TRACKED_WHEN_IDLE` or
+/// `STEP_TIMEOUT` passes, and returns the last count seen.
+async fn tracked_once_idle(connection: &Connection) -> TestResult<usize> {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let tracked = connection
+            .congestion_tracked_packets()
+            .ok_or("the sender's congestion controller keeps no per-packet state")?;
+        if tracked <= MAX_TRACKED_WHEN_IDLE || Instant::now() >= deadline {
+            return Ok(tracked);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_mid_transfer_does_not_pin_congestion_state() -> TestResult {
     let sender = P2pEndpoint::new(node_config()?).await?;
@@ -168,8 +189,6 @@ async fn migration_mid_transfer_does_not_pin_congestion_state() -> TestResult {
     send_messages(&sender, to, WARM_UP_MESSAGES, &received).await?;
     proxy.rebound.store(true, Ordering::Relaxed);
     send_messages(&sender, to, MESSAGES_AFTER_REBIND, &received).await?;
-    // Let the last ACKs land.
-    sleep(Duration::from_millis(300)).await;
 
     let connection = sender
         .get_quic_connection(&to)
@@ -180,7 +199,7 @@ async fn migration_mid_transfer_does_not_pin_congestion_state() -> TestResult {
         to,
         "the sender never migrated, so the test did not exercise path validation"
     );
-    let tracked = connection.congestion_tracked_packets();
+    let tracked = tracked_once_idle(&connection).await?;
     assert!(
         tracked <= MAX_TRACKED_WHEN_IDLE,
         "an idle connection still tracks {tracked} packets after migrating mid-transfer"

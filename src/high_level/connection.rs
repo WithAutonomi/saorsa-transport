@@ -841,9 +841,10 @@ impl Connection {
             .remote_address()
     }
 
-    /// Per-packet state entries held by the current path's congestion controller.
+    /// Per-packet state entries held by the current path's congestion controller, or `None` if
+    /// that controller keeps no per-packet state.
     #[cfg(test)]
-    pub(crate) fn congestion_tracked_packets(&self) -> usize {
+    pub(crate) fn congestion_tracked_packets(&self) -> Option<usize> {
         self.0
             .state
             .lock("congestion_tracked_packets")

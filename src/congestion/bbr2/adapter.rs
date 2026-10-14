@@ -381,8 +381,8 @@ impl Controller for Bbr2Adapter {
     }
 
     #[cfg(test)]
-    fn debug_tracked_packets(&self) -> usize {
-        self.inner.tracked_packets()
+    fn debug_tracked_packets(&self) -> Option<usize> {
+        Some(self.inner.tracked_packets())
     }
 }
 
