@@ -423,6 +423,16 @@ impl BBRv2NetworkModel {
         self.bandwidth_sampler.on_packet_neutered(packet_number)
     }
 
+    pub(super) fn remove_obsolete_packets(&mut self, least_unacked: u64) {
+        self.bandwidth_sampler
+            .remove_obsolete_packets(least_unacked)
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_packets(&self) -> usize {
+        self.bandwidth_sampler.tracked_packets()
+    }
+
     fn adapt_lower_bounds(&mut self, congestion_event: &BBRv2CongestionEvent, params: &Params) {
         if params.bw_lo_mode == BwLoMode::Default {
             if !congestion_event.end_of_round_trip || congestion_event.is_probing_for_bandwidth {

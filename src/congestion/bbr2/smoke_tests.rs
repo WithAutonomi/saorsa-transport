@@ -18,6 +18,7 @@
 
 #[cfg(test)]
 mod tests {
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -140,6 +141,86 @@ mod tests {
         assert_eq!(a.debug_least_unacked(), 2);
         assert!(!a.debug_is_unacked(1));
         assert!(a.debug_is_unacked(2));
+    }
+
+    fn send_packets(a: &mut Bbr2Adapter, t0: Instant, pns: RangeInclusive<u64>) {
+        for pn in pns {
+            a.on_sent(t0 + Duration::from_micros(pn), 1200, pn, true);
+        }
+    }
+
+    fn ack_packets(a: &mut Bbr2Adapter, t0: Instant, pns: RangeInclusive<u64>, in_flight: u64) {
+        let rtt = rtt_of(Duration::from_millis(50));
+        let largest = *pns.end();
+        for pn in pns {
+            a.on_ack(
+                t0 + Duration::from_millis(50),
+                t0 + Duration::from_micros(pn),
+                1200,
+                false,
+                &rtt,
+                pn,
+            );
+        }
+        a.on_end_acks(
+            t0 + Duration::from_millis(50),
+            in_flight,
+            false,
+            Some(largest),
+        );
+    }
+
+    #[test]
+    fn unresolved_oldest_packet_pins_sampler_state_for_every_later_packet() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+        send_packets(&mut a, t0, 1..=200);
+        ack_packets(&mut a, t0, 2..=200, 1200);
+
+        assert_eq!(a.debug_least_unacked(), 1);
+        assert_eq!(a.debug_tracked_packets(), Some(200));
+    }
+
+    #[test]
+    fn neutering_a_packet_whose_ack_is_withheld_releases_sampler_state() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+        send_packets(&mut a, t0, 1..=200);
+        // What the connection does when packet 1's ACK arrives while the
+        // path is being validated.
+        a.on_packet_neutered(1);
+        ack_packets(&mut a, t0, 2..=200, 0);
+
+        assert_eq!(a.debug_least_unacked(), 201);
+        assert_eq!(a.debug_tracked_packets(), Some(0));
+    }
+
+    #[test]
+    fn least_unacked_drops_packets_the_controller_never_heard_about() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+        send_packets(&mut a, t0, 1..=200);
+        ack_packets(&mut a, t0, 2..=200, 0);
+
+        a.on_least_unacked(201);
+
+        assert!(!a.debug_is_unacked(1));
+        assert_eq!(a.debug_least_unacked(), 201);
+        assert_eq!(a.debug_tracked_packets(), Some(0));
+    }
+
+    #[test]
+    fn least_unacked_keeps_packets_still_outstanding() {
+        let mut a = make_adapter();
+        let t0 = Instant::now();
+        send_packets(&mut a, t0, 1..=10);
+
+        a.on_least_unacked(5);
+
+        assert_eq!(a.debug_least_unacked(), 5);
+        assert!(!a.debug_is_unacked(4));
+        assert!(a.debug_is_unacked(5));
+        assert_eq!(a.debug_tracked_packets(), Some(6));
     }
 
     #[test]

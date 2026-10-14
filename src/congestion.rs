@@ -85,9 +85,10 @@ pub trait Controller: Send + Sync {
         let _ = bytes_in_flight;
     }
 
-    /// A packet that was in flight has been "neutered" — its protection
+    /// A packet that was in flight has been "neutered": its protection
     /// keys have been discarded, so it can neither be acked nor
-    /// retransmitted. BBRv2 removes it from its sampler state map.
+    /// retransmitted, or its ACK is withheld from the controller while a new
+    /// path is being validated. BBRv2 drops its sampler state for it.
     fn on_packet_neutered(&mut self, pn: u64) {
         let _ = pn;
     }
@@ -99,6 +100,16 @@ pub trait Controller: Send + Sync {
     fn on_packet_abandoned(&mut self, pn: u64, bytes: u64) {
         let _ = bytes;
         self.on_packet_neutered(pn);
+    }
+
+    /// Every ack-eliciting packet numbered below `least_unacked` has been
+    /// acked, declared lost or abandoned, whether or not this controller was
+    /// told. Called
+    /// after [`Controller::on_end_acks`] for each ACK frame that acknowledges
+    /// new packets. BBRv2 drops any per-packet state it still holds for those
+    /// packets; the others ignore it (default no-op).
+    fn on_least_unacked(&mut self, least_unacked: u64) {
+        let _ = least_unacked;
     }
 
     /// Called when the known in-flight packet count has decreased (should be called exactly once per on_ack_received)
@@ -144,6 +155,13 @@ pub trait Controller: Send + Sync {
 
     /// Convert this controller to Any for downcasting
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+
+    /// Per-packet state entries this controller holds (BBRv2's sampler map),
+    /// or `None` for a controller that keeps no per-packet state.
+    #[cfg(test)]
+    fn debug_tracked_packets(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Base datagram size constant
