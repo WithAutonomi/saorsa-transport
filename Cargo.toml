@@ -263,10 +263,6 @@ windows = { version = "0.62", features = [
 # Note: Using raw libc netlink sockets instead of netlink-packet crates
 # to avoid transitive dependency on unmaintained 'paste' crate
 hex = "0.4"
-[target.'cfg(target_os = "macos")'.dependencies]
-system-configuration = "0.7"
-core-foundation = "0.9"
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
