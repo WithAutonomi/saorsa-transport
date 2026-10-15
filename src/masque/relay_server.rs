@@ -1933,12 +1933,12 @@ impl MasqueRelayServer {
                 svc.shutdown().await;
             }
             // Kept at INFO: rare, and a signal that `max_reservations` is being
-            // hit (the cap may be too low).
+            // hit (the cap may be too low). No port: "MASQUE relay session
+            // created" logs it with the client's IP, so it would join the two.
             tracing::info!(
                 component = "relay_reservation",
                 event = "reservation_evicted",
                 peer = %short_peer_hex(&evicted_key),
-                port = old.port,
                 "evicted least-recently-used relay-port reservation (cap reached)"
             );
         }
@@ -2081,15 +2081,7 @@ impl MasqueRelayServer {
             let guard = self.sessions.read().await;
             guard
                 .values()
-                .map(|s| {
-                    (
-                        s.session_id(),
-                        s.client_address(),
-                        s.peer_id(),
-                        s.stats(),
-                        s.targets(),
-                    )
-                })
+                .map(|s| (s.session_id(), s.client_address(), s.stats(), s.targets()))
                 .collect()
         };
 
@@ -2126,13 +2118,12 @@ impl MasqueRelayServer {
         // keeps a quiet node's log volume at one line per tick.
         let mut ranked: Vec<_> = sessions
             .into_iter()
-            .map(|(id, client, peer, stats, targets)| {
+            .map(|(id, client, stats, targets)| {
                 let to_target = stats.total_bytes_sent();
                 let to_client = stats.total_bytes_received();
                 (
                     id,
                     client,
-                    peer,
                     to_target,
                     to_client,
                     stats.datagrams_forwarded.load(Ordering::Relaxed),
@@ -2140,12 +2131,14 @@ impl MasqueRelayServer {
                     to_target.saturating_add(to_client),
                 )
             })
-            .filter(|row| row.7 > 0)
+            .filter(|row| row.6 > 0)
             .collect();
-        ranked.sort_unstable_by_key(|row| std::cmp::Reverse(row.7));
+        ranked.sort_unstable_by_key(|row| std::cmp::Reverse(row.6));
         ranked.truncate(RELAY_TRAFFIC_SUMMARY_SESSIONS);
 
-        for (session_id, client, peer, to_target, to_client, datagrams, targets, _) in ranked {
+        // The client's peer ID is deliberately left out: pairing it with
+        // `client_addr` would tie a node's identity to its IP in the logs.
+        for (session_id, client, to_target, to_client, datagrams, targets, _) in ranked {
             let mut seen = targets.snapshot();
             seen.truncate(RELAY_TRAFFIC_SUMMARY_TARGETS);
             // Fixed destination slots keep the field schema stable across ticks
@@ -2159,7 +2152,6 @@ impl MasqueRelayServer {
                 target: "saorsa_transport::relay::traffic",
                 session_id,
                 client_addr = %client.map(|a| a.to_string()).unwrap_or_default(),
-                client_peer = %peer.map(|p| short_peer_hex(&p)).unwrap_or_default(),
                 to_target_bytes = to_target,
                 to_client_bytes = to_client,
                 datagrams_to_client = datagrams,
