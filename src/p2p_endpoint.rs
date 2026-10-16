@@ -2656,13 +2656,11 @@ impl P2pEndpoint {
         // Look up the target peer ID from the per-target map. This avoids
         // races when multiple concurrent connections share the same P2pEndpoint.
         let target_peer_id = self.hole_punch_target_peer_ids.get(&target).map(|v| *v);
-        if let Some(ref pid) = target_peer_id {
+        // The target's peer ID is not logged: these lines already name its address.
+        if target_peer_id.is_some() {
             info!(
-                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID {} (dashmap key={})",
-                target,
-                coordinator,
-                hex::encode(&pid[..8]),
-                target
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID (dashmap key={})",
+                target, coordinator, target
             );
         } else {
             info!(

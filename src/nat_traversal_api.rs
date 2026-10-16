@@ -7734,14 +7734,11 @@ impl NatTraversalEndpoint {
         // Use peer ID if provided (works for symmetric NAT), fall back to
         // wire_id_from_addr (works for cone NAT where address is stable).
         let target_wire_id = target_peer_id.unwrap_or_else(|| Self::wire_id_from_addr(target_addr));
+        // The target's peer ID is not logged: this line already names its address.
         info!(
-            "Sending PUNCH_ME_NOW coordination request for {} to coordinator {} (wire_id={}, from_peer_id={}, from_addr={})",
+            "Sending PUNCH_ME_NOW coordination request for {} to coordinator {} (from_addr={})",
             target_addr,
             coordinator,
-            hex::encode(&target_wire_id[..8]),
-            target_peer_id
-                .map(|p| hex::encode(&p[..8]))
-                .unwrap_or_else(|| "none".to_string()),
             target_peer_id.is_none(),
         );
 
