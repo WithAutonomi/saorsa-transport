@@ -193,7 +193,7 @@ nix = { version = "0.31", features = ["resource", "net"], optional = true }
 # Used by the `upnp` feature for best-effort UDP port mapping. The
 # implementation never blocks startup and silently degrades when the
 # router does not support or has disabled UPnP IGD.
-igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"], optional = true }
 
 # BLE transport dependencies (cross-platform, optional)
 # btleplug supports Linux (BlueZ), macOS (Core Bluetooth), and Windows (WinRT)
