@@ -118,6 +118,21 @@ CASES = [
     ("template: rc branch without chore(release) title still enforced", "template",
      {"PR_TITLE": "fix something", "PR_BRANCH": "rc-2026.9.1",
       "PR_BASE": "main", "PR_BODY": "freeform"}, 1),
+    # --- Dependabot exemption (keyed on the PR author, not the branch) ---
+    ("linear: Dependabot PR exempt", "linear",
+     {"PR_AUTHOR": "dependabot[bot]", "PR_TITLE": "chore(deps): bump foo from 1.0.0 to 2.0.0",
+      "PR_BRANCH": "dependabot/cargo/foo-2.0.0"}, 0),
+    ("template: Dependabot PR exempt", "template",
+     {"PR_AUTHOR": "dependabot[bot]", "PR_TITLE": "chore(deps): bump foo from 1.0.0 to 2.0.0",
+      "PR_BRANCH": "dependabot/cargo/foo-2.0.0", "PR_BASE": "main",
+      "PR_BODY": "Bumps [foo](https://github.com/x/foo) from 1.0.0 to 2.0.0."}, 0),
+    ("linear: dependabot/* branch from a person still enforced", "linear",
+     {"PR_AUTHOR": "someone", "PR_BRANCH": "dependabot/cargo/foo-2.0.0"}, 1),
+    ("template: dependabot/* branch from a person still enforced", "template",
+     {"PR_AUTHOR": "someone", "PR_BRANCH": "dependabot/cargo/foo-2.0.0",
+      "PR_BASE": "main", "PR_BODY": "freeform"}, 1),
+    ("linear: look-alike author without [bot] still enforced", "linear",
+     {"PR_AUTHOR": "dependabot", "PR_BRANCH": "x"}, 1),
     # --- pr-template: acceptances ---
     ("template: valid T0 body", "template", {"PR_BASE": "main", "PR_BODY": VALID_BODY}, 0),
     ("template: rc-* base is a no-op pass", "template", {"PR_BASE": "rc-2025.10", "PR_BODY": "anything"}, 0),
@@ -143,7 +158,7 @@ CASES = [
 
 def run(mode, env):
     full = dict(os.environ)
-    for k in ("PR_TITLE", "PR_BODY", "PR_BRANCH", "PR_BASE"):
+    for k in ("PR_TITLE", "PR_BODY", "PR_BRANCH", "PR_BASE", "PR_AUTHOR"):
         full.pop(k, None)
     full.update(env)
     return subprocess.run(

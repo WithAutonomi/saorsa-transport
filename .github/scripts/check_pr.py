@@ -19,8 +19,11 @@ Release-promotion PRs — a 'chore(release):' title from an 'rc-*' head branch,
 the promote step of the release train — are exempt from both checks (V2-1092):
 they are mechanical version-bump PRs with no issue or template of their own.
 
+Dependabot PRs — opened by 'dependabot[bot]' — are exempt from both checks too
+(V2-1537): they are automated dependency bumps with no issue or template.
+
 PR fields are read from the environment (set by the workflow from the event
-payload): PR_TITLE, PR_BODY, PR_BRANCH, PR_BASE.
+payload): PR_TITLE, PR_BODY, PR_BRANCH, PR_BASE, PR_AUTHOR.
 
 This file is duplicated verbatim across the six crate repos; keep them
 identical when updating.
@@ -87,6 +90,13 @@ LINEAR_CLOSES = re.compile(
 RELEASE_TITLE = re.compile(r"^chore\(release\):")
 RC_BRANCH = re.compile(r"^rc-")
 
+# Dependabot PRs self-pass both checks the same way. Keyed on the PR author
+# (pull_request.user.login), the account that opened the PR: the '[bot]' suffix
+# is reserved for GitHub Apps, so no person can open a PR as this login. Not on
+# the branch name (anyone with push access can create a dependabot/* branch) or
+# github.actor (it becomes whoever last pushed to the PR).
+DEPENDABOT_LOGIN = "dependabot[bot]"
+
 # Canonical section headings, exactly as they appear in the template, keyed by
 # their lower-cased form. Used so failure messages name the real heading.
 CANONICAL_HEADINGS = {
@@ -127,6 +137,10 @@ def release_promotion():
     )
 
 
+def dependabot():
+    return env("PR_AUTHOR") == DEPENDABOT_LOGIN
+
+
 def linear_ref(*parts):
     """Return the first Linear URL/key found in the given (comment-free) parts."""
     haystack = "\n".join(parts)
@@ -156,6 +170,8 @@ def check_linear():
             f"✅ linear-link not enforced on release-promotion PRs "
             f"(chore(release) from '{env('PR_BRANCH')}')."
         )
+    if dependabot():
+        ok(f"✅ linear-link not enforced on Dependabot PRs (author {DEPENDABOT_LOGIN}).")
 
     # Strip comments from the body so the template's own example does not count.
     closes = LINEAR_CLOSES.search(strip_comments(env("PR_BODY")))
@@ -196,6 +212,8 @@ def check_template():
             f"✅ pr-template not enforced on release-promotion PRs "
             f"(chore(release) from '{env('PR_BRANCH')}')."
         )
+    if dependabot():
+        ok(f"✅ pr-template not enforced on Dependabot PRs (author {DEPENDABOT_LOGIN}).")
 
     base = env("PR_BASE")
     if base and base != "main":
