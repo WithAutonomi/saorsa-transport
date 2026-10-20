@@ -41,6 +41,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use stun::attributes::ATTR_USERNAME;
 use stun::message::{Message as StunMessage, is_message as is_stun_message};
 use thiserror::Error;
@@ -54,7 +55,9 @@ use webrtc_stack::api::{APIBuilder, interceptor_registry::register_default_inter
 use webrtc_stack::data::data_channel::DataChannel;
 use webrtc_stack::data_channel::RTCDataChannel;
 use webrtc_stack::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
+use webrtc_stack::dtls_transport::RTCDtlsTransport;
 use webrtc_stack::dtls_transport::dtls_role::DTLSRole;
+use webrtc_stack::dtls_transport::dtls_transport_state::RTCDtlsTransportState;
 use webrtc_stack::ice::mdns::MulticastDnsMode;
 use webrtc_stack::ice::network_type::NetworkType;
 use webrtc_stack::ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
@@ -63,6 +66,7 @@ use webrtc_stack::interceptor::registry::Registry;
 use webrtc_stack::peer_connection::RTCPeerConnection;
 use webrtc_stack::peer_connection::certificate::RTCCertificate;
 use webrtc_stack::peer_connection::configuration::RTCConfiguration;
+use webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc_stack::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_stack::util::{Conn, Error as WebRtcUtilError};
 
@@ -84,6 +88,15 @@ pub const ICE_CREDENTIAL_PREFIX: &str = ICE_CREDENTIAL_PREFIX_V2;
 pub const MAX_DATA_CHANNEL_MESSAGE_SIZE: usize = 16 * 1024;
 
 const MAX_PENDING_ASSOCIATIONS: usize = 256;
+
+// How long teardown waits for a pending DTLS handshake to end before closing.
+const PENDING_HANDSHAKE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+// A plaintext DTLS 1.2 close_notify alert record: content type 21 (alert),
+// version 254.253, epoch 0, sequence number 2^48 - 1, length 2, then level 1
+// (warning) and description 0 (close_notify). A browser's handshake records
+// count up from zero, so the replay window has not seen the last number.
+const DTLS_CLOSE_NOTIFY: [u8; 15] = [21, 254, 253, 0, 0, 255, 255, 255, 255, 255, 255, 0, 2, 1, 0];
 
 /// Resource limits applied after address validation and before RTC allocation.
 #[derive(Clone, Copy, Debug)]
@@ -416,7 +429,7 @@ struct AssociationOwner {
     mux: Arc<DirectUdpMux>,
     credential: String,
     remote_addr: SocketAddr,
-    peer: Option<Arc<RTCPeerConnection>>,
+    peer: Option<(Arc<RTCPeerConnection>, UDPMuxConn)>,
     generation: Option<u64>,
 }
 
@@ -426,16 +439,69 @@ impl Drop for AssociationOwner {
             .release_pending(self.remote_addr, &self.credential, self.generation);
         let mux = Arc::clone(&self.mux);
         let credential = self.credential.clone();
+        let remote_addr = self.remote_addr;
         let peer = self.peer.take();
         let generation = self.generation;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Some(peer) = peer {
-                    let _ = peer.close().await;
+                if let Some((peer, ice)) = peer {
+                    let _ = close_inbound_peer(&peer, &ice, remote_addr).await;
                 }
                 mux.remove_owned_connection(&credential, generation).await;
             });
         }
+    }
+}
+
+/// Close an inbound peer connection without stranding its DTLS handshake.
+///
+/// webrtc 0.14 cannot cancel a DTLS server handshake that is still waiting for
+/// the browser: `RTCDtlsTransport::stop` only closes a finished connection, and
+/// stopping ICE drops the DTLS endpoint without closing its buffer. The
+/// handshake and its reader and writer tasks then wait forever and keep the
+/// peer connection's internals alive, about 62 KiB for every browser that
+/// gives up after ICE connects. While ICE still delivers packets, hand the
+/// handshake a close_notify from the browser's address so it fails and
+/// releases everything, then close as for any failed connection.
+async fn close_inbound_peer(
+    peer: &RTCPeerConnection,
+    ice: &UDPMuxConn,
+    remote_addr: SocketAddr,
+) -> Result<(), webrtc_stack::Error> {
+    let dtls = peer.dtls_transport();
+    // A start that already passed the New check is handled below only if the
+    // next read sees Connecting; ADR-017 records the instant in which it does
+    // not.
+    stop_unstarted_dtls(&dtls).await;
+    if dtls.state() == RTCDtlsTransportState::Connecting {
+        match ice.write_packet(&DTLS_CLOSE_NOTIFY, remote_addr).await {
+            Ok(()) => {
+                let ended = tokio::time::timeout(PENDING_HANDSHAKE_CLOSE_TIMEOUT, async {
+                    while dtls.state() == RTCDtlsTransportState::Connecting {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                if ended.is_err() {
+                    tracing::debug!(%remote_addr, "pending DTLS handshake outlived close_notify");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%remote_addr, %error, "failed to end pending DTLS handshake");
+            }
+        }
+    }
+    peer.close().await
+}
+
+/// Stop a DTLS transport whose handshake has not started.
+///
+/// A handshake only starts from New, so ICE connecting after this, for
+/// example while the peer connection closes, can no longer start one that
+/// nothing would end.
+async fn stop_unstarted_dtls(dtls: &RTCDtlsTransport) {
+    if dtls.state() == RTCDtlsTransportState::New {
+        let _ = dtls.stop().await;
     }
 }
 
@@ -444,6 +510,7 @@ pub struct WebRtcDirectConnection {
     diagnostics: ConnectionTracker,
     remote_addr: SocketAddr,
     peer_connection: Arc<RTCPeerConnection>,
+    ice: UDPMuxConn,
     incoming: mpsc::Receiver<WebRtcDataChannel>,
     closed: watch::Receiver<bool>,
     owner: Option<AssociationOwner>,
@@ -482,8 +549,7 @@ impl WebRtcDirectConnection {
 
     /// Close the WebRTC association.
     pub async fn close(&self) -> Result<(), WebRtcDirectError> {
-        self.peer_connection
-            .close()
+        close_inbound_peer(&self.peer_connection, &self.ice, self.remote_addr)
             .await
             .map_err(|error| WebRtcDirectError::Session(error.to_string()))
     }
@@ -770,13 +836,14 @@ async fn create_inbound_connection(
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?,
     );
 
-    owner.peer = Some(Arc::clone(&peer_connection));
+    owner.peer = Some((Arc::clone(&peer_connection), initial_conn.clone()));
     let setup_peer = Arc::downgrade(&peer_connection);
+    let setup_ice = initial_conn.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         if let Some(peer) = setup_peer.upgrade() {
             if peer.connection_state() != webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected {
-                let _ = peer.close().await;
+                let _ = close_inbound_peer(&peer, &setup_ice, remote_addr).await;
             }
         }
     });
@@ -784,11 +851,26 @@ async fn create_inbound_connection(
     register_data_channel_handler(&peer_connection, incoming_tx, diagnostics.observer());
     let (closed_tx, closed) = watch::channel(false);
     let observer = diagnostics.observer();
+    // Teardown stops a DTLS transport that is still New, and webrtc then reports
+    // Connected if ICE connects before the close completes. Only a peer
+    // connection whose DTLS handshake completed counts as connected: the
+    // transport stores the remote certificate when it completes, before
+    // publishing Connected, and never clears it.
+    let dtls = Arc::downgrade(&peer_connection.dtls_transport());
     peer_connection.on_peer_connection_state_change(Box::new(move |state| {
         let closed_tx = closed_tx.clone();
-        observer.transition(state);
+        let observer = observer.clone();
+        let dtls = dtls.clone();
         Box::pin(async move {
-            use webrtc_stack::peer_connection::peer_connection_state::RTCPeerConnectionState;
+            let handshake_done = match dtls.upgrade() {
+                Some(dtls) if state == RTCPeerConnectionState::Connected => {
+                    !dtls.get_remote_certificate().await.is_empty()
+                }
+                _ => false,
+            };
+            if state != RTCPeerConnectionState::Connected || handshake_done {
+                observer.transition(state);
+            }
             if matches!(
                 state,
                 RTCPeerConnectionState::Failed
@@ -820,6 +902,7 @@ async fn create_inbound_connection(
         remote_addr,
         owner: None,
         peer_connection,
+        ice: initial_conn,
         incoming,
         closed,
     })
@@ -1513,9 +1596,333 @@ fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::poll_fn;
+    use std::pin::pin;
+    use std::task::Poll;
     use stun::agent::TransactionId;
+    use stun::attributes::ATTR_USE_CANDIDATE;
     use stun::message::{BINDING_REQUEST, BINDING_SUCCESS};
     use stun::textattrs::Username;
+    use tokio::task::JoinSet;
+    use webrtc_stack::ice_transport::ice_connection_state::RTCIceConnectionState;
+    use webrtc_stack::peer_connection::signaling_state::RTCSignalingState;
+
+    // Relay STUN both ways and drop everything else, from one upstream port.
+    // ICE connects and stays up, but the listener's DTLS server never sees a
+    // ClientHello: what a browser that gives up after ICE leaves behind.
+    // While `nominate` is false, the client's nominating checks are dropped as
+    // well, so ICE does not connect and DTLS does not start.
+    async fn spawn_stun_only_relay(
+        listener: SocketAddr,
+        nominate: Arc<AtomicBool>,
+    ) -> std::io::Result<(SocketAddr, JoinSet<()>)> {
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let relay_addr = front.local_addr()?;
+        let client = Arc::new(parking_lot::Mutex::new(None));
+        let mut tasks = JoinSet::new();
+        {
+            let (front, back, client) =
+                (Arc::clone(&front), Arc::clone(&back), Arc::clone(&client));
+            tasks.spawn(async move {
+                let mut buffer = [0u8; 2048];
+                while let Ok((length, source)) = front.recv_from(&mut buffer).await {
+                    *client.lock() = Some(source);
+                    if let Some(packet) = buffer
+                        .get(..length)
+                        .filter(|packet| is_stun_message(packet))
+                        .filter(|packet| nominate.load(Ordering::Relaxed) || !is_nomination(packet))
+                    {
+                        let _ = back.send_to(packet, listener).await;
+                    }
+                }
+            });
+        }
+        tasks.spawn(async move {
+            let mut buffer = [0u8; 2048];
+            while let Ok((length, _)) = back.recv_from(&mut buffer).await {
+                let packet = buffer
+                    .get(..length)
+                    .filter(|packet| is_stun_message(packet));
+                let target = *client.lock();
+                if let (Some(packet), Some(target)) = (packet, target) {
+                    let _ = front.send_to(packet, target).await;
+                }
+            }
+        });
+        Ok((relay_addr, tasks))
+    }
+
+    fn is_nomination(packet: &[u8]) -> bool {
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(packet).is_ok() && message.contains(ATTR_USE_CANDIDATE)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Teardown {
+        // The application closes the connection before ICE connects, as
+        // ant-node does when it rejects one on accept. DTLS never starts.
+        CloseOnAccept,
+        // The application closes the connection, as ant-node does on errors.
+        Close,
+        // The application drops the connection without closing it.
+        Drop,
+        // Nobody acts until the listener's setup deadline closes it.
+        SetupDeadline,
+        // The application closes the connection twice at once, then drops it.
+        ConcurrentClose,
+        // The application gives up on a close part-way, then drops the
+        // connection, so the drop's teardown runs where the close stopped.
+        CancelledClose,
+        // The setup deadline's teardown runs while the application's close is
+        // part-way through.
+        CloseDuringSetupDeadline,
+    }
+
+    // A listener with one accepted connection from a native client behind a
+    // STUN-only relay, which forwards nominations while `nominate` is true.
+    async fn accept_through_stun_only_relay(
+        nominate: Arc<AtomicBool>,
+    ) -> anyhow::Result<(
+        WebRtcDirectListener,
+        WebRtcDirectConnection,
+        JoinSet<()>,
+        JoinSet<()>,
+    )> {
+        let certificate = WebRtcCertificate::generate()?;
+        let certificate_hash = certificate.sha256_digest()?;
+        let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse()?, certificate).await?;
+        let (relay, relay_tasks) = spawn_stun_only_relay(listener.local_addr(), nominate).await?;
+        let endpoint = WebRtcDirectAddr::new(
+            relay,
+            crate::transport::WebRtcCertificateHash::new(certificate_hash),
+        )?;
+        let mut client = JoinSet::new();
+        client.spawn(async move {
+            let _ = WebRtcDirectClient::dial(&endpoint, "pending-dtls-test").await;
+        });
+        let connection = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        Ok((listener, connection, relay_tasks, client))
+    }
+
+    async fn assert_teardown_releases_pending_dtls_handshake(
+        teardown: Teardown,
+    ) -> anyhow::Result<()> {
+        let nominate = !matches!(teardown, Teardown::CloseOnAccept);
+        let (_listener, connection, _relay, _client) =
+            accept_through_stun_only_relay(Arc::new(AtomicBool::new(nominate))).await?;
+        let dtls = connection.peer_connection.dtls_transport();
+        if nominate {
+            // ICE is connected and the DTLS server is waiting for a ClientHello.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while dtls.state() != RTCDtlsTransportState::Connecting {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+        } else {
+            // Nothing nominated a pair, so ICE has not connected and DTLS has
+            // not started.
+            assert_eq!(dtls.state(), RTCDtlsTransportState::New);
+        }
+        let transport = Arc::downgrade(&dtls);
+        drop(dtls);
+
+        match teardown {
+            Teardown::CloseOnAccept | Teardown::Close => connection.close().await?,
+            Teardown::Drop => {}
+            Teardown::SetupDeadline => {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while connection.peer_connection.connection_state()
+                        != RTCPeerConnectionState::Closed
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+            }
+            Teardown::ConcurrentClose => {
+                let (first, second) = tokio::join!(connection.close(), connection.close());
+                first?;
+                second?;
+            }
+            Teardown::CancelledClose => {
+                // One poll of the close delivers the close_notify and leaves
+                // it waiting for the handshake to end. Abandon it there.
+                let mut close = pin!(connection.close());
+                let first = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+                assert!(
+                    first.is_pending(),
+                    "close finished on its first poll, so nothing was abandoned"
+                );
+                // Nothing else delivers a close_notify before the drop, so the
+                // handshake ending shows the abandoned close delivered one.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while connection.peer_connection.dtls_transport().state()
+                        == RTCDtlsTransportState::Connecting
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+            }
+            Teardown::CloseDuringSetupDeadline => {
+                // Suspend a close in its wait for the handshake to end, as in
+                // CancelledClose, and finish it only once the setup deadline's
+                // teardown has begun closing the peer connection: webrtc marks
+                // the signaling state Closed before the first await of close.
+                let mut close = pin!(connection.close());
+                let first = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "close finished on its first poll");
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while connection.peer_connection.signaling_state() != RTCSignalingState::Closed
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+                close.await?;
+            }
+        }
+        drop(connection);
+
+        // The handshake future owns the peer connection's internals. If it
+        // never ends, neither does the transport it is negotiating for.
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while transport.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "{teardown:?} left the pending DTLS handshake holding its peer connection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_notify_record_decodes_as_a_plaintext_close_notify() -> anyhow::Result<()> {
+        use webrtc_stack::dtls::content::{Content, ContentType};
+        use webrtc_stack::dtls::record_layer::RecordLayer;
+        use webrtc_stack::dtls::record_layer::record_layer_header::{
+            MAX_SEQUENCE_NUMBER, PROTOCOL_VERSION1_2,
+        };
+
+        let record = RecordLayer::unmarshal(&mut DTLS_CLOSE_NOTIFY.as_slice())?;
+        let header = record.record_layer_header;
+        assert_eq!(header.content_type, ContentType::Alert);
+        assert_eq!(header.protocol_version, PROTOCOL_VERSION1_2);
+        assert_eq!(header.epoch, 0);
+        assert_eq!(header.sequence_number, MAX_SEQUENCE_NUMBER);
+        let Content::Alert(alert) = record.content else {
+            anyhow::bail!("expected an alert, got {:?}", record.content);
+        };
+        assert_eq!(alert.to_string(), "Alert LevelWarning: CloseNotify");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_on_accept_releases_dtls_transport() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::CloseOnAccept).await
+    }
+
+    #[tokio::test]
+    async fn close_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::Close).await
+    }
+
+    #[tokio::test]
+    async fn drop_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::Drop).await
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::SetupDeadline).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::ConcurrentClose).await
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::CancelledClose).await
+    }
+
+    #[tokio::test]
+    async fn close_during_setup_deadline_releases_pending_dtls_handshake() -> anyhow::Result<()> {
+        assert_teardown_releases_pending_dtls_handshake(Teardown::CloseDuringSetupDeadline).await
+    }
+
+    // Teardown stops a DTLS transport that is still New before it closes the
+    // peer connection. ICE can connect in between; it must not start a
+    // handshake, and webrtc's Connected for ICE connected with DTLS closed must
+    // not count as a successful connection.
+    #[tokio::test]
+    async fn ice_connecting_after_dtls_stop_starts_no_handshake() -> anyhow::Result<()> {
+        let nominate = Arc::new(AtomicBool::new(false));
+        let (listener, connection, _relay, _client) =
+            accept_through_stun_only_relay(Arc::clone(&nominate)).await?;
+        let diagnostics = listener.diagnostics();
+        let peer = Arc::clone(&connection.peer_connection);
+        let dtls = peer.dtls_transport();
+        assert_eq!(dtls.state(), RTCDtlsTransportState::New);
+
+        stop_unstarted_dtls(&dtls).await;
+        nominate.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peer.ice_connection_state() != RTCIceConnectionState::Connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // A stopped transport stays Closed, so this wait only bounds how long a
+        // wrongly started handshake has to show; webrtc tries the DTLS start
+        // right after ICE connects.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            dtls.state(),
+            RTCDtlsTransportState::Closed,
+            "ICE connecting after the stop started a DTLS handshake"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peer.connection_state() != RTCPeerConnectionState::Connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+
+        // webrtc runs each call of the state handler to completion under one
+        // lock, and close publishes Closed through it only after stopping the
+        // transports, so once close returns the diagnostics have seen the
+        // Connected call too. The Closed count shows the handler recorded the
+        // close, not the connection's drop below.
+        connection.close().await?;
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.closed_connections, 1);
+        assert_eq!(
+            snapshot.successful_connections, 0,
+            "ICE connected with DTLS stopped counted as a successful connection"
+        );
+        assert_eq!(snapshot.failed_connections, 1);
+
+        let transport = Arc::downgrade(&dtls);
+        drop((dtls, peer, connection));
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while transport.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the closed connection kept its DTLS transport"
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_only_supported_saorsa_profile_credentials() {
