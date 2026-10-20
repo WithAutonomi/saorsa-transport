@@ -99,10 +99,12 @@ records count up from zero, so the replay window accepts it.
 - The reader answers the close_notify with its own, so the listener sends one
   15-byte datagram toward the browser when it closes an association whose DTLS
   transport is `Connecting`. A transport still in `New` sends nothing.
-- Teardown of such an association waits for the handshake to end: 12 to 19 ms
-  in local browser runs, at most one second. If the close_notify cannot be
-  written, or the handshake outlives that second, the close goes ahead and the
-  handshake stays pending, as before this change.
+- Teardown of such an association now waits for the handshake to end before
+  calling `close`: 12 to 19 ms in local browser runs. The one-second cap covers
+  that wait only. The write before it does not wait for buffer space, and
+  `close` itself takes as long as it did before this change. If the
+  close_notify cannot be written, or the handshake outlives that second, the
+  close goes ahead and the handshake stays pending, as before this change.
 - Associations with a completed handshake close as before. One whose DTLS
   never started is stopped before the peer connection closes, which ends the
   same way. No wire-format, API or configuration change, and no change to
@@ -132,15 +134,20 @@ fail on its own, but it changes the browser profile.
 
 ## References
 
-- `src/webrtc/direct.rs`: `close_inbound_peer`, `DTLS_CLOSE_NOTIFY`,
-  `create_inbound_connection` (setup deadline), `AssociationOwner`,
-  `WebRtcDirectConnection::close`
+- `src/webrtc/direct.rs`: `close_inbound_peer`, `stop_unstarted_dtls`,
+  `DTLS_CLOSE_NOTIFY`, `create_inbound_connection` (setup deadline),
+  `AssociationOwner`, `WebRtcDirectConnection::close`
 - webrtc 0.14.0: `dtls_transport/mod.rs` (`start`, `stop`), `mux/mod.rs`
   (`Mux::close`), `peer_connection/operation/mod.rs` (`Operations::close`);
   dtls 0.13.0: `conn/mod.rs` (`DTLSConn::new`, `read_and_buffer`)
-- Tests: `close_on_accept_releases_dtls_transport`,
+- Tests (a native client behind a relay that drops DTLS):
+  `close_on_accept_releases_dtls_transport`,
   `close_releases_pending_dtls_handshake`,
   `drop_releases_pending_dtls_handshake`,
-  `setup_deadline_releases_pending_dtls_handshake` (a native client behind a
-  relay that drops DTLS) and
+  `setup_deadline_releases_pending_dtls_handshake`,
+  `concurrent_close_releases_pending_dtls_handshake`,
+  `cancelled_close_releases_pending_dtls_handshake`,
+  `close_during_setup_deadline_releases_pending_dtls_handshake` and
+  `ice_connecting_after_dtls_stop_starts_no_handshake` (the stop in `New` and
+  the diagnostics check); plus
   `close_notify_record_decodes_as_a_plaintext_close_notify`
