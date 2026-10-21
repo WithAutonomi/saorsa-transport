@@ -335,17 +335,6 @@ cargo test --test nat_traversal -- with_loss
 cargo test --test nat_traversal -- matrix
 ```
 
-### Compliance Tests
-
-Verify protocol compliance:
-
-```bash
-# Run IETF compliance tests
-cargo run --bin compliance-test -- \
-    --spec draft-ietf-quic-address-discovery-00 \
-    --spec draft-seemann-quic-nat-traversal-02
-```
-
 ## Debugging
 
 ### Enable Protocol Logging
