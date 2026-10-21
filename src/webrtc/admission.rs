@@ -9,15 +9,18 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use stun::agent::TransactionId;
 use stun::attributes::{ATTR_ICE_CONTROLLED, ATTR_PRIORITY, ATTR_USERNAME};
+use stun::error_code::{CODE_ALLOC_QUOTA_REACHED, ErrorCodeAttribute};
 use stun::fingerprint::FINGERPRINT;
 use stun::integrity::MessageIntegrity;
-use stun::message::{BINDING_REQUEST, BINDING_SUCCESS, Message, Setter};
+use stun::message::{BINDING_ERROR, BINDING_REQUEST, BINDING_SUCCESS, Message, Setter};
 use stun::textattrs::Username;
 use tokio::time::Instant;
 
 const PROBE_LIFETIME: Duration = Duration::from_secs(2);
 const MAX_PROBES: usize = 256;
 const MAX_PROBES_PER_IP: usize = 4;
+const CAPACITY_REASON: &[u8] = b"Insufficient Capacity";
+const SOURCE_QUOTA_REASON: &[u8] = b"Source Quota Reached";
 
 struct ReturnedProof {
     message: Message,
@@ -48,6 +51,61 @@ pub(super) enum Decision {
     Ignore,
     Challenge(Vec<u8>),
     Admit(IncomingAssociation),
+}
+
+/// Why a proven association found no free slot.
+///
+/// Both refusals carry 486 (Allocation Quota Reached). A 4xx error ends the
+/// transaction (RFC 8489 §6.3.4), so an ICE agent fails the candidate pair at
+/// once (RFC 8445 §7.2.5.2.4) instead of retrying until ICE times out; a 5xx
+/// such as 508 may be retried. Browsers do not expose STUN errors to
+/// applications, so the reason phrase only makes captures readable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// Every listener association slot or pending-queue entry is in use.
+    Capacity,
+    /// The source's IPv4 address or IPv6 /64 already holds its full share.
+    SourceQuota,
+}
+
+impl Refusal {
+    fn reason(self) -> &'static [u8] {
+        match self {
+            Self::Capacity => CAPACITY_REASON,
+            Self::SourceQuota => SOURCE_QUOTA_REASON,
+        }
+    }
+}
+
+/// Build the STUN error response that refuses a proven Binding request.
+///
+/// The response echoes the request's transaction and carries
+/// MESSAGE-INTEGRITY under the listener credential that authenticated the
+/// request, so the browser accepts it as the answer to its own check. Like
+/// challenges, it never exceeds the request it answers.
+pub(super) fn refusal_response(
+    request: &[u8],
+    server_credential: &str,
+    refusal: Refusal,
+) -> Option<Vec<u8>> {
+    let mut incoming = Message::new();
+    incoming.unmarshal_binary(request).ok()?;
+    let mut response = Message::new();
+    response
+        .build(&[
+            Box::new(incoming.transaction_id),
+            Box::new(BINDING_ERROR),
+            Box::new(ErrorCodeAttribute {
+                code: CODE_ALLOC_QUOTA_REACHED,
+                reason: refusal.reason().to_vec(),
+            }),
+            Box::new(MessageIntegrity::new_short_term_integrity(
+                server_credential.to_string(),
+            )),
+            Box::new(FINGERPRINT),
+        ])
+        .ok()?;
+    (response.raw.len() <= request.len()).then_some(response.raw)
 }
 
 impl Admission {
@@ -434,6 +492,42 @@ pub(super) mod tests {
             admission.receive(&message.raw, source, now),
             Decision::Admit(_)
         ));
+    }
+
+    #[test]
+    fn refusal_answers_the_request_under_the_listener_credential() {
+        let password = "browserPassword0123456789";
+        let packet = request(password);
+        let server = format!("{}{}", super::super::ICE_CREDENTIAL_PREFIX_V2, password);
+        let mut original = Message::new();
+        original.unmarshal_binary(&packet).unwrap();
+        for (refusal, reason) in [
+            (Refusal::Capacity, CAPACITY_REASON),
+            (Refusal::SourceQuota, SOURCE_QUOTA_REASON),
+        ] {
+            let response = refusal_response(&packet, &server, refusal).unwrap();
+            assert!(response.len() <= packet.len());
+            let mut decoded = Message::new();
+            decoded.unmarshal_binary(&response).unwrap();
+            assert_eq!(decoded.typ, BINDING_ERROR);
+            assert_eq!(decoded.transaction_id, original.transaction_id);
+            let mut error = ErrorCodeAttribute::default();
+            stun::message::Getter::get_from(&mut error, &decoded).unwrap();
+            assert_eq!(error.code.0, CODE_ALLOC_QUOTA_REACHED.0);
+            assert_eq!(error.reason, reason);
+            FINGERPRINT.check(&decoded).unwrap();
+            MessageIntegrity::new_short_term_integrity(server.clone())
+                .check(&mut decoded)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn unparseable_requests_are_never_refused() {
+        let packet = request("browserPassword0123456789");
+        assert!(
+            refusal_response(&packet[..packet.len() / 2], "server", Refusal::Capacity).is_none()
+        );
     }
 
     #[test]
