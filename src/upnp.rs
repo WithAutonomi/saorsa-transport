@@ -484,10 +484,9 @@ mod backend {
     }
 
     async fn discover_gateway(timeout: Duration) -> Option<GenericGateway<Tokio>> {
-        let opts = SearchOptions {
-            timeout: Some(timeout),
-            ..Default::default()
-        };
+        // `SearchOptions` is `#[non_exhaustive]` since igd-next 0.18.
+        let mut opts = SearchOptions::default();
+        opts.timeout = Some(timeout);
         match tokio::time::timeout(timeout, search_gateway(opts)).await {
             Ok(Ok(gateway)) => Some(gateway),
             Ok(Err(err)) => {
