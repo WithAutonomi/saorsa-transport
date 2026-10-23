@@ -145,7 +145,7 @@ chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["
 serde_bytes = { version = "0.11", optional = true }
 # Core dependencies
 async-trait = { version = "0.1", optional = true }
-base64 = "0.22"
+base64 = "0.23"
 bytes = { version = ">=1.11.1", optional = true }
 enum_dispatch = { version = "0.3", optional = true }
 rustc-hash = { version = "2", optional = true }
