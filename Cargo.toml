@@ -141,7 +141,7 @@ webrtc = [
 
 [dependencies]
 web-time = { version = "1.1", optional = true }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"], optional = true }
 serde_bytes = { version = "0.11", optional = true }
 # Core dependencies
 async-trait = { version = "0.1", optional = true }
