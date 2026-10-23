@@ -213,14 +213,16 @@ impl Endpoint {
         // Queue the PunchMeNow frame to the connection via a connection event
         let event = ConnectionEvent(ConnectionEventInner::QueuePunchMeNow(relayed_frame));
 
+        // The connection handle is not logged: the caller has just logged the
+        // target's peer ID, and other lines pair handles with addresses.
         if self.connections.get(ch.0).is_some() {
             // Store the event to be processed by the high-level layer
             // The high-level endpoint will drain these and send to the appropriate connections
-            tracing::info!("Queueing PUNCH_ME_NOW relay event for connection {:?}", ch);
+            tracing::info!("Queueing PUNCH_ME_NOW relay event");
             self.pending_relay_events.push((ch, event));
             true
         } else {
-            tracing::warn!("Cannot relay PUNCH_ME_NOW: connection {:?} not found", ch);
+            tracing::warn!("Cannot relay PUNCH_ME_NOW: target connection not found");
             false
         }
     }
@@ -346,13 +348,11 @@ impl Endpoint {
 
                 // Primary: look up by authenticated peer ID
                 let found = if let Some(handle) = self.lookup_peer_connection(&peer_id) {
-                    let remote = self.connections[handle.0].addresses.remote;
                     tracing::info!(
-                        "Found target peer {} via peer ID lookup (remote={})",
-                        hex::encode(&target_peer_id[..8]),
-                        remote
+                        "Found target peer {} via peer ID lookup",
+                        hex::encode(&target_peer_id[..8])
                     );
-                    Some((handle, remote))
+                    Some(handle)
                 } else {
                     // Fallback: wire_id address matching (backward compat)
                     tracing::debug!(
@@ -361,23 +361,21 @@ impl Endpoint {
                     self.connections.iter().find_map(|(idx, meta)| {
                         let wire_id = wire_id_from_addr(meta.addresses.remote);
                         if wire_id == target_peer_id {
-                            Some((ConnectionHandle(idx), meta.addresses.remote))
+                            Some(ConnectionHandle(idx))
                         } else {
                             None
                         }
                     })
                 };
 
-                if let Some((target_ch, target_addr)) = found {
+                // Neither the target's address nor its connection handle is
+                // logged: the target's peer ID was logged just above.
+                if let Some(target_ch) = found {
                     if self.relay_frame_to_connection(target_ch, punch_me_now) {
                         self.relay_stats.requests_relayed += 1;
-                        tracing::info!("Relayed PUNCH_ME_NOW to {} via peer lookup", target_addr);
+                        tracing::info!("Relayed PUNCH_ME_NOW to target peer");
                     } else {
-                        tracing::warn!(
-                            "Failed to relay PUNCH_ME_NOW to connection {:?} for {}",
-                            target_ch,
-                            target_addr
-                        );
+                        tracing::warn!("Failed to relay PUNCH_ME_NOW to target peer");
                     }
                 } else {
                     let known_peers: Vec<String> = self

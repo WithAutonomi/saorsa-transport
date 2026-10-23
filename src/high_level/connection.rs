@@ -747,9 +747,10 @@ impl Connection {
             return Err(crate::ConnectionError::LocallyClosed);
         }
 
+        // The target's peer ID is not logged: the caller has just logged the
+        // target's address.
         tracing::info!(
-            "send_nat_punch_via_relay: connection alive, queuing frame (target_peer={}, remote={})",
-            hex::encode(&target_peer_id[..8]),
+            "send_nat_punch_via_relay: connection alive, queuing frame (remote={})",
             conn.inner.remote_address(),
         );
 

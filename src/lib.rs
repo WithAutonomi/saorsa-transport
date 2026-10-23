@@ -308,7 +308,19 @@ pub mod terminal_ui;
 
 // Compliance validation framework
 /// IETF compliance validation tools
+///
+/// Deprecated, to be removed in a future breaking release (V2-1658). The
+/// validators run `cargo test` in the caller's working directory and mostly
+/// return hard-coded results, so they give no real compliance signal.
+// `not(test)`: the test harness references the module's `#[test]` fns from
+// outside it, which would trip the deprecation lint on our own test build.
 #[cfg(feature = "native")]
+#[cfg_attr(
+    not(test),
+    deprecated(
+        note = "compliance_validator gives no real compliance signal and will be removed in a future breaking release; there is no replacement"
+    )
+)]
 pub mod compliance_validator;
 
 // Comprehensive logging system

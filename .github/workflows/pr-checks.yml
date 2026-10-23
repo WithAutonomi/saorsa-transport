@@ -26,6 +26,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_BASE: ${{ github.base_ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: python3 .github/scripts/check_pr.py linear
 
   pr-template:
@@ -39,6 +40,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_BASE: ${{ github.base_ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: python3 .github/scripts/check_pr.py template
 
   self-test:

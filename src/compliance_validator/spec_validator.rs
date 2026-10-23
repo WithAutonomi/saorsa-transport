@@ -324,72 +324,45 @@ mod tests {
     use super::*;
     use crate::compliance_validator::{RequirementCategory, RequirementLevel};
 
+    // Sections whose check spawns a nested `cargo test` (RFC9000 4.1/19.3, address
+    // discovery 3.1, NAT traversal 4.1) aren't validated here: the nested build can
+    // hang the outer test run (V2-1656).
+
     #[test]
     fn test_rfc9000_validator() {
         let validator = Rfc9000Validator;
         assert_eq!(validator.spec_id(), "RFC9000");
-
-        let req = ComplianceRequirement {
-            spec_id: "RFC9000".to_string(),
-            section: "4.1".to_string(),
-            level: RequirementLevel::Must,
-            description: "Test requirement".to_string(),
-            category: RequirementCategory::TransportParameters,
-        };
-
-        let result = validator.validate(&req);
-        assert!(!result.evidence.is_empty());
     }
 
     #[test]
     fn test_address_discovery_validator() {
         let validator = AddressDiscoveryValidator;
         assert_eq!(validator.spec_id(), "draft-ietf-quic-address-discovery-00");
-
-        let req = ComplianceRequirement {
-            spec_id: "draft-ietf-quic-address-discovery-00".to_string(),
-            section: "3.1".to_string(),
-            level: RequirementLevel::Must,
-            description: "Sequence numbers".to_string(),
-            category: RequirementCategory::AddressDiscovery,
-        };
-
-        let result = validator.validate(&req);
-        assert!(result.compliant);
     }
 
     #[test]
     fn test_nat_traversal_validator() {
         let validator = NatTraversalValidator;
         assert_eq!(validator.spec_id(), "draft-seemann-quic-nat-traversal-02");
-
-        let req = ComplianceRequirement {
-            spec_id: "draft-seemann-quic-nat-traversal-02".to_string(),
-            section: "4.1".to_string(),
-            level: RequirementLevel::Must,
-            description: "Clients MUST send empty".to_string(),
-            category: RequirementCategory::NatTraversal,
-        };
-
-        let result = validator.validate(&req);
-        assert!(result.compliant);
     }
 
     #[test]
     fn test_composite_validator() {
         let validator = QuicComplianceValidator::new();
 
-        // Test RFC9000
+        // Test RFC9000: routed to its validator, which has no check for 1.1
         let req = ComplianceRequirement {
             spec_id: "RFC9000".to_string(),
-            section: "4.1".to_string(),
+            section: "1.1".to_string(),
             level: RequirementLevel::Must,
             description: "Test".to_string(),
-            category: RequirementCategory::TransportParameters,
+            category: RequirementCategory::Transport,
         };
 
         let result = validator.validate(&req);
         assert_eq!(result.requirement.spec_id, "RFC9000");
+        assert_eq!(result.details, "Manual validation required");
+        assert!(!result.compliant);
 
         // Test unknown spec
         let req = ComplianceRequirement {

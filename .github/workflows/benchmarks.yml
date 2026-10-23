@@ -1,22 +1,12 @@
-# Benchmarks - Performance testing, profiling, and regression detection
-# Runs Criterion benchmarks, generates flamegraphs, and tracks performance history
+# Benchmarks - Performance testing and profiling
+# Runs Criterion benchmarks weekly or on demand and uploads the results as artifacts.
+# Not run on pull requests (V2-1642): ~13 min of runner time per PR for no signal.
 
 name: Benchmarks
 
 on:
-  pull_request:
-    branches: [master, main, "rc-*"]
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "benches/**"
   workflow_dispatch:
     inputs:
-      baseline:
-        description: 'Baseline commit/tag to compare against'
-        required: false
-        type: string
       run_profiling:
         description: 'Run profiling (flamegraph, memory analysis)'
         type: boolean
@@ -29,11 +19,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Required for posting comments on PRs
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
   benchmark:
@@ -81,82 +68,6 @@ jobs:
             benchmark-results.json
             benchmark-report.md
             target/criterion/
-
-      - name: Download baseline benchmarks
-        if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v24
-        with:
-          workflow: benchmarks.yml
-          branch: ${{ github.base_ref }}
-          name: benchmark-results-.*
-          name_is_regexp: true
-          path: baseline-benchmarks
-          if_no_artifact_found: warn
-
-      - name: Compare benchmarks
-        if: github.event_name == 'pull_request' && success()
-        id: compare
-        run: |
-          if [ -d "baseline-benchmarks" ]; then
-            python3 .github/scripts/compare-benchmarks.py \
-              baseline-benchmarks/*/benchmark-results.json \
-              benchmark-results.json \
-              > comparison-report.md 2>/dev/null || echo "Comparison script not available" > comparison-report.md
-
-            if grep -q "REGRESSION" comparison-report.md; then
-              echo "regression_found=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No baseline benchmarks found for comparison" > comparison-report.md
-          fi
-
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            let comment = '## Benchmark Results\n\n';
-
-            if (fs.existsSync('comparison-report.md')) {
-              comment += fs.readFileSync('comparison-report.md', 'utf8');
-            } else {
-              comment += fs.readFileSync('benchmark-report.md', 'utf8');
-            }
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            const botComment = comments.find(c =>
-              c.user.type === 'Bot' &&
-              c.body.includes('## Benchmark Results')
-            );
-
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: comment
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: comment
-              });
-            }
-
-      - name: Fail if regression found
-        if: steps.compare.outputs.regression_found == 'true'
-        run: |
-          echo "Performance regression detected!"
-          cat comparison-report.md
-          exit 1
 
   profile:
     name: CPU Profiling
@@ -236,36 +147,3 @@ jobs:
           name: valgrind-log
           path: valgrind.log
         if: always()
-
-  benchmark-history:
-    name: Track History
-    runs-on: ubuntu-latest
-    # Allow this job to fail - benchmark history is optional and may fail on forks
-    continue-on-error: true
-    if: github.event_name == 'schedule'
-    needs: benchmark
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Download current results
-        uses: actions/download-artifact@v8
-        with:
-          name: benchmark-results-${{ github.sha }}
-
-      - name: Update benchmark history
-        run: |
-          mkdir -p .benchmarks
-          cp benchmark-results.json .benchmarks/results-$(date +%Y%m%d-%H%M%S)-${{ github.sha }}.json
-
-          # Keep only last 50 results
-          ls -t .benchmarks/results-*.json | tail -n +51 | xargs rm -f || true
-
-      - name: Commit benchmark history
-        uses: stefanzweifel/git-auto-commit-action@v7
-        with:
-          commit_message: "Update benchmark history [skip ci]"
-          file_pattern: ".benchmarks/*.json"
-          branch: benchmark-history
-          create_branch: true
-          push_options: '--force'
