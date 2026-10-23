@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -365,8 +366,9 @@ pub struct P2pEndpoint {
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
     data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>>,
 
-    /// JoinSet tracking background reader tasks (each returns SocketAddr on exit)
-    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<SocketAddr>>>,
+    /// JoinSet tracking background reader tasks (each returns SocketAddr on exit).
+    /// Spawn into it only through [`spawn_reader`], which reaps finished readers.
+    reader_tasks: Arc<tokio::sync::Mutex<JoinSet<SocketAddr>>>,
 
     /// Per-address abort handles for targeted reader task cancellation
     reader_handles: Arc<RwLock<HashMap<SocketAddr, tokio::task::AbortHandle>>>,
@@ -1101,6 +1103,28 @@ async fn dispatch_inbound_stream(
     }
 }
 
+/// Spawn a QUIC reader into the shared reader set, first removing the readers
+/// that have already finished.
+///
+/// A `JoinSet` keeps each finished task allocated until it is joined or the
+/// set is dropped, and nothing else joins this set (shutdown only aborts), so
+/// without the reap every connection the endpoint ever had would stay
+/// allocated until the endpoint is dropped. With it the set holds the live
+/// readers plus those that finished since the previous spawn.
+fn spawn_reader(
+    reader_tasks: &mut JoinSet<SocketAddr>,
+    reader: impl Future<Output = SocketAddr> + Send + 'static,
+) -> AbortHandle {
+    while let Some(result) = reader_tasks.try_join_next() {
+        if let Err(error) = result
+            && error.is_panic()
+        {
+            warn!("Reader task panicked: {error}");
+        }
+    }
+    reader_tasks.spawn(reader)
+}
+
 async fn run_quic_reader_task(
     addr: SocketAddr,
     connection: crate::high_level::Connection,
@@ -1523,7 +1547,7 @@ impl P2pEndpoint {
 
         // Create channel for data received from background reader tasks
         let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
-        let reader_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let reader_tasks = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
         let reader_handles = Arc::new(RwLock::new(HashMap::new()));
 
         // Channel for reader tasks to signal immediate cleanup on exit
@@ -2656,13 +2680,11 @@ impl P2pEndpoint {
         // Look up the target peer ID from the per-target map. This avoids
         // races when multiple concurrent connections share the same P2pEndpoint.
         let target_peer_id = self.hole_punch_target_peer_ids.get(&target).map(|v| *v);
-        if let Some(ref pid) = target_peer_id {
+        // The target's peer ID is not logged: these lines already name its address.
+        if target_peer_id.is_some() {
             info!(
-                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID {} (dashmap key={})",
-                target,
-                coordinator,
-                hex::encode(&pid[..8]),
-                target
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID (dashmap key={})",
+                target, coordinator, target
             );
         } else {
             info!(
@@ -3695,16 +3717,19 @@ impl P2pEndpoint {
         let max_read_bytes = self.config.max_message_size;
         let exit_tx = self.reader_exit_tx.clone();
 
-        let abort_handle = self.reader_tasks.lock().await.spawn(run_quic_reader_task(
-            addr,
-            connection,
-            data_tx,
-            event_tx,
-            exit_tx,
-            max_read_bytes,
-            "",
-            InboundDataSendMode::TrySendWithTimeout,
-        ));
+        let abort_handle = spawn_reader(
+            &mut *self.reader_tasks.lock().await,
+            run_quic_reader_task(
+                addr,
+                connection,
+                data_tx,
+                event_tx,
+                exit_tx,
+                max_read_bytes,
+                "",
+                InboundDataSendMode::TrySendWithTimeout,
+            ),
+        );
 
         let key = normalize_socket_addr(addr);
         if let Some(old) = self.reader_handles.write().await.insert(key, abort_handle) {
@@ -4183,16 +4208,19 @@ impl P2pEndpoint {
                     let event_tx = event_tx.clone();
                     let exit_tx = reader_exit_tx.clone();
 
-                    let abort_handle = reader_tasks.lock().await.spawn(run_quic_reader_task(
-                        addr,
-                        conn,
-                        data_tx,
-                        event_tx,
-                        exit_tx,
-                        max_read_bytes,
-                        " (forwarder)",
-                        InboundDataSendMode::AwaitSend,
-                    ));
+                    let abort_handle = spawn_reader(
+                        &mut *reader_tasks.lock().await,
+                        run_quic_reader_task(
+                            addr,
+                            conn,
+                            data_tx,
+                            event_tx,
+                            exit_tx,
+                            max_read_bytes,
+                            " (forwarder)",
+                            InboundDataSendMode::AwaitSend,
+                        ),
+                    );
 
                     let key = normalize_socket_addr(addr);
                     if let Some(old) = reader_handles.write().await.insert(key, abort_handle) {
@@ -4502,6 +4530,66 @@ mod tests {
             assert!(endpoint.is_running());
             assert!(endpoint.local_addr().is_some() || endpoint.local_addr().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_finished_reader_tasks_do_not_accumulate() {
+        // Each connection spawns a reader on both sides. The server's ends when
+        // the client closes the connection and the client's is aborted by its
+        // own disconnect, so a set that kept finished readers would hold at
+        // least ROUNDS of them on each side.
+        const ROUNDS: usize = 8;
+        const MAX_RETAINED_READERS: usize = 2;
+        let localhost = SocketAddr::from(([127, 0, 0, 1], 0));
+        let config = || {
+            P2pConfig::builder()
+                .bind_addr(localhost)
+                .build()
+                .expect("valid config")
+        };
+        let server = P2pEndpoint::new(config()).await.expect("server endpoint");
+        let client = P2pEndpoint::new(config()).await.expect("client endpoint");
+        let server_addr = server.local_addr().expect("server address");
+
+        for round in 0..ROUNDS {
+            let (accepted, connected) = tokio::join!(
+                timeout(Duration::from_secs(10), server.accept()),
+                timeout(Duration::from_secs(10), client.connect(server_addr)),
+            );
+            accepted
+                .expect("accept did not time out")
+                .expect("server accepted the connection");
+            let peer = connected
+                .expect("connect did not time out")
+                .expect("client connected");
+            let peer_addr = peer.remote_addr.as_socket_addr().expect("QUIC address");
+
+            client
+                .disconnect(&peer_addr)
+                .await
+                .expect("client disconnected");
+            timeout(Duration::from_secs(10), async {
+                while !server.connected_peers().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: server kept the closed connection"));
+        }
+
+        let server_readers = server.reader_tasks.lock().await.len();
+        let client_readers = client.reader_tasks.lock().await.len();
+        assert!(
+            server_readers <= MAX_RETAINED_READERS,
+            "server retained {server_readers} reader tasks after {ROUNDS} closed connections"
+        );
+        assert!(
+            client_readers <= MAX_RETAINED_READERS,
+            "client retained {client_readers} reader tasks after {ROUNDS} closed connections"
+        );
+
+        client.shutdown().await;
+        server.shutdown().await;
     }
 
     // ==========================================================================

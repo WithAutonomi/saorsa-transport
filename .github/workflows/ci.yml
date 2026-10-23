@@ -83,7 +83,7 @@ jobs:
         run: cargo test --lib --all-features -- --test-threads=2
 
       - name: Run portable WebRTC profile tests
-        run: cargo test -p saorsa-transport --lib --no-default-features --features webrtc webrtc::
+        run: 'cargo test -p saorsa-transport --lib --no-default-features --features webrtc webrtc::'
 
       - name: Run integration tests
         run: |

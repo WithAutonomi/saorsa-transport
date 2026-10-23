@@ -4445,10 +4445,11 @@ impl Connection {
                 Some(x) => x,
                 None => break,
             };
-            if let Some(ref target) = punch_me_now.target_peer_id {
+            // The target's peer ID is not logged: the initiator logs the
+            // target's address alongside this frame.
+            if punch_me_now.target_peer_id.is_some() {
                 info!(
-                    "populate_packet: ENCODING PUNCH_ME_NOW relay frame target_peer={} remote={} buf_len={} max_size={}",
-                    hex::encode(&target[..8]),
+                    "populate_packet: ENCODING PUNCH_ME_NOW relay frame remote={} buf_len={} max_size={}",
                     self.path.remote,
                     buf.len(),
                     max_size,
@@ -5854,11 +5855,11 @@ impl Connection {
             Some(target_peer_id),
         );
 
+        // The target's peer ID is not logged: the caller has just logged the
+        // target's address.
         info!(
-            "Queued PUNCH_ME_NOW for relay: target_peer={}, our_addr={}, round={}",
-            hex::encode(&target_peer_id[..8]),
-            our_address,
-            round
+            "Queued PUNCH_ME_NOW for relay: our_addr={}, round={}",
+            our_address, round
         );
         Ok(())
     }
