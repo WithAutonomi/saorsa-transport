@@ -141,11 +141,11 @@ webrtc = [
 
 [dependencies]
 web-time = { version = "1.1", optional = true }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"], optional = true }
 serde_bytes = { version = "0.11", optional = true }
 # Core dependencies
 async-trait = { version = "0.1", optional = true }
-base64 = "0.22"
+base64 = "0.23"
 bytes = { version = ">=1.11.1", optional = true }
 enum_dispatch = { version = "0.3", optional = true }
 rustc-hash = { version = "2", optional = true }
@@ -172,7 +172,7 @@ indexmap = { version = "2.0", optional = true }
 lru-slab = { version = "0.1.2", optional = true }
 
 # Bootstrap cache dependencies
-dirs = { version = "6.0", optional = true }
+dirs = { version = "7.0", optional = true }
 
 # Platform keychain/keyring for secure credential storage
 keyring = { version = "3", optional = true }
@@ -193,7 +193,7 @@ nix = { version = "0.31", features = ["resource", "net"], optional = true }
 # Used by the `upnp` feature for best-effort UDP port mapping. The
 # implementation never blocks startup and silently degrades when the
 # router does not support or has disabled UPnP IGD.
-igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"], optional = true }
 
 # BLE transport dependencies (cross-platform, optional)
 # btleplug supports Linux (BlueZ), macOS (Core Bluetooth), and Windows (WinRT)
@@ -206,7 +206,7 @@ futures-util = { version = "0.3" , optional = true }
 
 # Browser transport primitives. Saorsa owns the transport API and wire
 # profile; these crates provide the standardized ICE/DTLS/SCTP machinery.
-stun = { version = "0.7", optional = true }
+stun = { version = "0.9", optional = true }
 webrtc-stack = { package = "webrtc", version = "0.14", features = ["pem"], optional = true }
 webrtc-rcgen = { package = "rcgen", version = "0.13", optional = true }
 x509-parser = { version = "0.18", optional = true }
@@ -229,7 +229,7 @@ dashmap = { version = "6", optional = true }
 parking_lot = { version = "0.12", optional = true }
 zeroize = { version = "1.8", features = ["derive"], optional = true }
 proptest = { version = "1.5", features = ["std"], optional = true }
-proptest-derive = { version = "0.8", optional = true }
+proptest-derive = { version = "0.9", optional = true }
 
 # criterion moved to dev-dependencies for benchmarks
 
@@ -283,7 +283,7 @@ quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { version = "1.5", features = ["std"] }
-proptest-derive = { version = "0.8" }
+proptest-derive = { version = "0.9" }
 
 # Enhanced testing dependencies
 # cargo-mutants is a CLI tool, not a library dependency
