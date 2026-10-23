@@ -229,7 +229,7 @@ dashmap = { version = "6", optional = true }
 parking_lot = { version = "0.12", optional = true }
 zeroize = { version = "1.8", features = ["derive"], optional = true }
 proptest = { version = "1.5", features = ["std"], optional = true }
-proptest-derive = { version = "0.8", optional = true }
+proptest-derive = { version = "0.9", optional = true }
 
 # criterion moved to dev-dependencies for benchmarks
 
@@ -283,7 +283,7 @@ quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { version = "1.5", features = ["std"] }
-proptest-derive = { version = "0.8" }
+proptest-derive = { version = "0.9" }
 
 # Enhanced testing dependencies
 # cargo-mutants is a CLI tool, not a library dependency
