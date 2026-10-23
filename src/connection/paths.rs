@@ -22,7 +22,7 @@ use super::{
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
 
 #[cfg(feature = "__qlog")]
-use qlog::events::quic::MetricsUpdated;
+use qlog::events::quic::RecoveryMetricsUpdated;
 
 /// Description of a particular network path
 pub(super) struct PathData {
@@ -242,7 +242,10 @@ impl PathData {
 
     #[cfg(feature = "__qlog")]
     #[allow(dead_code)]
-    pub(super) fn qlog_congestion_metrics(&mut self, pto_count: u32) -> Option<MetricsUpdated> {
+    pub(super) fn qlog_congestion_metrics(
+        &mut self,
+        pto_count: u32,
+    ) -> Option<RecoveryMetricsUpdated> {
         let controller_metrics = self.congestion.metrics();
 
         let metrics = CongestionMetrics {
@@ -315,16 +318,16 @@ impl CongestionMetrics {
         }
     }
 
-    /// Emit a `MetricsUpdated` event containing only updated values
+    /// Emit a `RecoveryMetricsUpdated` event containing only updated values
     #[allow(dead_code)]
-    fn to_qlog_event(&self, previous: &Self) -> Option<MetricsUpdated> {
+    fn to_qlog_event(&self, previous: &Self) -> Option<RecoveryMetricsUpdated> {
         let updated = self.retain_updated(previous);
 
         if updated == Self::default() {
             return None;
         }
 
-        Some(MetricsUpdated {
+        Some(RecoveryMetricsUpdated {
             min_rtt: updated.min_rtt.map(|rtt| rtt.as_secs_f32()),
             smoothed_rtt: updated.smoothed_rtt.map(|rtt| rtt.as_secs_f32()),
             latest_rtt: updated.latest_rtt.map(|rtt| rtt.as_secs_f32()),
@@ -337,6 +340,7 @@ impl CongestionMetrics {
             congestion_window: updated.congestion_window,
             ssthresh: updated.ssthresh,
             pacing_rate: updated.pacing_rate,
+            ..Default::default()
         })
     }
 }
