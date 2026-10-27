@@ -133,45 +133,6 @@ jobs:
           command: check sources
           arguments: --all-features
 
-  # Supply chain security (informational, non-blocking)
-  supply-chain:
-    name: Supply Chain Security
-    runs-on: ubuntu-latest
-    continue-on-error: true  # Don't block builds on supply chain failures
-    steps:
-      - uses: actions/checkout@v7
-        if: ${{ !startsWith(runner.name, 'nektos/act') }}
-      
-      - name: Set env
-        run: |
-          echo CARGO_TERM_COLOR=always >> "$GITHUB_ENV"
-          echo RUST_BACKTRACE=1       >> "$GITHUB_ENV"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-vet
-        run: cargo install cargo-vet --locked
-
-      - name: Initialize cargo-vet
-        run: cargo vet init || true
-
-      - name: Run cargo-vet
-        run: |
-          cargo vet --locked || VET_EXIT_CODE=$?
-
-          # Generate report
-          cargo vet dump-graph > supply-chain-report.json || true
-
-          exit ${VET_EXIT_CODE:-0}
-
-      - name: Upload supply chain report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: supply-chain-report
-          path: supply-chain-report.json
-
   # SBOM generation
   sbom-generation:
     name: Generate SBOM
@@ -207,7 +168,7 @@ jobs:
   # Security metrics and reporting
   security-report:
     name: Security Report
-    needs: [vulnerability-scan, policy-check, supply-chain]
+    needs: [vulnerability-scan, policy-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -227,7 +188,6 @@ jobs:
           echo "## Summary" >> security-report.md
           echo "- Vulnerability Scan: ${{ needs.vulnerability-scan.result }}" >> security-report.md
           echo "- Policy Check: ${{ needs.policy-check.result }}" >> security-report.md
-          echo "- Supply Chain: ${{ needs.supply-chain.result }}" >> security-report.md
           echo "" >> security-report.md
 
           # Add vulnerability summary if available

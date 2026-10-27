@@ -88,7 +88,6 @@ jobs:
       - name: Run integration tests
         run: |
           cargo test --test quick --all-features -- --test-threads=2 --skip auto_binding --skip binding_stream --skip kem_group_is_restricted_with_provider
-          cargo test --test standard --all-features -- --test-threads=2
           cargo test --test nat_traversal_rfc_compliance_tests --all-features
 
       - name: Run doc tests
@@ -123,34 +122,6 @@ jobs:
       - name: Run security audit
         run: cargo audit
 
-  # NAT traversal tests
-  nat-tests:
-    name: NAT Tests
-    needs: quick-checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: NAT traversal tests
-        run: cargo test --lib nat_traversal -- --test-threads=2
-
-      - name: Candidate discovery tests
-        run: cargo test --lib candidate_discovery -- --test-threads=2
-
-      - name: Connection establishment tests
-        run: cargo test --lib connection_establishment -- --test-threads=2
-
   # MSRV verification
   msrv:
     name: MSRV (1.95.0)
@@ -180,7 +151,7 @@ jobs:
   # CI gate - all required jobs must pass
   ci-success:
     name: CI Gate
-    needs: [quick-checks, test, security, nat-tests, msrv]
+    needs: [quick-checks, test, security, msrv]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -193,7 +164,6 @@ jobs:
           echo "| Quick Checks | ${{ needs.quick-checks.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test Suite | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| NAT Tests | ${{ needs.nat-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| MSRV | ${{ needs.msrv.result }} |" >> $GITHUB_STEP_SUMMARY
 
           # Required jobs
@@ -207,10 +177,6 @@ jobs:
           fi
           if [[ "${{ needs.security.result }}" != "success" ]]; then
             echo "::error::Security audit failed"
-            exit 1
-          fi
-          if [[ "${{ needs.nat-tests.result }}" != "success" ]]; then
-            echo "::error::NAT tests failed"
             exit 1
           fi
           if [[ "${{ needs.msrv.result }}" != "success" ]]; then

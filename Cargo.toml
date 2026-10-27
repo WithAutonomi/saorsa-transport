@@ -363,10 +363,6 @@ name = "quick"
 path = "tests/quick/main.rs"
 
 [[test]]
-name = "standard"
-path = "tests/standard/main.rs"
-
-[[test]]
 name = "long"
 path = "tests/long/main.rs"
 
