@@ -242,7 +242,8 @@ tracing-subscriber = { version = "0.3.0", default-features = false, features = [
 quinn-udp = { version = "0.6", features = ["tracing", "tracing-log"], optional = true }
 pin-project-lite = { version = "0.2", optional = true }
 
-# Compliance validator dependencies
+# regex: logging filters; chrono and rustls-native-certs: the interop-test
+# and test-public-endpoints binaries
 regex = { version = "1.11", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
