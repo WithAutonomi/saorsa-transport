@@ -1,5 +1,5 @@
-# External Validation - Public endpoint testing, interop, and compliance
-# Tests QUIC connectivity with public endpoints and validates RFC compliance
+# External Validation - Public endpoint testing
+# Tests QUIC connectivity with public endpoints
 
 name: External Validation
 
@@ -9,20 +9,6 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
-      endpoints:
-        description: 'Specific endpoints to test (comma-separated)'
-        required: false
-        default: 'all'
-      test_categories:
-        description: 'Test categories to run'
-        required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - basic_connectivity
-          - protocol_negotiation
-          - advanced_features
       verbose:
         description: 'Enable verbose logging'
         type: boolean
@@ -160,59 +146,9 @@ jobs:
               labels: ['ci/cd', 'validation', 'automated']
             });
 
-  test-interop:
-    name: Interoperability Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run interop tests
-        run: |
-          echo "### Interoperability Matrix" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Implementation | Version | Status | Notes |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------------|---------|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| quic-go | latest | Tested | Full compatibility |" >> $GITHUB_STEP_SUMMARY
-          echo "| Quinn | latest | Tested | Reference implementation |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cloudflare | prod | Tested | HTTP/3 only |" >> $GITHUB_STEP_SUMMARY
-          echo "| Google | prod | Tested | HTTP/3 only |" >> $GITHUB_STEP_SUMMARY
-
-  compliance-check:
-    name: RFC Compliance
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run compliance tests
-        run: cargo test --test nat_traversal_rfc_compliance_tests -- --nocapture || true
-
-      - name: Generate compliance report
-        run: |
-          echo "### RFC Compliance Check" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC | Feature | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|---------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC 9000 | QUIC v1 | Compliant |" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC 9001 | TLS 1.3 | Compliant |" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC 9002 | Loss Detection | Compliant |" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC 7250 | Raw Public Keys | Compliant |" >> $GITHUB_STEP_SUMMARY
-          echo "| draft-seemann | NAT Traversal | Compliant |" >> $GITHUB_STEP_SUMMARY
-
   summary:
     name: Validation Summary
-    needs: [validate-endpoints, test-interop, compliance-check]
+    needs: [validate-endpoints]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -225,8 +161,6 @@ jobs:
           echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Public Endpoints | ${{ needs.validate-endpoints.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Interoperability | ${{ needs.test-interop.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| RFC Compliance | ${{ needs.compliance-check.result }} |" >> $GITHUB_STEP_SUMMARY
 
       - name: Notify Discord
         if: failure() && github.event_name == 'schedule'
