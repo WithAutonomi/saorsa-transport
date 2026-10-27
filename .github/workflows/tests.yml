@@ -1,33 +1,13 @@
-# Tests - Comprehensive test suite for library, integration, and property tests
-# Runs on every push/PR and provides scheduled extended testing
+# Tests - extended property tests, weekly and on demand
+#
+# PR tests (lib, integration, doc, Windows and macOS) run in ci.yml. This
+# workflow only runs the long property-test pass that is too slow for every PR.
 
 name: Tests
 
 on:
   workflow_call:
-    inputs:
-      test_depth:
-        description: 'Test depth (quick/standard/extended)'
-        required: false
-        default: 'standard'
-        type: string
-    outputs:
-      passed:
-        description: "Whether all tests passed"
-        value: ${{ jobs.summary.outputs.passed }}
   workflow_dispatch:
-    inputs:
-      test_depth:
-        description: 'Test depth'
-        required: false
-        default: 'standard'
-        type: choice
-        options:
-          - quick
-          - standard
-          - extended
-  pull_request:
-    branches: [master, main, "rc-*"]
   schedule:
     # Extended tests weekly on Mondays at 4 AM UTC
     - cron: '0 4 * * 1'
@@ -36,7 +16,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
-  PROPTEST_CASES: ${{ github.event.inputs.test_depth == 'extended' && '1024' || '256' }}
 
 permissions:
   contents: read
@@ -46,150 +25,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Core library tests
-  lib-tests:
-    name: Library Tests (${{ matrix.os }} / ${{ matrix.rust }})
-    if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: [stable]
-        include:
-          - os: ubuntu-latest
-            rust: beta
-          - os: ubuntu-latest
-            rust: nightly
-    continue-on-error: ${{ matrix.rust != 'stable' }}
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ matrix.rust }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: lib-${{ matrix.os }}-${{ matrix.rust }}
-
-      - name: Run library tests
-        run: cargo test --lib --all-features -- --test-threads=2
-
-      - name: Run doc tests
-        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
-        run: cargo test --doc
-
-  # Integration tests
-  integration-tests:
-    name: Integration Tests (${{ matrix.os }})
-    if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: integration-${{ matrix.os }}
-
-      - name: Run integration tests
-        run: |
-          cargo test --test quick -- --test-threads=2
-          cargo test --test auto_binding_integration -- --test-threads=2
-        shell: bash
-
-  # Feature combination tests
-  feature-tests:
-    name: Feature Combinations
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: features
-
-      - name: Test minimal features
-        run: cargo test --lib --no-default-features
-
-      - name: Test all features
-        run: cargo test --lib --all-features
-
-      - name: Test default features
-        run: cargo test --lib
-
-  # Property-based tests
-  property-tests:
-    name: Property Tests
-    if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        include:
-          - os: windows-latest
-          - os: macos-latest
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: proptest-${{ matrix.os }}
-
-      - name: Run property tests
-        run: cargo test --test property_tests --release -- --test-threads=4
-        env:
-          PROPTEST_CASES: ${{ env.PROPTEST_CASES }}
-          PROPTEST_MAX_SHRINK_ITERS: 10000
-
-      - name: Upload regression files
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: proptest-regressions-${{ matrix.os }}
-          path: proptest-regressions/
-
-  # Extended property tests (schedule/manual only)
+  # Extended property tests
   extended-property-tests:
     name: Extended Property Tests
-    if: github.event_name == 'schedule' || github.event.inputs.test_depth == 'extended'
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
@@ -206,45 +46,9 @@ jobs:
           PROPTEST_CASES: 1024
           PROPTEST_MAX_SHRINK_ITERS: 50000
 
-  # Summary job
-  summary:
-    name: Test Summary
-    needs: [lib-tests, integration-tests, feature-tests, property-tests]
-    if: always() && github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    outputs:
-      passed: ${{ steps.check.outputs.passed }}
-    steps:
-      - name: Check test results
-        id: check
-        run: |
-          # Core tests must pass
-          if [ "${{ needs.lib-tests.result }}" != "success" ]; then
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          if [ "${{ needs.integration-tests.result }}" != "success" ]; then
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          if [ "${{ needs.feature-tests.result }}" != "success" ]; then
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          if [ "${{ needs.property-tests.result }}" != "success" ]; then
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          echo "passed=true" >> $GITHUB_OUTPUT
-
-      - name: Generate summary
-        if: always()
-        run: |
-          echo "# Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Library Tests | ${{ needs.lib-tests.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Feature Combinations | ${{ needs.feature-tests.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Property Tests | ${{ needs.property-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+      - name: Upload regression files
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: proptest-regressions
+          path: proptest-regressions/
