@@ -86,9 +86,10 @@ jobs:
         run: 'cargo test -p saorsa-transport --lib --no-default-features --features webrtc webrtc::'
 
       # Every integration test target (`--test '*'`; the lib tests ran above).
-      # The skips are tests in `quick` that hang.
+      # auto_binding: the two tests deadlock in ConnectionDriver::poll when a
+      # global trust runtime is set (V2-1755); drop the skip once that's fixed.
       - name: Run integration tests
-        run: cargo test --all-features --test '*' -- --test-threads=2 --skip auto_binding --skip binding_stream --skip kem_group_is_restricted_with_provider
+        run: cargo test --all-features --test '*' -- --test-threads=2 --skip auto_binding
 
       - name: Run doc tests
         run: cargo test --doc
