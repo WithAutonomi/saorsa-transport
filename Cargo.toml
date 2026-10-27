@@ -291,12 +291,6 @@ proptest-derive = { version = "0.9" }
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(wasm_browser)', 'cfg(feature, values("arbitrary", "__qlog"))'] }
 
-# Main P2P binary with NAT traversal support
-[[bin]]
-required-features = ["native"]
-name = "saorsa-transport"
-path = "src/bin/saorsa-transport.rs"
-
 # Interoperability test runner
 [[bin]]
 required-features = ["native"]

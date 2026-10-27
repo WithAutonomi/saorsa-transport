@@ -260,23 +260,6 @@ let config = P2pConfig::builder()
     .build()?;
 ```
 
-### Runtime Configuration
-
-Configure via command-line arguments:
-
-```bash
-# v0.13.0+: All nodes are symmetric P2P nodes
-# Connect to known peers
-saorsa-transport --connect quic.saorsalabs.com:9000 \
-         --nat-traversal \
-         --max-candidates 20 \
-         --punch-timeout 10000
-
-# Listen for incoming connections
-saorsa-transport --listen 0.0.0.0:9000 \
-         --enable-relay
-```
-
 ### Configuration File
 
 Create `config.toml`:
@@ -308,20 +291,6 @@ enable_observed_address = true # 0x9f81a6-a7
 
 ## Testing Procedures
 
-### Basic Connectivity Test
-
-```bash
-# v0.13.0+: All nodes are symmetric - no "bootstrap" role distinction
-# 1. Start first peer (listening)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:9000
-
-# 2. Start second peer (connecting)
-cargo run --bin saorsa-transport -- --connect localhost:9000
-
-# 3. Verify connection
-# Look for: "Successfully connected through NAT"
-```
-
 ### Comprehensive NAT Test Suite
 
 ```bash
@@ -346,23 +315,6 @@ cargo test --test connection_lifecycle_tests stress -- --ignored
 
 # Measure hole punching latency
 cargo run --example nat_latency_test
-```
-
-### Multi-Node Testing
-
-```bash
-# v0.13.0+: All nodes are symmetric P2P nodes
-# Start first peer (as initial connection target)
-saorsa-transport --listen 0.0.0.0:9000 --log peer-0.log &
-
-# Start multiple additional peers
-for i in {1..10}; do
-  saorsa-transport --connect localhost:9000 --peer-id "peer-$i" \
-           --log "peer-$i.log" &
-done
-
-# Monitor success rate
-grep "NAT traversal successful" peer-*.log | wc -l
 ```
 
 ## Troubleshooting
@@ -398,7 +350,7 @@ sudo iptables -L -n | grep 9000
 **Diagnosis**:
 ```bash
 # Enable detailed logging
-RUST_LOG=saorsa_transport::nat_traversal=debug cargo run --bin saorsa-transport
+RUST_LOG=saorsa_transport::nat_traversal=debug cargo test nat_traversal -- --nocapture > debug.log 2>&1
 
 # Check candidate discovery
 grep "Discovered candidate" debug.log
@@ -503,22 +455,6 @@ punch_burst_size = 3            # Send multiple packets
 let pool = ConnectionPool::new()
     .with_nat_cache_duration(Duration::from_secs(300))
     .with_max_cached_mappings(100);
-```
-
-### Metrics and Monitoring
-
-```bash
-# Enable metrics endpoint
-saorsa-transport --metrics-port 8080
-
-# Query metrics
-curl localhost:8080/metrics | grep nat_
-
-# Key metrics:
-# - nat_traversal_attempts_total
-# - nat_traversal_success_total
-# - nat_traversal_duration_seconds
-# - nat_hole_punching_packets_sent
 ```
 
 ## Best Practices
