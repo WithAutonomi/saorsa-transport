@@ -116,7 +116,8 @@ jobs:
 
       - name: Run integration tests
         run: |
-          cargo test --test quick -- --test-threads=2 --skip auto_binding --skip binding_stream
+          cargo test --test quick -- --test-threads=2
+          cargo test --test auto_binding_integration -- --test-threads=2
           cargo test --test standard -- --test-threads=2
         shell: bash
 

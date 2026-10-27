@@ -87,7 +87,8 @@ jobs:
 
       - name: Run integration tests
         run: |
-          cargo test --test quick --all-features -- --test-threads=2 --skip auto_binding --skip binding_stream --skip kem_group_is_restricted_with_provider
+          cargo test --test quick --all-features -- --test-threads=2 --skip kem_group_is_restricted_with_provider
+          cargo test --test auto_binding_integration --all-features -- --test-threads=2
           cargo test --test standard --all-features -- --test-threads=2
 
       - name: Run doc tests
