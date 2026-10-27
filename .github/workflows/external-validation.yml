@@ -161,14 +161,3 @@ jobs:
           echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Public Endpoints | ${{ needs.validate-endpoints.result }} |" >> $GITHUB_STEP_SUMMARY
-
-      - name: Notify Discord
-        if: failure() && github.event_name == 'schedule'
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          if [ -n "$DISCORD_WEBHOOK" ]; then
-            curl -H "Content-Type: application/json" \
-              -d "{\"content\": \"External validation failed. Check: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-              $DISCORD_WEBHOOK
-          fi
