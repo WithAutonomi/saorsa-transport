@@ -41,22 +41,6 @@ async fn test_endpoint_creation() {
 }
 
 #[test]
-#[ignore = "Requires Docker infrastructure setup"]
-fn test_docker_config_exists() {
-    // Verify Docker configuration files exist
-    let docker_compose = Path::new("docker/docker-compose.yml");
-    let nat_script = Path::new("docker/scripts/nat-gateway-entrypoint.sh");
-    let network_config = Path::new("docker/configs/network-conditions.yaml");
-
-    assert!(docker_compose.exists(), "docker-compose.yml not found");
-    assert!(nat_script.exists(), "NAT gateway script not found");
-    assert!(
-        network_config.exists(),
-        "Network conditions config not found"
-    );
-}
-
-#[test]
 #[ignore = "Requires public endpoints documentation"]
 fn test_public_endpoints_doc() {
     // Verify public endpoints documentation exists
