@@ -8,8 +8,7 @@ on:
     outputs:
       passed:
         description: "Whether all security checks passed"
-        # For PRs, security-gate runs; for other events (tags), use core check results
-        value: ${{ jobs.security-report.result == 'success' }}
+        value: ${{ jobs.security-report.outputs.passed }}
   workflow_dispatch:
   pull_request:
     branches: [master, main, "rc-*"]
@@ -102,36 +101,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-deny
+      - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           arguments: --all-features
           log-level: warn
-
-      - name: Check licenses
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check licenses
-          arguments: --all-features
-
-      - name: Check bans
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check bans
-          arguments: --all-features
-
-      - name: Check advisories
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
-          arguments: --all-features
-
-      - name: Check sources
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check sources
-          arguments: --all-features
 
   # SBOM generation
   sbom-generation:
@@ -171,7 +146,18 @@ jobs:
     needs: [vulnerability-scan, policy-check]
     if: always()
     runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.result.outputs.passed }}
     steps:
+      - name: Overall result
+        id: result
+        run: |
+          if [ "${{ needs.vulnerability-scan.result }}" = "success" ] && [ "${{ needs.policy-check.result }}" = "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v7
 
       - name: Download all artifacts
@@ -241,18 +227,18 @@ jobs:
   # Dependency Graph is enabled for this repository.
   security-gate:
     name: Security Gate
-    needs: [vulnerability-scan, policy-check, dependency-review]
-    if: github.event_name == 'pull_request'
+    needs: [vulnerability-scan, policy-check]
+    if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check security status
         run: |
-          if [ "${{ needs.vulnerability-scan.result }}" == "failure" ]; then
+          if [ "${{ needs.vulnerability-scan.result }}" != "success" ]; then
             echo "::error::Critical vulnerabilities found. Please fix before merging."
             exit 1
           fi
 
-          if [ "${{ needs.policy-check.result }}" == "failure" ]; then
+          if [ "${{ needs.policy-check.result }}" != "success" ]; then
             echo "::error::Security policy violations found. Please fix before merging."
             exit 1
           fi
