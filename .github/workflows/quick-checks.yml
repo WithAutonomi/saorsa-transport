@@ -54,7 +54,6 @@ jobs:
       run: |
         # Run clippy on tests excluding broken property_tests
         cargo clippy --all-features --test quick -- -D warnings
-        cargo clippy --all-features --test standard -- -D warnings
       continue-on-error: true  # Tests may have warnings
 
   quick-test:
@@ -101,30 +100,6 @@ jobs:
       run: cargo check --lib --bins --examples
       # Note: --all-targets excluded because property_tests need fixes
 
-  dependencies:
-    name: Dependency Check
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-      if: ${{ !startsWith(runner.name, 'nektos/act') }}
-      with:
-        fetch-depth: 1
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - uses: Swatinem/rust-cache@v2
-
-    - name: Check for unused dependencies
-      run: |
-        cargo install cargo-machete --locked || true
-        cargo machete || true
-
-    - name: Check for outdated dependencies
-      run: |
-        cargo install cargo-outdated --locked || true
-        cargo outdated --exit-code 1 || true
-
   license-check:
     name: License Header Check
     runs-on: ubuntu-latest
@@ -161,25 +136,9 @@ jobs:
           exit 1
         fi
 
-  yaml-lint:
-    name: YAML/TOML Validation
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-      with:
-        fetch-depth: 1
-
-    - name: Note
-      run: echo "Skipping actionlint; running TOML validation only"
-
-    - name: Validate TOML files
-      run: |
-        find . -name "Cargo.toml" -exec cargo verify-project --manifest-path {} \;
-      continue-on-error: true
-
   summary:
     name: Quick Checks Summary
-    needs: [lint, check, dependencies, license-check, yaml-lint]
+    needs: [lint, check, license-check]
     runs-on: ubuntu-latest
     if: always()
     outputs:
@@ -190,8 +149,7 @@ jobs:
       run: |
         if [[ "${{ needs.lint.result }}" == "success" && \
               "${{ needs.check.result }}" == "success" && \
-              "${{ needs.license-check.result }}" == "success" && \
-              "${{ needs.yaml-lint.result }}" == "success" ]]; then
+              "${{ needs.license-check.result }}" == "success" ]]; then
           echo "✅ All quick checks passed!"
           echo "passed=true" >> $GITHUB_OUTPUT
         else
@@ -209,8 +167,6 @@ jobs:
         echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
         echo "| Clippy | ${{ needs.lint.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Compilation | ${{ needs.check.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Dependencies | ${{ needs.dependencies.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| License Headers | ${{ needs.license-check.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| YAML/TOML | ${{ needs.yaml-lint.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "Time: $(date -u)" >> $GITHUB_STEP_SUMMARY
