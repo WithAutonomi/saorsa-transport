@@ -1669,23 +1669,26 @@ fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
 fn nominating_request(request: &[u8], server_credential: &str) -> Option<Vec<u8>> {
     let mut incoming = StunMessage::new();
     incoming.unmarshal_binary(request).ok()?;
-    if incoming.contains(ATTR_USE_CANDIDATE) || !incoming.contains(ATTR_ICE_CONTROLLING) {
+    // MESSAGE-INTEGRITY signs only the attributes before it, and receivers
+    // ignore everything after it but FINGERPRINT (RFC 8489 §14.5), so decide
+    // on and copy only the signed ones. A FINGERPRINT among them is malformed
+    // and would make the new MESSAGE-INTEGRITY unencodable.
+    let signed: Vec<_> = incoming
+        .attributes
+        .0
+        .iter()
+        .take_while(|attribute| attribute.typ != ATTR_MESSAGE_INTEGRITY)
+        .filter(|attribute| attribute.typ != ATTR_FINGERPRINT)
+        .collect();
+    let signs = |typ| signed.iter().any(|attribute| attribute.typ == typ);
+    if signs(ATTR_USE_CANDIDATE) || !signs(ATTR_ICE_CONTROLLING) {
         return None;
     }
     let mut nominating = StunMessage::new();
     nominating.typ = incoming.typ;
     nominating.transaction_id = incoming.transaction_id;
     nominating.write_header();
-    // Receivers ignore everything after MESSAGE-INTEGRITY but FINGERPRINT,
-    // so only attributes before it carry over. A FINGERPRINT before it is
-    // malformed and would make the new MESSAGE-INTEGRITY unencodable.
-    for attribute in incoming
-        .attributes
-        .0
-        .iter()
-        .take_while(|attribute| attribute.typ != ATTR_MESSAGE_INTEGRITY)
-        .filter(|attribute| attribute.typ != ATTR_FINGERPRINT)
-    {
+    for attribute in signed {
         nominating.add(attribute.typ, &attribute.value);
     }
     nominating.add(ATTR_USE_CANDIDATE, &[]);
@@ -1703,7 +1706,7 @@ mod tests {
     use std::pin::pin;
     use std::task::Poll;
     use stun::agent::TransactionId;
-    use stun::attributes::{ATTR_ICE_CONTROLLED, ATTR_PRIORITY};
+    use stun::attributes::{ATTR_ICE_CONTROLLED, ATTR_PRIORITY, AttrType};
     use stun::message::{BINDING_REQUEST, BINDING_SUCCESS};
     use stun::textattrs::Username;
     use tokio::task::JoinSet;
@@ -2091,6 +2094,88 @@ mod tests {
             None
         );
         assert!(nominating_request(&request(ATTR_ICE_CONTROLLING)?, &server).is_some());
+        Ok(())
+    }
+
+    // Whether admission admits `packet` from a source that returns the
+    // challenge it answers with.
+    fn admits(packet: &[u8], password: &str) -> anyhow::Result<bool> {
+        let mut admission = admission::Admission::default();
+        let source = "127.0.0.1:5000".parse()?;
+        let now = tokio::time::Instant::now();
+        let admission::Decision::Challenge(challenge) = admission.receive(packet, source, now)
+        else {
+            return Ok(false);
+        };
+        let proof = admission::tests::response(&challenge, password, source);
+        admission.receive(&proof, source, now);
+        Ok(matches!(
+            admission.receive(packet, source, now),
+            admission::Decision::Admit(_)
+        ))
+    }
+
+    // MESSAGE-INTEGRITY signs only the attributes before it, so admission
+    // admits a request with attributes appended after it. The copy must
+    // decide on the signed attributes alone.
+    #[test]
+    fn nominating_request_ignores_attributes_after_message_integrity() -> anyhow::Result<()> {
+        let password = "browserPassword0123456789";
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}{password}");
+        let tie_breaker = 1u64.to_be_bytes();
+        let request = |role: AttrType, unsigned: &[(AttrType, &[u8])]| -> anyhow::Result<Vec<u8>> {
+            let mut message = StunMessage::new();
+            message.build(&[
+                Box::new(TransactionId::new()),
+                Box::new(BINDING_REQUEST),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{server}:browserClientUfrag"),
+                )),
+            ])?;
+            message.add(role, &tie_breaker);
+            message.add(ATTR_PRIORITY, &1u32.to_be_bytes());
+            MessageIntegrity::new_short_term_integrity(server.clone()).add_to(&mut message)?;
+            for (typ, value) in unsigned {
+                message.add(*typ, value);
+            }
+            FINGERPRINT.add_to(&mut message)?;
+            Ok(message.raw)
+        };
+
+        // An unsigned ICE-CONTROLLING does not make a controlled agent's
+        // request nominate.
+        let controlled = request(ATTR_ICE_CONTROLLED, &[(ATTR_ICE_CONTROLLING, &tie_breaker)])?;
+        assert!(admits(&controlled, password)?);
+        assert_eq!(nominating_request(&controlled, &server), None);
+
+        // An unsigned USE-CANDIDATE neither stops a controlling agent's
+        // request from nominating nor survives into the copy.
+        let controlling = request(ATTR_ICE_CONTROLLING, &[(ATTR_USE_CANDIDATE, &[])])?;
+        assert!(admits(&controlling, password)?);
+        let nominating = nominating_request(&controlling, &server)
+            .ok_or_else(|| anyhow::anyhow!("the request was not re-encoded"))?;
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(&nominating)?;
+        let types: Vec<_> = message
+            .attributes
+            .0
+            .iter()
+            .map(|attribute| attribute.typ)
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ATTR_USERNAME,
+                ATTR_ICE_CONTROLLING,
+                ATTR_PRIORITY,
+                ATTR_USE_CANDIDATE,
+                ATTR_MESSAGE_INTEGRITY,
+                ATTR_FINGERPRINT,
+            ]
+        );
+        MessageIntegrity::new_short_term_integrity(server).check(&mut message)?;
+        FINGERPRINT.check(&message)?;
         Ok(())
     }
 
