@@ -38,9 +38,16 @@ before admission. This cache is bounded globally and per canonical IP, evicts
 the oldest returned proof when full, and contains no RTC state. ICE request
 retransmission completes admission without browser-specific signalling.
 The admitted Binding request is retained in the bounded pending queue and
-delivered unchanged to that association's ICE mux before the ICE agent starts.
-ICE can therefore answer and nominate from the admission-completing request
-without waiting for another client retransmission. Generation ownership still
+delivered to that association's ICE mux before the ICE agent starts, so ICE
+answers the admission-completing request without waiting for another client
+retransmission. It is delivered as a nomination: the listener adds USE-CANDIDATE
+and signs it again with its own ICE password, keeping the transaction. ICE then
+connects, and the DTLS server starts, once the listener's own check of the pair
+succeeds. A browser starts DTLS when its first check succeeds but nominates an
+ICE-lite peer only on a later check, which libwebrtc sends up to about a second
+later; until it arrived, the listener held the browser's ClientHello and the
+browser resent it. The association is pinned to the source that completed
+admission, so this is the only pair the browser can select. Generation ownership still
 guards mux creation, routing and cleanup; rejected probes never reach an ICE agent.
 Challenges never exceed the triggering packet size. This is reachability proof,
 not protection against an on-path attacker or many genuinely reachable sources.
