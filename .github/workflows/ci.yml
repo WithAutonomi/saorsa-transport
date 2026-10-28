@@ -1,5 +1,10 @@
-# CI - Main continuous integration gate
-# Runs on every push/PR to verify code quality and tests
+# CI - the pull request gate
+#
+# Every check a PR needs runs here, and `CI Gate` summarises them. Suites that
+# only run on a schedule or by hand live elsewhere: tests.yml (extended property
+# tests), platforms.yml (full target matrix), platforms-exotic.yml, and
+# security.yml (cargo audit/deny, on Cargo changes and daily). See
+# .github/CI_ARCHITECTURE.md.
 
 name: CI
 
@@ -21,11 +26,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Quick checks - lint, format, compile
+  # Quick checks - format, lint, compile, licence headers
   quick-checks:
     name: Quick Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -46,7 +51,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-features --lib --bins --examples -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Clippy portable WebRTC profile
         run: cargo clippy -p saorsa-transport --lib --no-default-features --features webrtc -- -D warnings
@@ -54,10 +59,39 @@ jobs:
       - name: Build check
         run: cargo check --lib --bins --examples
 
-      - name: Build portable WebRTC profile for WASM
-        run: cargo check -p saorsa-transport --lib --no-default-features --features webrtc --target wasm32-unknown-unknown
+      - name: Build for WASM
+        run: |
+          cargo check --lib --no-default-features --target wasm32-unknown-unknown
+          cargo check -p saorsa-transport --lib --no-default-features --features webrtc --target wasm32-unknown-unknown
 
-  # Main test suite
+      - name: Check licence headers
+        run: |
+          # Every tracked Rust file must open one of the licence headers in use
+          # within its first 15 lines: the crate's MIT OR Apache-2.0 notice (in
+          # either wording or as an SPDX identifier), or the Chromium or
+          # Cloudflare BSD notice kept on the vendored quiche files. Code under
+          # any other terms needs review, and its header line added below.
+          headers='^// (This software is licensed under the MIT license <LICENSE-MIT or|Licensed under the MIT license <https://opensource\.org/licenses/MIT> or the|SPDX-License-Identifier: MIT OR Apache-2\.0|Use of this source code is governed by a BSD-style license that can be|Redistribution and use in source and binary forms, with or without)$'
+          checked=0
+          missing_headers=0
+          while IFS= read -r -d '' file; do
+            checked=$((checked + 1))
+            if ! head -n 15 -- "$file" | grep -E "$headers" > /dev/null; then
+              echo "::error file=$file::Missing license header"
+              missing_headers=$((missing_headers + 1))
+            fi
+          done < <(git ls-files -z -- '*.rs')
+
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::No tracked .rs files found"
+            exit 1
+          fi
+          if [ "$missing_headers" -gt 0 ]; then
+            echo "::error::Found $missing_headers files without license headers"
+            exit 1
+          fi
+
+  # Main test suite (Linux): every feature profile, every test target
   test:
     name: Test Suite
     needs: quick-checks
@@ -82,6 +116,9 @@ jobs:
       - name: Run library tests
         run: cargo test --lib --all-features -- --test-threads=2
 
+      - name: Run library tests (no default features)
+        run: cargo test --lib --no-default-features -- --test-threads=2
+
       - name: Run portable WebRTC profile tests
         run: 'cargo test -p saorsa-transport --lib --no-default-features --features webrtc webrtc::'
 
@@ -92,34 +129,46 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc
 
-  # Security audit
-  security:
-    name: Security Audit
+  # Windows and macOS: default features, lib + quick integration tests
+  test-os:
+    name: Tests (${{ matrix.os }})
     needs: quick-checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    defaults:
+      run:
+        # bash on Windows too: a multi-line pwsh step only fails on its last command
+        shell: bash
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Add x86_64-apple-darwin target
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+
       - uses: Swatinem/rust-cache@v2
-
-      - name: Cache cargo-audit
-        uses: actions/cache@v6
         with:
-          path: ~/.cargo/bin/cargo-audit
-          key: cargo-audit-${{ runner.os }}
+          key: test-${{ matrix.os }}
 
-      - name: Install cargo-audit
+      - name: Run library tests
+        run: cargo test --lib -- --test-threads=2
+
+      - name: Run integration tests
         run: |
-          if ! command -v cargo-audit &> /dev/null; then
-            cargo install cargo-audit --locked
-          fi
+          cargo test --test quick -- --test-threads=2
+          cargo test --test auto_binding_integration -- --test-threads=2
 
-      - name: Run security audit
-        run: cargo audit
+      # macos-latest is arm64; the release also ships x86_64-apple-darwin
+      - name: Build for x86_64-apple-darwin
+        if: runner.os == 'macOS'
+        run: cargo build --target x86_64-apple-darwin --all-features --lib --bins --examples
 
   # MSRV verification
   msrv:
@@ -145,12 +194,14 @@ jobs:
           key: msrv
 
       - name: Check MSRV
-        run: cargo check --all-features
+        run: |
+          cargo check --all-features
+          cargo check --no-default-features
 
   # CI gate - all required jobs must pass
   ci-success:
     name: CI Gate
-    needs: [quick-checks, test, security, msrv]
+    needs: [quick-checks, test, test-os, msrv]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -162,7 +213,7 @@ jobs:
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Quick Checks | ${{ needs.quick-checks.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test Suite | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests (Windows, macOS) | ${{ needs.test-os.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| MSRV | ${{ needs.msrv.result }} |" >> $GITHUB_STEP_SUMMARY
 
           # Required jobs
@@ -174,8 +225,8 @@ jobs:
             echo "::error::Test suite failed"
             exit 1
           fi
-          if [[ "${{ needs.security.result }}" != "success" ]]; then
-            echo "::error::Security audit failed"
+          if [[ "${{ needs.test-os.result }}" != "success" ]]; then
+            echo "::error::Windows/macOS tests failed"
             exit 1
           fi
           if [[ "${{ needs.msrv.result }}" != "success" ]]; then

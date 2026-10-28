@@ -1,5 +1,5 @@
 # Platforms - Cross-platform testing (Ubuntu, macOS, Windows, ARM)
-# Tests on major platforms with dynamic matrix selection
+# Weekly and on demand. PRs get Windows and macOS coverage from ci.yml.
 
 name: Platforms
 
@@ -21,8 +21,6 @@ on:
         options:
           - minimal
           - full
-  pull_request:
-    branches: [master, main, "rc-*"]
   schedule:
     # Run weekly
     - cron: '0 2 * * 1'
@@ -49,17 +47,10 @@ jobs:
       - name: Define platform matrix
         id: set-matrix
         run: |
-          EVENT="${{ github.event_name }}"
           PLAT_INPUT="${{ github.event.inputs.platforms }}"
 
-          # Minimal matrix for PRs and pushes
-          if [ "$EVENT" = "push" ] || [ "$EVENT" = "pull_request" ]; then
-            echo 'matrix={"include":[
-              {"os":"ubuntu-latest","rust":"stable","target":"x86_64-unknown-linux-gnu"},
-              {"os":"macos-latest","rust":"stable","target":"x86_64-apple-darwin"}
-            ]}' | tr -d '\n' >> $GITHUB_OUTPUT
           # Minimal on request
-          elif [ "$PLAT_INPUT" = "minimal" ]; then
+          if [ "$PLAT_INPUT" = "minimal" ]; then
             echo 'matrix={"include":[
               {"os":"ubuntu-latest","rust":"stable","target":"x86_64-unknown-linux-gnu"},
               {"os":"windows-latest","rust":"stable","target":"x86_64-pc-windows-msvc"},
@@ -159,29 +150,6 @@ jobs:
         with:
           name: results-${{ matrix.target }}-${{ matrix.rust }}
           path: test-results/
-
-  msrv:
-    name: MSRV (1.95.0)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Install MSRV
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: 1.95.0
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check MSRV
-        run: |
-          cargo check --all-features
-          cargo check --no-default-features
 
   summary:
     name: Summary
