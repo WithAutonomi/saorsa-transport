@@ -110,9 +110,10 @@ jobs:
         with:
           key: integration-${{ matrix.os }}
 
+      # auto_binding deadlocks when a global trust runtime is set (V2-1755)
       - name: Run integration tests
         run: |
-          cargo test --test quick -- --test-threads=2 --skip auto_binding --skip binding_stream
+          cargo test --test quick -- --test-threads=2 --skip auto_binding
         shell: bash
 
   # Feature combination tests
@@ -151,7 +152,6 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    continue-on-error: true  # Property tests need fixes - non-blocking
     strategy:
       fail-fast: false
       matrix:
@@ -231,7 +231,10 @@ jobs:
             echo "passed=false" >> $GITHUB_OUTPUT
             exit 1
           fi
-          # Property tests are non-blocking (continue-on-error)
+          if [ "${{ needs.property-tests.result }}" != "success" ]; then
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
           echo "passed=true" >> $GITHUB_OUTPUT
 
       - name: Generate summary
