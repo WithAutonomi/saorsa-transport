@@ -89,6 +89,7 @@ jobs:
         run: |
           cargo test --test quick --all-features -- --test-threads=2 --skip auto_binding --skip binding_stream --skip kem_group_is_restricted_with_provider
           cargo test --test standard --all-features -- --test-threads=2
+          cargo test --test nat_traversal_rfc_compliance_tests --all-features
 
       - name: Run doc tests
         run: cargo test --doc
