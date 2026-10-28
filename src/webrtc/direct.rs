@@ -42,7 +42,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use stun::attributes::{ATTR_MESSAGE_INTEGRITY, ATTR_USE_CANDIDATE, ATTR_USERNAME};
+use stun::attributes::{
+    ATTR_FINGERPRINT, ATTR_ICE_CONTROLLING, ATTR_MESSAGE_INTEGRITY, ATTR_USE_CANDIDATE,
+    ATTR_USERNAME,
+};
 use stun::fingerprint::FINGERPRINT;
 use stun::integrity::MessageIntegrity;
 use stun::message::{Message as StunMessage, Setter, is_message as is_stun_message};
@@ -793,26 +796,31 @@ async fn create_inbound_connection(
     });
     // Admission consumed the authenticated Binding request that proved the
     // return path. Deliver it to this generation's ICE agent before it starts,
-    // so nomination does not depend on the client's next retransmission.
+    // so ICE answers it without waiting for the client's next retransmission.
+    //
+    // Deliver it as a nomination, so ICE connects, and DTLS starts, once this
+    // agent's own check of the pair succeeds. A browser starts DTLS when its
+    // first check succeeds but nominates an ICE-lite peer only on a later
+    // check, which libwebrtc sends up to about a second after that; the agent
+    // would otherwise hold the browser's ClientHello until then. Admission
+    // bound this credential to the one source that proved the return path, so
+    // this is the only pair the browser can ever select. This relies on
+    // webrtc-ice 0.14 remembering a nomination of a pair until its own check
+    // of the pair succeeds; rtc-ice 0.21 forgets it, and does not answer the
+    // nominating request either.
+    //
     // Keep this same writer alive in SettingEngine: UDPMuxConn holds it weakly.
     let writer: Arc<dyn UDPMuxWriter + Send + Sync> = association_mux.clone();
     let initial_conn = udp_mux
         .get_owned_conn(server_ufrag, Some(generation), writer)
         .await
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
-    // Delivered as a nomination, so ICE connects, and DTLS starts, once this
-    // agent's own check of the pair succeeds. A browser starts DTLS when its
-    // first check succeeds but nominates an ICE-lite peer only on a later
-    // check, which libwebrtc sends up to about a second after that; the agent
-    // would otherwise hold the browser's ClientHello until then. Admission
-    // bound this credential to the one source that proved the return path, so
-    // this is the only pair the browser can ever select.
-    let initial_packet =
-        nominating_request(&association.initial_packet, server_ufrag).ok_or_else(|| {
-            WebRtcDirectError::Protocol("admitted Binding request cannot be re-encoded".into())
-        })?;
+    let nominating = nominating_request(&association.initial_packet, server_ufrag);
     initial_conn
-        .write_packet(&initial_packet, remote_addr)
+        .write_packet(
+            nominating.as_deref().unwrap_or(&association.initial_packet),
+            remote_addr,
+        )
         .await
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     settings.set_udp_network(UDPNetwork::Muxed(association_mux));
@@ -1650,7 +1658,10 @@ fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
     Some((local.to_string(), remote.to_string()))
 }
 
-/// Return a Binding request with USE-CANDIDATE added.
+/// Return a copy of a controlling agent's Binding request that nominates its
+/// candidate pair, or `None` to deliver the request as it came: it already
+/// nominates, comes from an agent that may not nominate, or cannot be
+/// re-encoded.
 ///
 /// The copy keeps the request's transaction, so the client takes the agent's
 /// answer as the answer to its own check. It is signed again with the
@@ -1658,20 +1669,22 @@ fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
 fn nominating_request(request: &[u8], server_credential: &str) -> Option<Vec<u8>> {
     let mut incoming = StunMessage::new();
     incoming.unmarshal_binary(request).ok()?;
-    if incoming.contains(ATTR_USE_CANDIDATE) {
-        return Some(request.to_vec());
+    if incoming.contains(ATTR_USE_CANDIDATE) || !incoming.contains(ATTR_ICE_CONTROLLING) {
+        return None;
     }
     let mut nominating = StunMessage::new();
     nominating.typ = incoming.typ;
     nominating.transaction_id = incoming.transaction_id;
     nominating.write_header();
     // Receivers ignore everything after MESSAGE-INTEGRITY but FINGERPRINT,
-    // so only attributes before it carry over.
+    // so only attributes before it carry over. A FINGERPRINT before it is
+    // malformed and would make the new MESSAGE-INTEGRITY unencodable.
     for attribute in incoming
         .attributes
         .0
         .iter()
         .take_while(|attribute| attribute.typ != ATTR_MESSAGE_INTEGRITY)
+        .filter(|attribute| attribute.typ != ATTR_FINGERPRINT)
     {
         nominating.add(attribute.typ, &attribute.value);
     }
@@ -1690,7 +1703,7 @@ mod tests {
     use std::pin::pin;
     use std::task::Poll;
     use stun::agent::TransactionId;
-    use stun::attributes::{ATTR_ICE_CONTROLLING, ATTR_PRIORITY};
+    use stun::attributes::{ATTR_ICE_CONTROLLED, ATTR_PRIORITY};
     use stun::message::{BINDING_REQUEST, BINDING_SUCCESS};
     use stun::textattrs::Username;
     use tokio::task::JoinSet;
@@ -2050,7 +2063,69 @@ mod tests {
         FINGERPRINT.check(&message)?;
 
         // A request that already nominates is delivered as it came.
-        assert_eq!(nominating_request(&nominating, &server), Some(nominating));
+        assert_eq!(nominating_request(&nominating, &server), None);
+        Ok(())
+    }
+
+    #[test]
+    fn nominating_request_leaves_requests_it_may_not_nominate() -> anyhow::Result<()> {
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}browserPassword0123456789");
+        let request = |role| -> anyhow::Result<Vec<u8>> {
+            let mut message = StunMessage::new();
+            message.build(&[
+                Box::new(TransactionId::new()),
+                Box::new(BINDING_REQUEST),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{server}:browserClientUfrag"),
+                )),
+            ])?;
+            message.add(role, &1u64.to_be_bytes());
+            MessageIntegrity::new_short_term_integrity(server.clone()).add_to(&mut message)?;
+            FINGERPRINT.add_to(&mut message)?;
+            Ok(message.raw)
+        };
+        // Only the controlling agent nominates (RFC 8445 §7.1.2).
+        assert_eq!(
+            nominating_request(&request(ATTR_ICE_CONTROLLED)?, &server),
+            None
+        );
+        assert!(nominating_request(&request(ATTR_ICE_CONTROLLING)?, &server).is_some());
+        Ok(())
+    }
+
+    // Admission's FINGERPRINT check reads the first FINGERPRINT but hashes up
+    // to the last one, so an admitted request can carry one before
+    // MESSAGE-INTEGRITY. The copy must still be signed.
+    #[test]
+    fn nominating_request_drops_a_fingerprint_before_message_integrity() -> anyhow::Result<()> {
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}browserPassword0123456789");
+        let mut crafted = StunMessage::new();
+        crafted.build(&[
+            Box::new(TransactionId::new()),
+            Box::new(BINDING_REQUEST),
+            Box::new(Username::new(
+                ATTR_USERNAME,
+                format!("{server}:browserClientUfrag"),
+            )),
+        ])?;
+        crafted.add(ATTR_ICE_CONTROLLING, &1u64.to_be_bytes());
+        crafted.add(ATTR_FINGERPRINT, &[0; 4]);
+        crafted.add(ATTR_MESSAGE_INTEGRITY, &[0; 20]);
+
+        let nominating = nominating_request(&crafted.raw, &server)
+            .ok_or_else(|| anyhow::anyhow!("the request was not re-encoded"))?;
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(&nominating)?;
+        let fingerprints = message
+            .attributes
+            .0
+            .iter()
+            .filter(|attribute| attribute.typ == ATTR_FINGERPRINT)
+            .count();
+        assert_eq!(fingerprints, 1);
+        MessageIntegrity::new_short_term_integrity(server).check(&mut message)?;
+        FINGERPRINT.check(&message)?;
         Ok(())
     }
 

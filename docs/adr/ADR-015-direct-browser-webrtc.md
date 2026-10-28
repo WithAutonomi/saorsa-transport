@@ -47,7 +47,12 @@ succeeds. A browser starts DTLS when its first check succeeds but nominates an
 ICE-lite peer only on a later check, which libwebrtc sends up to about a second
 later; until it arrived, the listener held the browser's ClientHello and the
 browser resent it. The association is pinned to the source that completed
-admission, so this is the only pair the browser can select. Generation ownership still
+admission, so this is the only pair the browser can select. Only a request with
+ICE-CONTROLLING is nominated, and one that cannot be re-encoded is delivered as
+it came. This relies on webrtc-ice 0.14 remembering the nomination until the
+listener's own check of the pair succeeds; rtc-ice 0.21 forgets it and leaves the
+nominating request unanswered, so an upgrade must nominate only after that check
+succeeds instead. Generation ownership still
 guards mux creation, routing and cleanup; rejected probes never reach an ICE agent.
 Challenges never exceed the triggering packet size. This is reachability proof,
 not protection against an on-path attacker or many genuinely reachable sources.
