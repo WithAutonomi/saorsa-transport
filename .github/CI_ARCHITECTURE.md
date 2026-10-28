@@ -29,7 +29,6 @@ flowchart TB
         Property[Property Tests]
         Bench[Benchmarks]
         Docker[Docker NAT]
-        External[External Validation]
     end
 
     subgraph "Release Process"
@@ -64,7 +63,6 @@ flowchart TB
     DocBuild --> Bench
 
     Platform --> Docker
-    Security --> External
 
     Version --> BuildAll
     BuildAll --> Package
@@ -75,7 +73,6 @@ flowchart TB
     Platform --> Artifacts
     Property --> Reports
     Bench --> Reports
-    External --> Badges
     Coverage --> Badges
     GitHubRel --> Notifications
 ```
@@ -88,7 +85,6 @@ flowchart TB
 - **security.yml**: Vulnerability scanning
 
 ### 2. Scheduled Tasks
-- **external-validation.yml**: Daily endpoint testing
 - **benchmarks.yml**: Weekly performance tracking
 - **security.yml**: Daily vulnerability checks
 

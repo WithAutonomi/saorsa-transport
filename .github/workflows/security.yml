@@ -8,8 +8,7 @@ on:
     outputs:
       passed:
         description: "Whether all security checks passed"
-        # For PRs, security-gate runs; for other events (tags), use core check results
-        value: ${{ jobs.security-report.result == 'success' }}
+        value: ${{ jobs.security-report.outputs.passed }}
   workflow_dispatch:
   pull_request:
     branches: [master, main, "rc-*"]
@@ -102,75 +101,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-deny
+      - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           arguments: --all-features
           log-level: warn
-
-      - name: Check licenses
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check licenses
-          arguments: --all-features
-
-      - name: Check bans
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check bans
-          arguments: --all-features
-
-      - name: Check advisories
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
-          arguments: --all-features
-
-      - name: Check sources
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check sources
-          arguments: --all-features
-
-  # Supply chain security (informational, non-blocking)
-  supply-chain:
-    name: Supply Chain Security
-    runs-on: ubuntu-latest
-    continue-on-error: true  # Don't block builds on supply chain failures
-    steps:
-      - uses: actions/checkout@v7
-        if: ${{ !startsWith(runner.name, 'nektos/act') }}
-      
-      - name: Set env
-        run: |
-          echo CARGO_TERM_COLOR=always >> "$GITHUB_ENV"
-          echo RUST_BACKTRACE=1       >> "$GITHUB_ENV"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-vet
-        run: cargo install cargo-vet --locked
-
-      - name: Initialize cargo-vet
-        run: cargo vet init || true
-
-      - name: Run cargo-vet
-        run: |
-          cargo vet --locked || VET_EXIT_CODE=$?
-
-          # Generate report
-          cargo vet dump-graph > supply-chain-report.json || true
-
-          exit ${VET_EXIT_CODE:-0}
-
-      - name: Upload supply chain report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: supply-chain-report
-          path: supply-chain-report.json
 
   # SBOM generation
   sbom-generation:
@@ -207,10 +143,21 @@ jobs:
   # Security metrics and reporting
   security-report:
     name: Security Report
-    needs: [vulnerability-scan, policy-check, supply-chain]
+    needs: [vulnerability-scan, policy-check]
     if: always()
     runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.result.outputs.passed }}
     steps:
+      - name: Overall result
+        id: result
+        run: |
+          if [ "${{ needs.vulnerability-scan.result }}" = "success" ] && [ "${{ needs.policy-check.result }}" = "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v7
 
       - name: Download all artifacts
@@ -227,7 +174,6 @@ jobs:
           echo "## Summary" >> security-report.md
           echo "- Vulnerability Scan: ${{ needs.vulnerability-scan.result }}" >> security-report.md
           echo "- Policy Check: ${{ needs.policy-check.result }}" >> security-report.md
-          echo "- Supply Chain: ${{ needs.supply-chain.result }}" >> security-report.md
           echo "" >> security-report.md
 
           # Add vulnerability summary if available
@@ -281,18 +227,18 @@ jobs:
   # Dependency Graph is enabled for this repository.
   security-gate:
     name: Security Gate
-    needs: [vulnerability-scan, policy-check, dependency-review]
-    if: github.event_name == 'pull_request'
+    needs: [vulnerability-scan, policy-check]
+    if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check security status
         run: |
-          if [ "${{ needs.vulnerability-scan.result }}" == "failure" ]; then
+          if [ "${{ needs.vulnerability-scan.result }}" != "success" ]; then
             echo "::error::Critical vulnerabilities found. Please fix before merging."
             exit 1
           fi
 
-          if [ "${{ needs.policy-check.result }}" == "failure" ]; then
+          if [ "${{ needs.policy-check.result }}" != "success" ]; then
             echo "::error::Security policy violations found. Please fix before merging."
             exit 1
           fi
