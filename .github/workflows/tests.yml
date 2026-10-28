@@ -110,10 +110,10 @@ jobs:
         with:
           key: integration-${{ matrix.os }}
 
-      # auto_binding deadlocks when a global trust runtime is set (V2-1755)
       - name: Run integration tests
         run: |
-          cargo test --test quick -- --test-threads=2 --skip auto_binding
+          cargo test --test quick -- --test-threads=2
+          cargo test --test auto_binding_integration -- --test-threads=2
         shell: bash
 
   # Feature combination tests
