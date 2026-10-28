@@ -1,5 +1,5 @@
 # Coverage - Code coverage using llvm-cov
-# Generates coverage reports and uploads to Codecov
+# Generates a coverage report (HTML artifact) and prints the line coverage
 
 name: Coverage
 
@@ -69,15 +69,6 @@ jobs:
           else
             echo "Coverage ${COVERAGE}% meets threshold of ${COVERAGE_THRESHOLD}%"
           fi
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v7
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: unittests
-          name: saorsa-transport-coverage-${{ matrix.os }}
-          fail_ci_if_error: false
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7

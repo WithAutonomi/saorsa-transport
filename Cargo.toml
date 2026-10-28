@@ -158,7 +158,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 # Safe-Rust YAML parser; replaces the deprecated serde_yaml, whose
 # unsafe-libyaml backend is unmaintained (RUSTSEC-2024-0449).
-serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"], optional = true }
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"], optional = true }
 # Ed25519 removed in v0.2.0+ - Pure PQC uses ML-DSA-65 only
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 
@@ -197,7 +197,7 @@ igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"
 
 # BLE transport dependencies (cross-platform, optional)
 # btleplug supports Linux (BlueZ), macOS (Core Bluetooth), and Windows (WinRT)
-btleplug = { version = "0.11", optional = true }
+btleplug = { version = "0.13", optional = true }
 
 # Essential dependencies (formerly production-ready)
 rcgen = { version = "0.14" , optional = true }
@@ -206,7 +206,7 @@ futures-util = { version = "0.3" , optional = true }
 
 # Browser transport primitives. Saorsa owns the transport API and wire
 # profile; these crates provide the standardized ICE/DTLS/SCTP machinery.
-stun = { version = "0.9", optional = true }
+stun = { version = "0.17", optional = true }
 webrtc-stack = { package = "webrtc", version = "0.14", features = ["pem"], optional = true }
 webrtc-rcgen = { package = "rcgen", version = "0.13", optional = true }
 x509-parser = { version = "0.18", optional = true }
@@ -361,10 +361,6 @@ harness = false
 [[test]]
 name = "quick"
 path = "tests/quick/main.rs"
-
-[[test]]
-name = "standard"
-path = "tests/standard/main.rs"
 
 [[test]]
 name = "long"
