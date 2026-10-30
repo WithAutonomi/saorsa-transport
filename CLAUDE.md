@@ -130,21 +130,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Running Examples and Binaries
+### Running Examples
 
-#### Main QUIC Binary
-```bash
-# Run the QUIC P2P binary (v0.13.0+: all nodes are symmetric)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:9000
-
-# Connect to known peers (v0.13.0+: no "bootstrap" distinction)
-cargo run --bin saorsa-transport -- --connect quic.saorsalabs.com:9000
-
-# Run with monitoring dashboard
-cargo run --bin saorsa-transport -- --dashboard --listen 0.0.0.0:9000
-```
-
-#### Examples
 ```bash
 # Chat demo with QUIC
 cargo run --example chat_demo
@@ -184,8 +171,7 @@ saorsa-transport has a three-layer architecture:
 - **`src/quic_node.rs`**: `QuicP2PNode` - Application-friendly P2P node wrapper
 - **`src/high_level/`**: Evolved fork of Quinn's async API (NOT external Quinn - this is saorsa-transport's own implementation)
 
-### Layer 3: Applications (Binaries)
-- **`src/bin/saorsa-transport.rs`**: Main QUIC P2P binary using `QuicP2PNode`
+### Layer 3: Applications
 - **`examples/`**: Demo applications showing various use cases
 
 ### NAT Traversal Architecture
@@ -313,14 +299,12 @@ cargo nextest run --ignored stress
 - **Pure PQC Raw Public Keys** with BLAKE3(ML-DSA-65) PeerId + ML-DSA-65 auth (v0.2) - NO X.509 certificates
 - **Dual-stack IPv4/IPv6** support with transparent address handling
 - High-level APIs: `QuicP2PNode` and `NatTraversalEndpoint`
-- Production binary `saorsa-transport` with full QUIC implementation
 - Comprehensive test suite (580+ tests)
 - Automatic connection to known peers on startup (v0.4.1+)
 - Peer authentication with ML-DSA-65 signatures
 - Secure chat protocol with message versioning
 - Real-time monitoring dashboard
 - GitHub Actions for automated releases
-- Multi-platform binary releases
 - Platform-specific network interface discovery (Windows, Linux, macOS)
 - QUIC Address Discovery Extension (draft-ietf-quic-address-discovery-00)
 - OBSERVED_ADDRESS frame (0x9f81a6-a7) implementation
@@ -358,7 +342,7 @@ cargo nextest run --ignored stress
 ### Logging
 ```bash
 # Enable verbose NAT traversal logging
-RUST_LOG=saorsa_transport::nat_traversal=debug cargo run --bin saorsa-transport
+RUST_LOG=saorsa_transport::nat_traversal=debug cargo nextest run nat_traversal --no-capture
 
 # Connection-level debugging
 RUST_LOG=saorsa_transport::connection=trace cargo nextest run --no-capture
@@ -367,7 +351,7 @@ RUST_LOG=saorsa_transport::connection=trace cargo nextest run --no-capture
 RUST_LOG=debug cargo run --example nat_simulation
 
 # PQC-specific debugging
-RUST_LOG=saorsa_transport::crypto::pqc=debug cargo run --bin saorsa-transport
+RUST_LOG=saorsa_transport::crypto::pqc=debug cargo nextest run pqc --no-capture
 ```
 
 ### Network Simulation
@@ -395,7 +379,6 @@ Use `examples/nat_simulation.rs` for testing different network topologies and NA
 - **QUIC Node**: `src/quic_node.rs` - P2P node implementation
 - **Connection Logic**: `src/connection_establishment.rs` - Connection orchestration
 - **PQC Implementation**: `src/crypto/pqc/` - Post-quantum crypto modules
-- **Binary**: `src/bin/saorsa-transport.rs` - Main executable with CLI
 - **Config**: `Cargo.toml` - Feature flags, dependencies, build configuration
 
 ## Reference Specifications (docs/rfcs/ directory)
@@ -439,43 +422,6 @@ Key shared information that must stay synchronized:
 - Architecture overview and key file locations
 
 ---
-
-## 🚨 CRITICAL: Saorsa Network Infrastructure & Port Isolation
-
-### Infrastructure Documentation
-Full infrastructure documentation is available at: `docs/infrastructure/INFRASTRUCTURE.md`
-
-This includes:
-- All 9 VPS nodes across 3 cloud providers (DigitalOcean, Hetzner, Vultr)
-- Bootstrap node endpoints and IP addresses
-- Firewall configurations and SSH access
-- Systemd service templates
-
-### Port Allocation
-
-All P2P services use **dynamic port allocation** (bind to port 0). The OS assigns an available port automatically, preventing collisions between services.
-
-```bash
-# Run saorsa-transport with dynamic port (recommended)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:0
-
-# Or with saorsa-transport-test
-cargo run --bin saorsa-transport-test -- --registry https://saorsa-1.saorsalabs.com
-```
-
-### Bootstrap Discovery
-
-Bootstrap nodes use dynamic ports. New nodes discover bootstrap addresses via:
-
-1. **Registry API**: `https://saorsa-1.saorsalabs.com/api/peers` returns active nodes with current addresses
-2. **Gossip**: Once connected to any peer, discover others via gossip protocol
-
-### VPS Operations
-
-When managing VPS nodes:
-- Services register with the registry after binding to their dynamic port
-- Use service names (e.g., `systemctl restart saorsa-transport-test`) not port-based targeting
-- The registry API provides current addresses of all active nodes
 
 ## Pull requests: fill the template
 

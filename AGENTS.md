@@ -88,7 +88,6 @@ All nodes are equal. Any connected peer can:
 ## Project Structure
 
 - `src/`: Core library (QUIC, NAT traversal, crypto, metrics)
-- `src/bin/`: CLI binary (`saorsa-transport`)
 - `src/unified_config.rs`: P2pConfig, NatConfig, MtuConfig
 - `tests/`: Integration suites (`quick/`, `standard/`, `long/`, `property_tests/`)
 - `examples/`: Runnable demos (`simple_chat`, dashboard, PQC)
@@ -109,9 +108,6 @@ cargo test --all-features
 
 # Quick checks (fmt, clippy, smoke tests)
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
-
-# Run binary (all nodes are symmetric)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:9000
 
 # Run example
 cargo run --example simple_chat -- --listen 0.0.0.0:9000
@@ -200,7 +196,6 @@ Conventional Commits required (see `cliff.toml`):
 - **NAT Traversal API**: `src/nat_traversal_api.rs`
 - **QUIC Node**: `src/quic_node.rs`
 - **PQC Implementation**: `src/crypto/pqc/`
-- **Binary**: `src/bin/saorsa-transport.rs`
 
 ---
 

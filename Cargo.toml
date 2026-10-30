@@ -80,8 +80,6 @@ native = [
     "dep:dashmap",
     "dep:parking_lot",
     "dep:zeroize",
-    "dep:clap",
-    "dep:reqwest",
     "dep:tokio",
     "dep:tracing-subscriber",
     "dep:quinn-udp",
@@ -233,10 +231,8 @@ proptest-derive = { version = "0.9", optional = true }
 
 # criterion moved to dev-dependencies for benchmarks
 
-# Dependencies for saorsa-transport binary
+# Error handling, runtime and logging
 anyhow = "1"
-clap = { version = "4", features = ["derive"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 tokio = { version = "1.28.1", features = ["full"], optional = true }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time", "json"], optional = true }
 quinn-udp = { version = "0.6", features = ["tracing", "tracing-log"], optional = true }
@@ -290,30 +286,6 @@ proptest-derive = { version = "0.9" }
 # Install with: cargo install cargo-mutants
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(wasm_browser)', 'cfg(feature, values("arbitrary", "__qlog"))'] }
-
-# Main P2P binary with NAT traversal support
-[[bin]]
-required-features = ["native"]
-name = "saorsa-transport"
-path = "src/bin/saorsa-transport.rs"
-
-# Interoperability test runner
-[[bin]]
-required-features = ["native"]
-name = "interop-test"
-path = "src/bin/interop-test.rs"
-
-# Public endpoint tester
-[[bin]]
-required-features = ["native"]
-name = "test-public-endpoints"
-path = "src/bin/test_public_endpoints.rs"
-
-# E2E test node with metrics push and data verification
-[[bin]]
-required-features = ["native"]
-name = "e2e-test-node"
-path = "src/bin/e2e-test-node.rs"
 
 # Benchmarks
 [[bench]]
