@@ -1,5 +1,4 @@
-# Release - Build and publish releases
-# Builds multi-platform binaries and publishes to crates.io
+# Release - publish to crates.io and create the GitHub release
 
 name: Release
 
@@ -134,198 +133,6 @@ jobs:
             git push
           fi
 
-  build:
-    name: Build ${{ matrix.target }}
-    needs: [validate]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            binary: saorsa-transport
-            archive: saorsa-transport-x86_64-linux.tar.gz
-
-          # Linux musl (static, Alpine-compatible)
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            binary: saorsa-transport
-            archive: saorsa-transport-x86_64-linux-musl.tar.gz
-            use-cross: true
-
-          # Linux ARM64
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
-            binary: saorsa-transport
-            archive: saorsa-transport-aarch64-linux.tar.gz
-            use-cross: true
-
-          # Linux ARMv7 (Raspberry Pi, etc.)
-          - os: ubuntu-24.04
-            target: armv7-unknown-linux-gnueabihf
-            binary: saorsa-transport
-            archive: saorsa-transport-armv7-linux.tar.gz
-            use-cross: true
-
-          # macOS Intel
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary: saorsa-transport
-            archive: saorsa-transport-x86_64-macos.tar.gz
-
-          # macOS Apple Silicon
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: saorsa-transport
-            archive: saorsa-transport-aarch64-macos.tar.gz
-
-          # Windows MSVC
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: saorsa-transport.exe
-            archive: saorsa-transport-x86_64-windows.zip
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # Install NASM for Windows builds (required by aws-lc-rs)
-      - name: Install NASM
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/setup-nasm@v1
-
-      # Use actions-rust-cross for cross-compilation (handles everything)
-      - name: Build saorsa-transport (cross)
-        if: matrix.use-cross == true
-        uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: "--locked --release --bin saorsa-transport"
-          strip: true
-
-      # Native builds for non-cross targets
-      - name: Install Rust (native)
-        if: matrix.use-cross != true
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo (native)
-        if: matrix.use-cross != true
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build saorsa-transport (native)
-        if: matrix.use-cross != true
-        run: cargo build --release --target ${{ matrix.target }} --bin saorsa-transport
-        shell: bash
-
-      - name: Strip binaries (Unix, native builds only)
-        if: matrix.os != 'windows-latest' && matrix.use-cross != true
-        run: |
-          if command -v strip &> /dev/null; then
-            strip target/${{ matrix.target }}/release/${{ matrix.binary }} || true
-          fi
-
-      # macOS Code Signing
-      - name: Import Code Signing Certificate
-        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE != ''
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          # Create temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Import certificate
-          echo "$MACOS_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
-          security import $RUNNER_TEMP/certificate.p12 -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
-
-          # Allow codesign to access the key
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-      - name: Sign macOS Binaries
-        if: matrix.os == 'macos-latest' && env.MACOS_SIGNING_IDENTITY != ''
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-        run: |
-          # Sign the main binary
-          codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" \
-            target/${{ matrix.target }}/release/${{ matrix.binary }}
-
-          # Verify signature
-          codesign --verify --verbose target/${{ matrix.target }}/release/${{ matrix.binary }}
-
-          echo "✅ Binary signed successfully"
-
-      - name: Notarize macOS Binaries
-        if: matrix.os == 'macos-latest' && env.MACOS_NOTARIZATION_APPLE_ID != ''
-        env:
-          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
-          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
-          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
-        run: |
-          # Create ZIP for notarization (required format)
-          cd target/${{ matrix.target }}/release
-          zip saorsa-transport-notarize.zip ${{ matrix.binary }}
-
-          # Submit for notarization
-          echo "Submitting saorsa-transport for notarization..."
-          xcrun notarytool submit saorsa-transport-notarize.zip \
-            --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
-            --password "$MACOS_NOTARIZATION_PASSWORD" \
-            --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
-            --wait
-
-          # Staple the notarization ticket to binary
-          xcrun stapler staple ${{ matrix.binary }} || echo "Stapling binary (may fail for CLI tools)"
-
-          # Cleanup
-          rm -f saorsa-transport-notarize.zip
-          cd -
-
-          echo "✅ Notarization complete"
-
-      - name: Package saorsa-transport (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.archive }} ${{ matrix.binary }}
-          cd -
-          sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
-
-      - name: Package saorsa-transport (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.archive }} ${{ matrix.binary }}
-          cd -
-          certutil -hashfile ${{ matrix.archive }} SHA256 > ${{ matrix.archive }}.sha256
-
-      - name: Upload saorsa-transport Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.archive }}
-          path: |
-            ${{ matrix.archive }}
-            ${{ matrix.archive }}.sha256
-          retention-days: 1
-
   publish-crate:
     name: Publish to crates.io
     needs: [validate, changelog]
@@ -348,40 +155,16 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [validate, build, changelog]
+    needs: [validate, changelog]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Run even if some builds failed, but skip if validation failed
-    if: always() && github.event.inputs.dry_run != 'true' && needs.validate.result == 'success' && needs.changelog.result == 'success'
+    if: github.event.inputs.dry_run != 'true'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release
-          # Find only files (not directories) and move them to release/
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "*.zip" -o -name "*.zip.sha256" \) -exec mv {} release/ \;
-          # List what we found
-          echo "Release assets:"
-          ls -la release/
-          # Generate checksums for binary files only
-          cd release
-          sha256sum *.tar.gz *.zip 2>/dev/null | sort > checksums.txt || true
-          cat checksums.txt
-          cd ..
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.validate.outputs.version }}
-          files: release/*
           draft: false
           prerelease: ${{ needs.validate.outputs.is_prerelease }}
           generate_release_notes: false
@@ -396,31 +179,10 @@ jobs:
 
             ### Installation
 
-            #### From crates.io
             ```bash
-            cargo install saorsa-transport
-            ```
-
-            #### Pre-built binaries
-            Download the appropriate binary for your platform below.
-
-            **Linux/macOS:**
-            ```bash
-            tar -xzf saorsa-transport-*.tar.gz
-            chmod +x saorsa-transport
-            ./saorsa-transport --help
-            ```
-
-            **Windows:**
-            ```powershell
-            Expand-Archive saorsa-transport-*.zip
-            .\saorsa-transport.exe --help
+            cargo add saorsa-transport
             ```
 
             ### What's Changed
 
             ${{ needs.changelog.outputs.changelog }}
-
-            ### Checksums
-
-            See checksums.txt for SHA256 checksums of all binaries.

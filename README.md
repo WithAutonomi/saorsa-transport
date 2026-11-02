@@ -84,7 +84,7 @@ self-asserted roles.
 
 1. **Protocol Layer**: QUIC + NAT traversal extension frames
 2. **Integration APIs**: `P2pEndpoint`, `P2pConfig`
-3. **Applications**: Binary, examples
+3. **Applications**: examples
 
 ## Pure Post-Quantum Cryptography (v0.2)
 
@@ -213,13 +213,6 @@ This follows our [Pure PQC Authentication specification](docs/rfcs/saorsa-transp
 cargo add saorsa-transport
 ```
 
-### Pre-built Binaries
-
-Download from [GitHub Releases](https://github.com/WithAutonomi/saorsa-transport/releases):
-- Linux: `saorsa-transport-linux-x86_64`, `saorsa-transport-linux-aarch64`
-- Windows: `saorsa-transport-windows-x86_64.exe`
-- macOS: `saorsa-transport-macos-x86_64`, `saorsa-transport-macos-aarch64`
-
 ### From Source
 
 ```bash
@@ -227,36 +220,6 @@ git clone https://github.com/WithAutonomi/saorsa-transport
 cd saorsa-transport
 cargo build --release
 ```
-
-## Binary Usage
-
-```bash
-# Run as P2P node (auto-connects to default bootstrap nodes)
-saorsa-transport --listen 0.0.0.0:9000
-
-# Connect to specific known peers
-saorsa-transport --listen 0.0.0.0:9000 --known-peers 1.2.3.4:9000 --known-peers 5.6.7.8:9000
-
-# Show your external address (discovered via peers)
-saorsa-transport --listen 0.0.0.0:9000
-# Output: External address: YOUR.PUBLIC.IP:PORT
-
-# Run with monitoring dashboard
-saorsa-transport --dashboard --listen 0.0.0.0:9000
-
-# Interactive commands while running:
-# /status - Show connections and discovered addresses
-# /peers  - List connected peers
-# /help   - Show all commands
-```
-
-### Default Bootstrap Nodes
-
-If no `--known-peers` are specified, saorsa-transport automatically connects to the Saorsa Labs bootstrap nodes:
-- `saorsa-1.saorsalabs.com:9000`
-- `saorsa-2.saorsalabs.com:9000`
-
-These nodes run the same saorsa-transport software as any peer - they help with initial peer discovery and external address observation.
 
 ## API Reference
 

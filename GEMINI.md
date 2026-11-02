@@ -91,7 +91,6 @@ All nodes are equal. Any connected peer can:
 
 ```
 src/                    # Core library
-  bin/                  # CLI binary (saorsa-transport)
   connection/           # QUIC connection with NAT traversal extensions
   crypto/               # TLS 1.3 with Pure PQC Raw Public Keys (v0.2)
   crypto/pqc/           # Post-quantum cryptography (ML-KEM, ML-DSA)
@@ -116,9 +115,6 @@ cargo test --all-features
 # Quick checks
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-
-# Run binary (all nodes are symmetric)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:9000
 
 # Run example
 cargo run --example simple_chat
@@ -195,7 +191,6 @@ Conventional Commits required:
 - **NAT Traversal API**: `src/nat_traversal_api.rs`
 - **QUIC Node**: `src/quic_node.rs`
 - **PQC Implementation**: `src/crypto/pqc/`
-- **Binary**: `src/bin/saorsa-transport.rs`
 
 ---
 

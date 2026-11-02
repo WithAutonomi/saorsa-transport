@@ -277,7 +277,7 @@ This guide helps diagnose and resolve common issues with saorsa-transport's v0.1
    ```bash
    # Use cargo flamegraph
    cargo install flamegraph
-   cargo flamegraph --bin saorsa-transport
+   cargo flamegraph --bin <your-app>
    ```
 
 ### Problem: High memory usage

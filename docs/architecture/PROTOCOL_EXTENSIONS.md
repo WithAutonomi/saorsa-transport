@@ -341,7 +341,7 @@ cargo test --test nat_traversal -- matrix
 
 ```bash
 RUST_LOG=saorsa_transport::frame=trace,saorsa_transport::connection::nat_traversal=debug \
-    cargo run --bin saorsa-transport
+    cargo test nat_traversal -- --nocapture
 ```
 
 ### Packet Capture
