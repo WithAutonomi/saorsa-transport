@@ -220,7 +220,7 @@ qlog = { version = "0.18", optional = true }
 
 # Essential dependencies
 uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
-unicode-width = { version = "=0.2.2", optional = true } # Pinned to match ratatui
+unicode-width = { version = "=0.2.3", optional = true } # Pinned to match ratatui
 hex = { version = "0.4", optional = true }
 blake3 = { version = "1", optional = true }
 once_cell = { version = "1.21", optional = true }
