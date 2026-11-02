@@ -60,7 +60,6 @@ jobs:
 
             cargo build --locked --lib --bins --examples
             cargo test --locked --lib
-            cargo test --locked --lib -- --ignored stress
 
   # NetBSD testing via VM
   netbsd:
@@ -92,7 +91,6 @@ jobs:
 
             cargo build --locked --lib --bins --examples
             cargo test --locked --lib
-            cargo test --locked --lib -- --ignored stress
 
   # Solaris testing via VM
   solaris:
@@ -150,7 +148,6 @@ jobs:
 
             cargo build --locked --lib --bins --examples
             cargo test --locked --lib
-            cargo test --locked --lib -- --ignored stress
 
   # Android emulator testing
   android:

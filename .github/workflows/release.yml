@@ -424,18 +424,3 @@ jobs:
             ### Checksums
 
             See checksums.txt for SHA256 checksums of all binaries.
-
-  notify:
-    name: Notify Release
-    needs: [validate, release]
-    runs-on: ubuntu-latest
-    if: github.event.inputs.dry_run != 'true' && always()
-    steps:
-      - name: Notify Discord
-        if: env.DISCORD_WEBHOOK != ''
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          curl -H "Content-Type: application/json" \
-            -d "{\"content\": \"saorsa-transport ${{ needs.validate.outputs.version }} released! https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.version }}\"}" \
-            $DISCORD_WEBHOOK
