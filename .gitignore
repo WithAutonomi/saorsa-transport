@@ -41,7 +41,6 @@ tmp/
 # Old config files (removed from repo)
 compliance_report/
 results/
-docker/
 
 # Temporary files
 temp_clones/

@@ -79,16 +79,9 @@ This layer provides developer-friendly APIs wrapping the low-level protocol.
 - **`src/auth.rs`** - Authentication manager with challenge-response protocol
 - **`src/chat.rs`** - Chat protocol implementation
 
-### Layer 3: Applications (Binaries)
+### Layer 3: Applications
 
 User-facing applications demonstrating the library capabilities.
-
-#### Main Binary
-- **`src/bin/saorsa-transport.rs`** - Full QUIC P2P implementation
-  - Uses symmetric P2P model (v0.13.0+)
-  - Implements chat with peer discovery
-  - Dashboard support for monitoring
-  - NAT traversal event handling
 
 #### Examples
 - **`examples/chat_demo.rs`** - Chat application demo
@@ -222,7 +215,6 @@ The architecture supports extensions through:
 - 100% Post-Quantum Cryptography (v0.13.0+)
 - Symmetric P2P architecture (v0.13.0+)
 - High-level APIs (`P2pEndpoint`, `NatTraversalEndpoint`)
-- Production binary with full functionality
 - Comprehensive test suite
 - Peer authentication with Ed25519
 - Secure chat protocol

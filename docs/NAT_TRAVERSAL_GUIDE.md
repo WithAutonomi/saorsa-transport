@@ -8,11 +8,10 @@ This guide provides detailed information on testing and configuring NAT traversa
 
 1. [NAT Types Overview](#nat-types-overview)
 2. [Local NAT Simulation](#local-nat-simulation)
-3. [Docker NAT Testing](#docker-nat-testing)
-4. [Configuration Options](#configuration-options)
-5. [Testing Procedures](#testing-procedures)
-6. [Troubleshooting](#troubleshooting)
-7. [Performance Optimization](#performance-optimization)
+3. [Configuration Options](#configuration-options)
+4. [Testing Procedures](#testing-procedures)
+5. [Troubleshooting](#troubleshooting)
+6. [Performance Optimization](#performance-optimization)
 
 ## NAT Types Overview
 
@@ -116,126 +115,6 @@ sudo ip netns exec nat_ns iptables -t nat -A POSTROUTING -o veth2 -j MASQUERADE
 sudo ip netns exec nat_ns sysctl -w net.ipv4.ip_forward=1
 ```
 
-## Docker NAT Testing
-
-### Quick Start
-
-```bash
-# Clone the repository
-git clone https://github.com/WithAutonomi/saorsa-transport.git
-cd saorsa-transport/docker
-
-# Build Docker images
-docker-compose build
-
-# Start all NAT test scenarios
-docker-compose up -d
-
-# Run specific NAT test
-docker exec test-runner /app/run-test.sh full_cone_nat
-docker exec test-runner /app/run-test.sh symmetric_nat
-docker exec test-runner /app/run-test.sh port_restricted_nat
-
-# View results
-docker exec test-runner cat /app/results/test-*.json | jq .
-```
-
-### Docker Compose Configuration
-
-The `docker-compose.yml` defines multiple services simulating different NAT scenarios:
-
-```yaml
-version: '3.8'
-
-services:
-  # v0.13.0+: All nodes are symmetric - no "bootstrap" role distinction
-  peer-1:
-    build: .
-    networks:
-      public_net:
-        ipv4_address: 172.20.0.10
-    command: ["/app/saorsa-transport", "--listen", "0.0.0.0:9000"]
-
-  nat-gateway-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.nat
-    networks:
-      public_net:
-        ipv4_address: 172.20.0.20
-      private_net_1:
-        ipv4_address: 10.1.0.1
-    cap_add:
-      - NET_ADMIN
-    environment:
-      NAT_TYPE: "full_cone"
-
-  # v0.13.0+: Uses --connect instead of --bootstrap
-  peer-2:
-    build: .
-    networks:
-      private_net_1:
-        ipv4_address: 10.1.0.10
-    depends_on:
-      - nat-gateway-1
-    command: ["/app/saorsa-transport", "--connect", "172.20.0.10:9000"]
-
-networks:
-  public_net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
-
-  private_net_1:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 10.1.0.0/24
-```
-
-### Custom NAT Configurations
-
-Create custom NAT rules in `docker/nat-setup.sh`:
-
-```bash
-#!/bin/bash
-
-NAT_TYPE="${NAT_TYPE:-full_cone}"
-
-case $NAT_TYPE in
-  "full_cone")
-    # Full Cone NAT - most permissive
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-    iptables -A FORWARD -j ACCEPT
-    ;;
-    
-  "symmetric")
-    # Symmetric NAT - different port for each destination
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE --random
-    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -i eth0 -j DROP
-    ;;
-    
-  "port_restricted")
-    # Port Restricted NAT
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -i eth0 -j DROP
-    ;;
-    
-  "cgnat")
-    # Simulate CGNAT with limited port range
-    iptables -t nat -A POSTROUTING -o eth0 -j SNAT --to-source 172.20.0.20:10000-10999
-    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -i eth0 -j DROP
-    ;;
-esac
-
-# Enable IP forwarding
-sysctl -w net.ipv4.ip_forward=1
-```
-
 ## Configuration Options
 
 ### Transport Parameters
@@ -258,23 +137,6 @@ let config = P2pConfig::builder()
         ..Default::default()
     })
     .build()?;
-```
-
-### Runtime Configuration
-
-Configure via command-line arguments:
-
-```bash
-# v0.13.0+: All nodes are symmetric P2P nodes
-# Connect to known peers
-saorsa-transport --connect quic.saorsalabs.com:9000 \
-         --nat-traversal \
-         --max-candidates 20 \
-         --punch-timeout 10000
-
-# Listen for incoming connections
-saorsa-transport --listen 0.0.0.0:9000 \
-         --enable-relay
 ```
 
 ### Configuration File
@@ -308,20 +170,6 @@ enable_observed_address = true # 0x9f81a6-a7
 
 ## Testing Procedures
 
-### Basic Connectivity Test
-
-```bash
-# v0.13.0+: All nodes are symmetric - no "bootstrap" role distinction
-# 1. Start first peer (listening)
-cargo run --bin saorsa-transport -- --listen 0.0.0.0:9000
-
-# 2. Start second peer (connecting)
-cargo run --bin saorsa-transport -- --connect localhost:9000
-
-# 3. Verify connection
-# Look for: "Successfully connected through NAT"
-```
-
 ### Comprehensive NAT Test Suite
 
 ```bash
@@ -346,23 +194,6 @@ cargo test --test connection_lifecycle_tests stress -- --ignored
 
 # Measure hole punching latency
 cargo run --example nat_latency_test
-```
-
-### Multi-Node Testing
-
-```bash
-# v0.13.0+: All nodes are symmetric P2P nodes
-# Start first peer (as initial connection target)
-saorsa-transport --listen 0.0.0.0:9000 --log peer-0.log &
-
-# Start multiple additional peers
-for i in {1..10}; do
-  saorsa-transport --connect localhost:9000 --peer-id "peer-$i" \
-           --log "peer-$i.log" &
-done
-
-# Monitor success rate
-grep "NAT traversal successful" peer-*.log | wc -l
 ```
 
 ## Troubleshooting
@@ -398,7 +229,7 @@ sudo iptables -L -n | grep 9000
 **Diagnosis**:
 ```bash
 # Enable detailed logging
-RUST_LOG=saorsa_transport::nat_traversal=debug cargo run --bin saorsa-transport
+RUST_LOG=saorsa_transport::nat_traversal=debug cargo test nat_traversal -- --nocapture > debug.log 2>&1
 
 # Check candidate discovery
 grep "Discovered candidate" debug.log
@@ -503,22 +334,6 @@ punch_burst_size = 3            # Send multiple packets
 let pool = ConnectionPool::new()
     .with_nat_cache_duration(Duration::from_secs(300))
     .with_max_cached_mappings(100);
-```
-
-### Metrics and Monitoring
-
-```bash
-# Enable metrics endpoint
-saorsa-transport --metrics-port 8080
-
-# Query metrics
-curl localhost:8080/metrics | grep nat_
-
-# Key metrics:
-# - nat_traversal_attempts_total
-# - nat_traversal_success_total
-# - nat_traversal_duration_seconds
-# - nat_hole_punching_packets_sent
 ```
 
 ## Best Practices
