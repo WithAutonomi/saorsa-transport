@@ -1,212 +1,40 @@
-# CI/CD Architecture
+# CI architecture
 
-## Overview
+CI runs on pull requests, on a schedule, and by hand (`workflow_dispatch`). Nothing runs on a push to `main`: a merged PR has already passed CI on its head (V2-1353). The org is on GitHub's Free plan, so every repo shares one pool of concurrent jobs, including a small number of macOS runners. That is why each piece of work runs once per PR.
 
-The saorsa-transport CI/CD pipeline is designed as a modular, extensible system that ensures code quality, security, and compatibility across multiple platforms.
+## Pull requests
 
-## Pipeline Flow
+| Workflow | Job | What it runs |
+| -- | -- | -- |
+| `ci.yml` | Quick Checks | fmt; clippy `--all-features --all-targets`; clippy on the portable WebRTC profile; `cargo check` of lib/bins/examples; both WASM checks; licence headers |
+| | Test Suite (Linux) | build; lib tests with all features and with no default features; WebRTC profile tests; every integration test target (`--test '*'`); doc tests |
+| | Tests (windows-latest), Tests (macos-latest) | default features: lib tests and the `quick` and `auto_binding_integration` targets. macOS also builds `x86_64-apple-darwin` |
+| | MSRV (1.95.0) | `cargo check` with all features and with no default features |
+| | CI Gate | fails unless every job above succeeded |
+| `pr-checks.yml` | linear-link, pr-template | the required status checks (see CLAUDE.md, "Pull requests") |
+| | self-test | tests for `check_pr.py` |
+| `coverage.yml` | Coverage | `cargo llvm-cov --lib`; HTML report artifact; warns below the threshold, doesn't gate |
+| `security.yml` | Vulnerability Scan (`cargo audit`), Policy Check (`cargo deny`), SBOM, Security Report, Dependency Review, Security Gate | only when `Cargo.toml` or `Cargo.lock` changes |
 
-```mermaid
-flowchart TB
-    subgraph "Triggers"
-        PR[Pull Request]
-        Push[Push to Branch]
-        Schedule[Scheduled]
-        Manual[Manual Dispatch]
-        Tag[Version Tag]
-    end
+`claude.yml` runs only when someone mentions `@claude`.
 
-    subgraph "Quick Validation"
-        Format[Format Check]
-        Lint[Clippy Lint]
-        QuickTest[Quick Tests <30s]
-        DocBuild[Doc Build]
-    end
+## Scheduled and manual
 
-    subgraph "Extended Validation"
-        Security[Security Scan]
-        Platform[Cross-Platform]
-        Property[Property Tests]
-        Bench[Benchmarks]
-        Docker[Docker NAT]
-    end
+| Workflow | When | What |
+| -- | -- | -- |
+| `security.yml` | daily 02:00 UTC | `cargo audit` and `cargo deny`; advisories change without the tree changing |
+| `platforms.yml` | Mondays 02:00 UTC | the full matrix: Linux stable/beta/MSRV, aarch64 Linux (cross), x86_64 and aarch64 macOS, Windows. Dispatch can pick `minimal` |
+| `tests.yml` | Mondays 04:00 UTC | extended property tests (1024 cases, release build) |
+| `platforms-exotic.yml` | Fridays 03:21 UTC | FreeBSD, NetBSD, Solaris, illumos, Android, feature powerset |
+| `benchmarks.yml` | Sundays 00:00 UTC | criterion benchmarks |
 
-    subgraph "Release Process"
-        Version[Version Check]
-        BuildAll[Multi-Platform Build]
-        Package[Package Artifacts]
-        Publish[Publish]
-        GitHubRel[GitHub Release]
-    end
+## Releases
 
-    subgraph "Outputs"
-        Badges[Status Badges]
-        Reports[Test Reports]
-        Coverage[Coverage Data]
-        Artifacts[Build Artifacts]
-        Notifications[Notifications]
-    end
+`release.yml` runs on a `v*` tag: validate the tag against `Cargo.toml`, generate the changelog (git-cliff), build the 7 release targets, publish the crate, create the GitHub release. It doesn't re-run the test suite (V2-1353).
 
-    PR --> Format
-    Push --> Format
-    Schedule --> Security
-    Manual --> Format
-    Tag --> Version
+## Adding a check
 
-    Format --> Lint
-    Lint --> QuickTest
-    QuickTest --> DocBuild
-
-    DocBuild --> Security
-    DocBuild --> Platform
-    DocBuild --> Property
-    DocBuild --> Bench
-
-    Platform --> Docker
-
-    Version --> BuildAll
-    BuildAll --> Package
-    Package --> Publish
-    Publish --> GitHubRel
-
-    Security --> Reports
-    Platform --> Artifacts
-    Property --> Reports
-    Bench --> Reports
-    Coverage --> Badges
-    GitHubRel --> Notifications
-```
-
-## Workflow Categories
-
-### 1. Continuous Integration (Every PR/Push)
-- **quick-checks.yml**: Format, lint, quick tests
-- **cross-platform.yml**: Platform compatibility
-- **security.yml**: Vulnerability scanning
-
-### 2. Scheduled Tasks
-- **benchmarks.yml**: Weekly performance tracking
-- **security.yml**: Daily vulnerability checks
-
-### 3. Release Automation
-- **release-enhanced.yml**: Tag-triggered releases
-- **coverage.yml**: Coverage reporting
-
-### 4. Specialized Testing
-- **property-tests.yml**: Randomized testing
-- **docker-nat-tests.yml**: NAT traversal scenarios
-
-## Key Design Principles
-
-### 1. Fail Fast
-Quick checks run first to catch common issues early:
-```yaml
-needs: [format, lint]  # Don't run expensive tests if basics fail
-```
-
-### 2. Parallelization
-Independent jobs run concurrently:
-```yaml
-strategy:
-  matrix:
-    os: [ubuntu-latest, macos-latest, windows-latest]
-```
-
-### 3. Caching
-Aggressive caching for dependencies:
-```yaml
-cache:
-  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-```
-
-### 4. Modularity
-Each workflow has a single responsibility, making them:
-- Easy to understand
-- Simple to debug
-- Reusable
-
-### 5. Conditional Execution
-Run expensive operations only when needed:
-```yaml
-if: |
-  github.event_name == 'push' ||
-  contains(github.event.pull_request.labels.*.name, 'benchmark')
-```
-
-## Resource Optimization
-
-### Concurrency Control
-```yaml
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-```
-
-### Timeout Management
-```yaml
-timeout-minutes: 30  # Workflow level
-steps:
-  - timeout-minutes: 10  # Step level
-```
-
-### Artifact Retention
-```yaml
-retention-days: 7  # Don't keep forever
-```
-
-## Security Considerations
-
-1. **Secrets are never logged** - GitHub masks them automatically
-2. **Third-party actions are pinned** - Use SHA instead of tags
-3. **Minimal permissions** - Workflows request only needed permissions
-4. **Dependabot updates** - Keep actions up to date
-
-## Monitoring and Metrics
-
-### Key Metrics Tracked
-- Workflow success rate
-- Average execution time
-- Test coverage trends
-- Security vulnerability count
-- Platform-specific pass rates
-
-### Dashboards Available
-- GitHub Actions tab (built-in)
-- CI Dashboard (docs/ci-dashboard.html)
-- Codecov.io (coverage trends)
-- Security tab (vulnerability alerts)
-
-## Extensibility
-
-### Adding New Workflows
-1. Create `.github/workflows/new-workflow.yml`
-2. Follow naming conventions
-3. Include standard environment variables
-4. Add to documentation
-5. Update dashboard if needed
-
-### Integration Points
-- Status checks for PR merge requirements
-- Webhook notifications for external services
-- API access for custom tooling
-- Badge generation for README
-
-## Cost Optimization
-
-### GitHub Actions Minutes
-- Public repo: Unlimited for public runners
-- Private repo: Limited by plan
-
-### Optimization Strategies
-1. Use workflow conditions to skip unnecessary runs
-2. Leverage caching to reduce build times
-3. Run expensive tests only on main branch
-4. Use concurrency limits to prevent parallel runs
-
-## Future Improvements
-
-- [ ] Self-hosted runners for better performance
-- [ ] GPU runners for specialized tests
-- [ ] Integration with external monitoring
-- [ ] Advanced caching strategies
-- [ ] Multi-region testing infrastructure
+- **A new PR check is a step or job in `ci.yml` that feeds `CI Gate`**, not a new workflow. A separate workflow compiles the crate again and takes another runner, and nothing gates on it.
+- **A check must be able to fail.** Don't add `continue-on-error`, `|| true`, or `|| echo` to a check. If a result is advisory, say so in the job name and leave it out of `CI Gate`.
+- **Run multi-line steps under bash on Windows.** A multi-line `pwsh` step only fails if its last command fails.
+- **Skip a test in CI only with a linked ticket**, and remove the skip when the ticket closes.
