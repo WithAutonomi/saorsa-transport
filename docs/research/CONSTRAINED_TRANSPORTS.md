@@ -1712,7 +1712,6 @@ impl Message {
 ### saorsa-transport Documentation
 
 - [PQC Security Analysis](../guides/pqc-security.md)
-- [Architecture Overview](../architecture/ARCHITECTURE.md)
 
 ---
 

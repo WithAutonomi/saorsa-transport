@@ -65,4 +65,4 @@ Key design elements:
 
 - Commit: `0c91bcab` (feat: add LinkTransport trait abstraction layer)
 - File: `src/link_transport.rs`
-- Related: Three-layer architecture in `docs/architecture/ARCHITECTURE.md`
+- Related: Three-layer architecture in `docs/architecture/ARCHITECTURE.md`. *(Note, 2026-11-03: that document was deleted in V2-1798 because it no longer described the crate: it covered only the QUIC core, named files and APIs that don't exist, and contradicted ADR-003 on cryptography. The module map in the `src/lib.rs` crate docs replaces it. This ADR's decision is unchanged.)*

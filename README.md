@@ -329,8 +329,8 @@ See [docs/review.md](docs/review.md) for detailed RFC compliance analysis.
 - [API reference](https://docs.rs/saorsa-transport) - on docs.rs
 - [Symmetric P2P](docs/SYMMETRIC_P2P.md) - Architecture explanation
 - [PQC Configuration](docs/guides/pqc-configuration.md) - PQC tuning
-- [Architecture](docs/architecture/ARCHITECTURE.md) - System design
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues
+- [Module map](https://docs.rs/saorsa-transport) - in the crate docs, with links to the ADRs
+- [Wire format](docs/architecture/PROTOCOL_EXTENSIONS.md) - transport parameters and frames
 
 ## Examples
 

@@ -57,6 +57,6 @@ Relevant commits, RFCs, code paths.
 
 ## Related Documentation
 
-- [Architecture Overview](../architecture/ARCHITECTURE.md)
+- [Wire format of the QUIC extensions](../architecture/PROTOCOL_EXTENSIONS.md)
 - [Symmetric P2P Design](../SYMMETRIC_P2P.md)
 - [PQC Authentication Spec](../rfcs/saorsa-transport-pqc-authentication.md)
