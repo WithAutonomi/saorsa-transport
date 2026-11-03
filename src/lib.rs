@@ -801,3 +801,9 @@ pub use token::TokenStore;
 pub(crate) use token::{NoneTokenLog, ResetToken, TokenLog};
 #[cfg(feature = "native")]
 pub(crate) use token_memory_cache::TokenMemoryCache;
+
+// Compile the README's Rust code blocks as doctests, so its Quick Start can't drift
+// from the API (V2-1798). `sh` blocks are not Rust and are skipped.
+#[cfg(all(doctest, feature = "native"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
