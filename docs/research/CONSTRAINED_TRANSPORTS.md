@@ -5,6 +5,13 @@
 **Status**: Research / Proposal  
 **Author**: David Irvine, Saorsa Labs  
 **Date**: January 2026  
+
+> **Implementation note (2026-11-03, V2-1798):** this is a research proposal from January 2026 and does not describe the current API.
+>
+> - **Built:** a subset. The `TransportProvider` / `TransportRegistry` / `TransportAddr` abstraction (`src/transport/`), a UDP provider, a BLE provider (feature `ble`), a constrained-protocol engine with ARQ and a 5-byte header (`src/constrained/`), and capability-based engine selection (`src/connection_router.rs`).
+> - **Not built:** the LoRa, serial/HDLC, AX.25, I2P and Yggdrasil transports; the routing and gateway layer; the delay-tolerant message protocol; the separate crates; and the Section 12 timeline.
+>
+> Where this document differs from the code, the code is authoritative. For example, the PeerId is BLAKE3-based, not SHA-256, and BLE addresses are `{mac, psm}`. See the rustdoc for `saorsa_transport::transport` and `saorsa_transport::constrained`.
 **Version**: 0.1
 
 ---
@@ -1711,7 +1718,7 @@ impl Message {
 
 ### saorsa-transport Documentation
 
-- [PQC Security Analysis](../guides/pqc-security.md)
+- [PQC authentication spec](../rfcs/saorsa-transport-pqc-authentication.md)
 
 ---
 

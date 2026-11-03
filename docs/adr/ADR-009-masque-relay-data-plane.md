@@ -4,6 +4,8 @@
 
 Accepted (2026-03-29)
 
+> **Note (2026-11-03, V2-1798):** Since this was written, the stream framing has also come to carry control frames and keep-alives (`src/masque/tunnel_control.rs`). Teardown ordering is covered by ADR-013 and port reservation by ADR-011. The decision itself is unchanged.
+
 ## Context
 
 ### The Problem

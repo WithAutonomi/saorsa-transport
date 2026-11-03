@@ -4,6 +4,13 @@
 
 Accepted (2025-12-21)
 
+> **Note (2026-11-03, V2-1798):** Two points no longer match the code.
+>
+> - **Peer identity:** no Ed25519 remains. The PeerId is a 32-byte BLAKE3 fingerprint of the ML-DSA-65 public key with the domain prefix `AUTONOMI_PEER_ID_V2:` (`fingerprint_public_key`).
+> - **Key exchange:** the TLS group actually negotiated is the hybrid X25519MLKEM768 (`0x11EC`). The provider keeps only the ML-KEM groups from rustls's default list, and pure ML-KEM-768 is not among them. So "no hybrid" is the intent, not current behaviour. See V2-1798.
+>
+> The decision itself is unchanged.
+
 ## Context
 
 Quantum computers threaten classical cryptography:

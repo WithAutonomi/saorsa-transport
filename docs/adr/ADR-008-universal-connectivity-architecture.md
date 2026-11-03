@@ -4,6 +4,8 @@
 
 Accepted
 
+> **Note (2026-11-03, V2-1798):** The configuration snippet below is illustrative. `ip_mode`, `allow_ipv4_mapped` and `relay_fallback` are not `P2pConfigBuilder` methods; `IpMode` lives in `src/config/port.rs`, and relay fallback is always on. The decision itself is unchanged.
+
 ## Date
 
 2025-12-26

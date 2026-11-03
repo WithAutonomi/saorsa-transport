@@ -4,6 +4,8 @@
 
 Accepted (2025-12-21)
 
+> **Note (2026-11-03, V2-1798):** The trait sketched below has since changed. Identity is `local_public_key()`, the peer table is keyed by `SocketAddr`, events come from `subscribe()`, and dialling is by address (`dial_addr`); there is no dial by `PeerId`. See `src/link_transport.rs` for the current signatures. The decision itself is unchanged.
+
 ## Context
 
 Overlay networks like saorsa-core need to build on top of saorsa-transport's QUIC transport, but face several challenges:
