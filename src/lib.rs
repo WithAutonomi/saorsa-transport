@@ -241,8 +241,12 @@ pub mod structured_events;
 /// Zero-configuration P2P node - THE PRIMARY API
 ///
 /// Use [`Node`] for the simplest possible P2P experience:
-/// ```rust,ignore
+/// ```no_run
+/// # use saorsa_transport::Node;
+/// # async fn example() -> anyhow::Result<()> {
 /// let node = Node::new().await?;
+/// # Ok(())
+/// # }
 /// ```
 #[cfg(feature = "native")]
 pub mod node;

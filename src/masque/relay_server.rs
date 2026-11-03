@@ -27,9 +27,8 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```
 //! use saorsa_transport::masque::relay_server::{MasqueRelayServer, MasqueRelayConfig};
-//! use std::net::SocketAddr;
 //!
 //! let config = MasqueRelayConfig::default();
 //! let public_addr = "203.0.113.50:9000".parse().unwrap();
@@ -736,11 +735,13 @@ impl MasqueRelayServer {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::masque::relay_server::{MasqueRelayConfig, MasqueRelayServer};
+    /// # let config = MasqueRelayConfig::default();
     /// let server = MasqueRelayServer::new_dual_stack(
     ///     config,
-    ///     "203.0.113.50:9000".parse()?,
-    ///     "[2001:db8::1]:9000".parse()?,
+    ///     "203.0.113.50:9000".parse().unwrap(),
+    ///     "[2001:db8::1]:9000".parse().unwrap(),
     /// );
     /// assert!(server.supports_dual_stack());
     /// ```
