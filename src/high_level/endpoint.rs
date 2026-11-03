@@ -590,7 +590,7 @@ pub struct EndpointStats {
     pub refused_handshakes: u64,
     /// Cummulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
-    /// Cumulative count of [`ConnectionEvent`]s dropped because a
+    /// Cumulative count of `ConnectionEvent`s dropped because a
     /// per-connection inbox was full.
     ///
     /// Since the per-connection mailbox was converted from
