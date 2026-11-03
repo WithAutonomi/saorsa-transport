@@ -20,7 +20,7 @@
 //!
 //! The browser keeps the ICE credentials generated for its local SDP offer and
 //! synthesizes the listener's SDP answer from the bootstrap endpoint. The
-//! answer's username fragment uses [`ICE_CREDENTIAL_PREFIX`] and carries the
+//! answer's username fragment uses [`ICE_CREDENTIAL_PREFIX`](crate::webrtc::direct::ICE_CREDENTIAL_PREFIX) and carries the
 //! browser-generated ICE password. The listener recovers that password, the
 //! browser's username fragment, and its observed address from the first STUN
 //! binding request, then constructs the corresponding peer connection locally.

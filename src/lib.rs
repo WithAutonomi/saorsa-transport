@@ -69,7 +69,7 @@
 //!
 //! **Observability and support**
 //! - [`traffic`], [`metrics`], [`logging`], [`structured_events`],
-//!   [`tracing`](crate::tracing), [`stats_dashboard`], [`terminal_ui`].
+//!   [`tracing`], [`stats_dashboard`], [`terminal_ui`].
 //! - [`config`], [`shutdown`], [`watchable`], [`fair_polling`], [`bounded_pending_buffer`],
 //!   [`chat`].
 //!
