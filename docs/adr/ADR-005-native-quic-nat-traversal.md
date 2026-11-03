@@ -127,6 +127,6 @@ Based on IETF drafts (not yet RFCs):
 
 - Specification: `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt`
 - Address Discovery: `docs/rfcs/draft-ietf-quic-address-discovery-00.txt`
-- Documentation: `docs/NAT_TRAVERSAL_GUIDE.md`
+- Documentation: `docs/NAT_TRAVERSAL_GUIDE.md`. *(Note, 2026-11-03: that guide was deleted in V2-1798 because most of it described config, APIs, examples and frame IDs that don't exist. The wire format is in `docs/architecture/PROTOCOL_EXTENSIONS.md`. This ADR's decision is unchanged.)*
 - Implementation: `src/nat_traversal_api.rs`, `src/connection/nat_traversal.rs`
 - Frame definitions: `src/frame.rs`

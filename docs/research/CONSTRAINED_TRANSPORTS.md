@@ -1711,9 +1711,7 @@ impl Message {
 
 ### saorsa-transport Documentation
 
-- [NAT Traversal Guide](../NAT_TRAVERSAL_GUIDE.md)
 - [PQC Security Analysis](../guides/pqc-security.md)
-- [Architecture Overview](../architecture/ARCHITECTURE.md)
 
 ---
 

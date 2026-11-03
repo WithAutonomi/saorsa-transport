@@ -1,386 +1,222 @@
-# saorsa-transport Protocol Extensions
+# saorsa-transport Wire Reference: QUIC Extensions
 
-This document describes the QUIC protocol extensions implemented in saorsa-transport for NAT traversal and address discovery.
+This document specifies the QUIC transport parameters and extension frames that saorsa-transport puts on the wire for NAT traversal and address discovery. It is normative for peer implementations: a compatible peer must produce and accept what is described here.
 
-## Overview
+It describes the code at commit 84b9097e, including behaviour that is probably unintended; those cases are listed under "Known issues". It is based on `draft-seemann-quic-nat-traversal-02` and `draft-ietf-quic-address-discovery-00` (copies in `docs/rfcs/`), with the deviations listed below. Where this document and a draft disagree, this document describes what saorsa-transport does.
 
-saorsa-transport implements the following IETF drafts and custom extensions:
+Conventions: `(i)` is a QUIC variable-length integer (RFC 9000 section 16); `(n)` is n bits; all fixed-width integers and ports are big-endian.
 
-1. **draft-ietf-quic-address-discovery-00** - QUIC Address Discovery
-2. **draft-seemann-quic-nat-traversal-02** - QUIC NAT Traversal
-3. Custom extensions for enhanced P2P connectivity
+## Transport parameters
 
-**v0.13.0+: Symmetric P2P Architecture**
-- All nodes have identical capabilities
-- Any peer can observe addresses and coordinate NAT traversal
-- No client/server/bootstrap role distinctions
+These are ordinary QUIC transport parameters, carried in the TLS transport-parameters extension.
 
-## Transport Parameters
+| ID | Name | Value encoding | Who may send |
+|---|---|---|---|
+| `0x3d7e9f0bca12fea6` | nat_traversal | Empty (length 0) = "ClientSupport". Non-empty = one varint, the concurrency limit = "ServerSupport". | Either endpoint may send either form (symmetric P2P). |
+| `0x3d7e9f0bca12fea8` | rfc_nat_traversal (saorsa-specific, not in the draft) | Empty (length 0). Any non-empty value is Malformed. | Either endpoint. Sent whenever NAT traversal is configured. |
+| `0x9f81a176` | address_discovery | One varint: `0` = send only, `1` = receive only, `2` = send and receive. | Either endpoint. |
+| `0x50C0` | pqc_algorithms | Length 1, then one byte bitfield: bit 0 = ML-KEM-768, bit 1 = ML-DSA-65, bits 2-7 reserved (sent as 0). | Either endpoint. The ID is in the experimental range; not IANA-assigned. |
 
-### NAT Traversal Parameters
+Validation:
+- Each of these parameters may appear at most once; a duplicate is Malformed.
+- nat_traversal: a concurrency limit of 0 is IllegalValue on either side. A limit above 100 is IllegalValue only when the receiver is the accepting (server) side of the connection; the dialling side accepts any non-zero value.
+- address_discovery: any value other than 0, 1, 2 is Malformed.
+- pqc_algorithms: a length other than 1 is Malformed.
+- Senders must write the length as the exact encoded size of the value. The decoder does not check that the length of nat_traversal (ServerSupport) or address_discovery matches the varint it reads (see Known issues).
 
-Negotiates NAT traversal capabilities during the handshake:
+Negotiation:
+- NAT traversal is active on a connection only if the local endpoint has it configured, the peer sent nat_traversal, and at least one of the two sent ServerSupport. If both sent ClientSupport, it is not active. The concurrency limit is validated as above but has no further effect on the wire.
+- The RFC frame format (below) is used for sending only if the local endpoint has NAT traversal configured and the peer sent rfc_nat_traversal. Otherwise the legacy format is used for sending.
+- A node sends OBSERVED_ADDRESS once the peer has sent address_discovery, whatever its value, unless the application has disabled address discovery. The node's own address_discovery value and the 0/1/2 modes are not consulted when sending or receiving (see Known issues).
 
-```
-nat_traversal_capability (0x3d7e9f0bca12fea6): {
-    value: varint,  // 1 = enabled, 0 = disabled
-}
+## Frame types
 
-rfc_nat_traversal_frames (0x3d7e9f0bca12fea8): {
-    value: varint,  // 1 = RFC-compliant frame format
-}
-```
+Frame types are encoded as varints. All of them are larger than 16383 and smaller than 2^30, so each takes 4 bytes on the wire. Each frame that carries an address has one type for IPv4 and one for IPv6, as listed below. Take the address family from this table, not from the type's parity: for ADD_ADDRESS, PUNCH_ME_NOW and OBSERVED_ADDRESS the IPv4 type is even, but for TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE it is odd.
 
-### Address Discovery Parameters
+| Frame | IPv4 | IPv6 |
+|---|---|---|
+| ADD_ADDRESS | `0x3d7e90` | `0x3d7e91` |
+| PUNCH_ME_NOW | `0x3d7e92` | `0x3d7e93` |
+| REMOVE_ADDRESS | `0x3d7e94` (one type, no address) | |
+| TRY_CONNECT_TO | `0x3d7e95` | `0x3d7e96` |
+| TRY_CONNECT_TO_RESPONSE | `0x3d7e97` | `0x3d7e98` |
+| OBSERVED_ADDRESS | `0x9f81a6` | `0x9f81a7` |
 
-Configure address discovery behavior:
+The authoritative IDs are the `FrameType` constants in `src/frame.rs`.
 
-```
-address_discovery_config (0x9f81a176): {
-    value: varint,  // Configuration flags
-}
-```
+These frames are only valid in 1-RTT packets. Received in an Initial, Handshake or 0-RTT packet, any of them is a PROTOCOL_VIOLATION. Senders must not put them in 0-RTT packets.
 
-## Extension Frames
+## Frame layouts
 
-### OBSERVED_ADDRESS Frame (Type=0x9f81a6 IPv4, 0x9f81a7 IPv6)
+IPv4 address = 4 bytes, IPv6 address = 16 bytes, followed by a 16-bit port. In the RFC format (and all frames other than legacy ADD_ADDRESS and PUNCH_ME_NOW) the address family is given by the frame type alone; there is no version byte.
 
-Informs the peer of their observed network address as seen by the sender.
+### ADD_ADDRESS
 
-#### Frame Structure
-
-```
-OBSERVED_ADDRESS Frame {
-    Type (i) = 0x9f81a6 (IPv4) or 0x9f81a7 (IPv6),
-    Sequence Number (i),
-    IP Address (32 for IPv4, 128 for IPv6),
-    Port (16),
-}
-```
-
-#### Fields
-
-- **Type**: Frame type identifier (0x9f81a6 for IPv4, 0x9f81a7 for IPv6)
-- **Sequence Number**: Monotonically increasing counter for ordering
-- **IP Address**: 4 bytes for IPv4, 16 bytes for IPv6
-- **Port**: UDP port number (network byte order)
-
-#### Usage Example
-
-```rust
-// Sending an observed address
-connection.send_observed_address(
-    peer_addr.ip(),
-    peer_addr.port(),
-    sequence_num
-)?;
-
-// Receiving handler
-match frame {
-    Frame::ObservedAddress { ip, port, sequence } => {
-        if sequence > last_sequence {
-            update_reflexive_address(ip, port);
-            last_sequence = sequence;
-        }
-    }
-}
-```
-
-### ADD_ADDRESS Frame (Type=0x3d7e90 IPv4, 0x3d7e91 IPv6)
-
-Advertises additional addresses where the sender can be reached.
-
-#### Frame Structure
+RFC format (identical to the draft):
 
 ```
 ADD_ADDRESS Frame {
-    Type (i) = 0x3d7e90 (IPv4) or 0x3d7e91 (IPv6),
-    Address ID (i),
-    IP Address (32 for IPv4, 128 for IPv6),
-    Port (16),
-    Priority (i),
+  Type (i) = 0x3d7e90 / 0x3d7e91,
+  Sequence Number (i),
+  IP Address (32 or 128),
+  Port (16),
 }
 ```
 
-#### Fields
+Legacy format:
 
-- **Address ID**: Unique identifier for this address
-- **Priority**: Higher values = preferred candidates
+```
+ADD_ADDRESS Frame {
+  Type (i) = 0x3d7e90 / 0x3d7e91,
+  Sequence Number (i),
+  Priority (i),
+  IP Version (8) = 4 or 6,
+  IP Address (32 or 128),
+  Port (16),
+  [ Flow Info (32), Scope Id (32) ]   // IPv6 only
+}
+```
 
-### PUNCH_ME_NOW Frame (Type=0x3d7e92 IPv4, 0x3d7e93 IPv6)
+In the RFC format no priority is sent; the receiver computes a local priority from the address. Local candidates are numbered from sequence number 1.
 
-Coordinates simultaneous hole punching attempts.
+### PUNCH_ME_NOW
 
-#### Frame Structure
+RFC format:
 
 ```
 PUNCH_ME_NOW Frame {
-    Type (i) = 0x3d7e92 (IPv4) or 0x3d7e93 (IPv6),
-    Round ID (i),
-    Target Address Count (i),
-    Target Addresses [...] {
-        Address ID (i),
-        Delay Microseconds (i),
-    },
-    Coordination Token (64),
+  Type (i) = 0x3d7e92 / 0x3d7e93,
+  Round (i),
+  Paired With Sequence Number (i),
+  IP Address (32 or 128),
+  Port (16),
+  Has Target Peer Id (8) = 0 or 1,      // saorsa extension
+  [ Target Peer Id (256) ],             // present iff the flag is 1
 }
 ```
 
-#### Coordination Protocol (Symmetric P2P)
+Legacy format: as above, but with `IP Version (8)` before the address and `Flow Info (32), Scope Id (32)` after the port for IPv6, then the same trailer. The trailer is always written by the sender; the draft has no trailer. A flag value other than 0 or 1 is a decode error.
 
-1. **Peer A** wants to connect to Peer B
-2. **Any connected peer C** coordinates by forwarding addresses
-3. **Peer C** sends PUNCH_ME_NOW to both A and B with timing
-4. Both peers simultaneously send packets after specified delay
-5. Success reported via ADD_ADDRESS frame
+IP Address and Port are the address the receiver should punch towards, normally the sender's own external address. A frame sent directly rather than relayed may carry the unspecified address and port 0. Target Peer Id identifies the peer a coordinator should relay the frame to (see Coordination).
 
-### REMOVE_ADDRESS Frame (Type=0x3d7e94)
+### REMOVE_ADDRESS
 
-Removes a previously advertised address.
-
-#### Frame Structure
+Same in both formats:
 
 ```
 REMOVE_ADDRESS Frame {
-    Type (i) = 0x3d7e94,
-    Address ID (i),
+  Type (i) = 0x3d7e94,
+  Sequence Number (i),
 }
 ```
 
-## NAT Traversal Protocol
+### OBSERVED_ADDRESS
 
-### Overview
-
-The NAT traversal protocol enables direct peer-to-peer connections through various NAT types without requiring STUN/TURN servers.
-
-### Symmetric P2P Model (v0.13.0+)
-
-All nodes have identical capabilities:
-- **Connect**: Initiate connections to other peers
-- **Accept**: Accept incoming connections from peers
-- **Observe**: See external addresses of connecting peers
-- **Report**: Send OBSERVED_ADDRESS frames to peers
-- **Coordinate**: Help two other peers establish a connection
-- **Relay**: Forward traffic when direct connection fails
-
-There are no special roles - any peer can perform any function.
-
-### Connection Establishment Flow
-
-```mermaid
-sequenceDiagram
-    participant Peer A
-    participant Peer C (any peer)
-    participant Peer B
-
-    Peer A->>Peer C: Connect + NAT traversal enabled
-    Peer C->>Peer A: OBSERVED_ADDRESS (public IP:port)
-    Peer A->>Peer C: ADD_ADDRESS (local candidates)
-
-    Peer B->>Peer C: Connect + NAT traversal enabled
-    Peer C->>Peer B: OBSERVED_ADDRESS (public IP:port)
-    Peer B->>Peer C: ADD_ADDRESS (local candidates)
-
-    Peer A->>Peer C: Request connection to Peer B
-    Peer C->>Peer B: Forward request + Peer A addresses
-    Peer C->>Peer A: Send Peer B addresses
-
-    Peer C->>Peer A: PUNCH_ME_NOW (round 1)
-    Peer C->>Peer B: PUNCH_ME_NOW (round 1)
-
-    Peer A-->>Peer B: Simultaneous packets
-    Peer B-->>Peer A: Simultaneous packets
-
-    Peer A->>Peer B: Direct QUIC connection
-```
-
-### Candidate Types and Priority
-
-Candidates are prioritized using a formula similar to ICE:
+Identical to the draft:
 
 ```
-priority = (2^24 * type_preference) +
-           (2^8 * local_preference) +
-           (256 - component_id)
-```
-
-Type preferences:
-- Local: 126
-- Server Reflexive: 100
-- Relayed: 10
-- Predicted: 5
-
-### Symmetric NAT Handling
-
-For symmetric NATs, saorsa-transport implements port prediction:
-
-1. **Linear Prediction**: Assumes sequential port allocation
-2. **Delta Prediction**: Based on observed port differences
-3. **Range Prediction**: Tests a range around predicted port
-
-Example:
-```rust
-// Predict next port for symmetric NAT
-let predicted_ports = predict_symmetric_ports(
-    observed_ports,  // Historical observations
-    target_addr,     // Destination address
-    strategy         // PredictionStrategy
-);
-
-// Add predicted candidates
-for port in predicted_ports {
-    add_candidate(CandidateAddress {
-        addr: SocketAddr::new(public_ip, port),
-        source: CandidateSource::Predicted,
-        priority: calculate_priority(CandidateSource::Predicted),
-    });
+OBSERVED_ADDRESS Frame {
+  Type (i) = 0x9f81a6 / 0x9f81a7,
+  Sequence Number (i),
+  IP Address (32 or 128),
+  Port (16),
 }
 ```
 
-## Security Considerations
+A connection sends one OBSERVED_ADDRESS, with sequence number 0, reporting the peer's address on the primary path.
 
-### Address Validation
+### TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE
 
-Observed addresses MUST be validated to prevent address spoofing:
+Not in either draft. Decoded and validated on receive; never sent (see Known issues).
 
-1. **Token Validation**: Include cryptographic token in OBSERVED_ADDRESS
-2. **Rate Limiting**: Limit frequency of address updates
-3. **Source Verification**: Only accept from established connections
+```
+TRY_CONNECT_TO Frame {
+  Type (i) = 0x3d7e95 / 0x3d7e96,
+  Request Id (i),
+  IP Address (32 or 128),
+  Port (16),
+  Timeout Ms (16),
+}
 
-### Amplification Prevention
-
-To prevent amplification attacks:
-
-1. Limit response size to request size
-2. Require established connection for NAT traversal
-3. Rate limit hole punching attempts
-
-### Privacy Considerations
-
-1. **Address Disclosure**: Only share addresses with authorized peers
-2. **Metadata Protection**: Encrypt coordination messages
-3. **Timing Attacks**: Add random jitter to hole punching
-
-## Implementation Notes
-
-### Frame Parsing
-
-```rust
-impl Frame {
-    pub fn parse(input: &mut impl Buf) -> Result<Self, FrameError> {
-        let frame_type = input.get_var()?;
-
-        match frame_type {
-            0x3d7e90 | 0x3d7e91 => parse_add_address(input, frame_type),
-            0x3d7e92 | 0x3d7e93 => parse_punch_me_now(input, frame_type),
-            0x3d7e94 => parse_remove_address(input),
-            0x9f81a6 | 0x9f81a7 => parse_observed_address(input, frame_type),
-            _ => Err(FrameError::UnknownType(frame_type)),
-        }
-    }
+TRY_CONNECT_TO_RESPONSE Frame {
+  Type (i) = 0x3d7e97 / 0x3d7e98,
+  Request Id (i),
+  Success (8) = 1 on success, otherwise 0,
+  Error Code (8),                      // written as 0 on success
+  Source IP Address (32 or 128),
+  Source Port (16),
 }
 ```
 
-### State Management
+Error codes: 0 Timeout, 1 ConnectionRefused, 2 NetworkUnreachable, 3 HostUnreachable, 4 RateLimited, 5 InvalidAddress, 255 InternalError. Any other received value is treated as InternalError. The error code is ignored when Success is non-zero.
 
-```rust
-struct NatTraversalState {
-    // v0.13.0+: No role field - all peers are symmetric
-    candidates: HashMap<u64, CandidateAddress>,
-    observed_addresses: VecDeque<ObservedAddress>,
-    coordination_rounds: HashMap<u64, CoordinationRound>,
-    peer_candidates: HashMap<PeerId, Vec<CandidateAddress>>,
-}
-```
+### Format selection
 
-### Concurrency Considerations
+A sender uses the RFC format for ADD_ADDRESS and PUNCH_ME_NOW only when the peer advertised rfc_nat_traversal (see Negotiation); otherwise it uses the legacy format. A receiver always tries the RFC layout first and falls back to the legacy layout only if that fails. In practice only the RFC format can be received reliably (see Known issues). All other frames have a single format.
 
-1. **Thread Safety**: Use Arc<Mutex<>> for shared state
-2. **Async Operations**: Non-blocking candidate discovery
-3. **Timeout Handling**: Configurable timeouts for all operations
+## Receive rules
 
-## Testing
+- ADD_ADDRESS, PUNCH_ME_NOW, REMOVE_ADDRESS received when NAT traversal is not active on the connection: PROTOCOL_VIOLATION. TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE do not require NAT traversal.
+- OBSERVED_ADDRESS received on a connection where the peer did not send address_discovery, or where the application has disabled address discovery: PROTOCOL_VIOLATION.
+- The draft's direction rules (ADD_ADDRESS and REMOVE_ADDRESS server-to-client only, PUNCH_ME_NOW client-to-server only) are not enforced; any peer may send any of them.
+- ADD_ADDRESS is checked in this order:
+  1. An address whose IP equals the IP of the peer's current path is silently dropped. IPv4-mapped IPv6 addresses are normalized first.
+  2. Silently dropped: more than 20 candidates from this peer in 60 seconds (every attempt counts, including rejected ones), or the receiver is under resource pressure.
+  3. Silently dropped: port 0 or below 1024; unspecified, broadcast, multicast or documentation IPv4 addresses; loopback unless allowed locally; multicast or unspecified IPv6 addresses; addresses made of one repeated octet or segment.
+  4. If 50 remote candidates are already held: PROTOCOL_VIOLATION. This check comes before the duplicate check, so a duplicate sent to a full table also closes the connection.
+  5. An address already held under another sequence number is silently dropped. A known sequence number with a new address replaces the old one.
+- REMOVE_ADDRESS for an unknown sequence number is ignored.
+- OBSERVED_ADDRESS with a sequence number less than or equal to the highest already received is ignored (tracked per path; only path 0 is used today).
+- TRY_CONNECT_TO is validated (a loopback target is refused unless loopback is allowed locally, and an unspecified target is refused), but no response is ever put on the wire.
 
-### Unit Tests
+## Coordination (PUNCH_ME_NOW relay)
 
-```rust
-#[test]
-fn test_observed_address_frame_encoding() {
-    let frame = Frame::ObservedAddress {
-        sequence: 42,
-        ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-        port: 9000,
-    };
+Every connection with NAT traversal active can act as a coordinator. A relayed hole punch works like this:
 
-    let mut buf = BytesMut::new();
-    frame.encode(&mut buf);
+1. The initiator sends PUNCH_ME_NOW to a connected peer, the coordinator, with the trailer flag 1, Target Peer Id set to the peer it wants to reach, its own external address, and Paired With Sequence Number 0.
+2. The coordinator validates the frame and silently ignores it if it fails. It is rejected for: rate limits (300 coordination requests per 60 s), the address checks above, a round above 1,000,000, a paired sequence number above 10,000, or a target equal to the sender.
+3. The coordinator finds a connection to the target by Target Peer Id. It first looks for a connection registered under that id, then compares it with each connection's address-derived 32-byte id: byte 0 = 4 or 6, then the IP octets, then the port, zero-padded. Peer ids are registered by the embedding application through `P2pEndpoint::register_connection_peer_id`; this crate does not derive them. When this crate sends the request itself, Target Peer Id is the peer id the caller supplied for the target: through `P2pEndpoint::set_hole_punch_target_peer_id` before the hole punch, or the `target_peer_id` argument of `NatTraversalEndpoint::initiate_nat_traversal_for_peer`. Only when no id is supplied, as with `NatTraversalEndpoint::initiate_nat_traversal`, does it use the target's address-derived id.
+4. The coordinator forwards the frame to the target with the trailer flag 0, keeping Round, Paired With Sequence Number and address. If it has no connection to the target, nothing is sent and the initiator is not told.
+5. The target (flag 0) checks the round. A round of 0, or one more than 100 away from its own current round, is a PROTOCOL_VIOLATION on the connection to the coordinator. Otherwise it starts sending hole-punch packets to the address in the frame.
 
-    let decoded = Frame::parse(&mut buf.freeze()).unwrap();
-    assert_eq!(frame, decoded);
-}
-```
+A frame with the flag set to 1 is always handled as a request to coordinate, never as one addressed to the receiver.
 
-### Integration Tests
+## Deviations from the drafts
 
-Test against various NAT configurations:
+1. Two wire formats for ADD_ADDRESS and PUNCH_ME_NOW (RFC and legacy), selected per connection by the saorsa-specific rfc_nat_traversal parameter.
+2. PUNCH_ME_NOW carries a trailer (`Has Target Peer Id`, optional 32-byte id) that the draft does not have. A draft-conformant PUNCH_ME_NOW without the trailer is accepted only if it is the last frame in the packet or is followed by a PADDING (0x00) byte. Otherwise the next byte is read as the trailer flag and decoding usually fails.
+3. No client/server asymmetry: either endpoint may send either form of the nat_traversal parameter and any NAT traversal frame. Two ClientSupport endpoints do not enable NAT traversal.
+4. The concurrency limit is capped at 100 on the accepting side (the draft allows any value above 0), and is not otherwise used.
+5. Candidate pairing and prioritization run on both sides, not only on the client.
+6. Additional frames TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE, and the additional parameters rfc_nat_traversal and pqc_algorithms.
+7. ADD_ADDRESS from the peer's own IP, from low ports, or from reserved addresses is dropped, and more than 50 candidates closes the connection.
+8. One OBSERVED_ADDRESS per connection; the address_discovery modes are not honoured.
+9. PUNCH_ME_NOW relay through a coordinator, identified by Target Peer Id.
 
-```bash
-# Test symmetric NAT traversal
-cargo test --test nat_traversal -- symmetric_nat
+## Known issues
 
-# Test with packet loss
-cargo test --test nat_traversal -- with_loss
+All tracked in V2-1823.
 
-# Test all NAT combinations
-cargo test --test nat_traversal -- matrix
-```
+- **Legacy-format frames can't be received reliably.** The receiver tries the RFC decoder first and, on error, runs the legacy decoder on the same buffer without rewinding. Worse, a legacy ADD_ADDRESS always parses "successfully" as RFC.
+  - Example: the legacy IPv4 ADD_ADDRESS body (after the type) `01 40 64 04 c0 00 02 01 12 34` means sequence 1, priority 100, version 4, 192.0.2.1:4660.
+  - The RFC decoder reads sequence 1, address 64.100.4.192, port 2, and leaves `01 12 34` to be parsed as further frames.
+  - A legacy PUNCH_ME_NOW parses as RFC only when the byte that lands in the flag position is 0 or 1. Otherwise decoding fails with FRAME_ENCODING_ERROR.
+- **A relayed PUNCH_ME_NOW with round 0 closes the target's connection to the coordinator.** The coordinator accepts and forwards round 0, but the target treats it as a PROTOCOL_VIOLATION.
+- **A duplicate ADD_ADDRESS sent to a full candidate table closes the connection**, because the cap is checked before the duplicate check.
+- **The address_discovery modes are parsed and then ignored.** send only, receive only, and send and receive all behave the same. The rate limiter for OBSERVED_ADDRESS (10 per second) and its bootstrap-mode variants never take effect, because only one frame is ever sent.
+- **The negotiated nat_traversal concurrency limit is computed but not used**, and the 100 cap is checked only on the accepting side.
+- **The decoder doesn't check the parameter length** for nat_traversal (ServerSupport) and address_discovery. A wrong length makes it read the value from the bytes of the next parameter.
+- **TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE are never sent.** No send path encodes them, the response queue is filled but never drained, and the endpoint handler for a received request is a TODO. Peers must not rely on them.
+- **`src/nat_traversal/frames.rs` defines `FRAME_TYPE_PUNCH_ME_NOW = 0x3d7e91` and `FRAME_TYPE_REMOVE_ADDRESS = 0x3d7e92`, which are wrong.** That module is a separate multi-transport codec whose `encode_with_type` is not called on the packet path. Use the IDs in `src/frame.rs`.
 
-## Debugging
+## Source of truth
 
-### Enable Protocol Logging
-
-```bash
-RUST_LOG=saorsa_transport::frame=trace,saorsa_transport::connection::nat_traversal=debug \
-    cargo test nat_traversal -- --nocapture
-```
-
-### Packet Capture
-
-Extension frames in Wireshark:
-
-1. Filter: `quic.frame_type == 0x3d7e90` (ADD_ADDRESS IPv4)
-2. Filter: `quic.frame_type == 0x9f81a6` (OBSERVED_ADDRESS IPv4)
-3. Decode as: Custom QUIC frames
-4. Export: JSON format for analysis
-
-### Common Issues
-
-1. **No OBSERVED_ADDRESS received**
-   - Check transport parameter negotiation
-   - Verify both peers support extension
-
-2. **Hole punching fails**
-   - Check firewall allows outbound UDP
-   - Verify coordinator connectivity
-   - Review timing logs
-
-3. **Symmetric NAT issues**
-   - Enable port prediction
-   - Increase candidate count
-   - Consider relay fallback
-
-## Future Extensions
-
-Planned enhancements:
-
-1. **Multi-path Coordination**: Simultaneous attempts on multiple paths
-2. **IPv6 Privacy Extensions**: Handle temporary addresses
-3. **QUIC Multicast**: One-to-many NAT traversal
-4. **Connection Migration**: Maintain connection across NAT changes
-
-## References
-
-- [draft-ietf-quic-address-discovery-00](https://datatracker.ietf.org/doc/draft-ietf-quic-address-discovery/)
-- [draft-seemann-quic-nat-traversal-02](https://datatracker.ietf.org/doc/draft-seemann-quic-nat-traversal/)
-- [RFC 9000 - QUIC Transport Protocol](https://www.rfc-editor.org/rfc/rfc9000.html)
-- [RFC 7250 - Raw Public Keys in TLS](https://www.rfc-editor.org/rfc/rfc7250.html)
+- `src/frame.rs`: frame type IDs, the frame decoder, `ObservedAddress`.
+- `src/frame/nat_traversal_unified.rs`: ADD_ADDRESS, PUNCH_ME_NOW, REMOVE_ADDRESS and TRY_CONNECT_TO(_RESPONSE) encode/decode; format selection.
+- `src/transport_parameters.rs`: parameter IDs, encoding, validation.
+- `src/connection/mod.rs`: frame send and receive handling, the per-space frame rules, format and capability negotiation, address discovery.
+- `src/connection/nat_traversal.rs`: candidate validation and limits, coordinator and round checks.
+- `src/endpoint.rs` and `src/shared.rs`: relaying PUNCH_ME_NOW to the target and the address-derived peer id.
+- `src/nat_traversal_api.rs` (`send_coordination_request_with_peer_id`) and `src/p2p_endpoint.rs` (`try_hole_punch`): the Target Peer Id this crate sends.
+- `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt`, `docs/rfcs/draft-ietf-quic-address-discovery-00.txt`.
+- ADRs: `docs/adr/ADR-004`, `ADR-005`, `ADR-008`.
