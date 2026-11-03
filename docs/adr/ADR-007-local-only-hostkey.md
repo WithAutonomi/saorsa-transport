@@ -4,6 +4,15 @@
 
 Accepted (2025-12-22)
 
+> **Note (2026-11-03, V2-1798):** As built, this differs from the design below in four ways.
+>
+> - **Key derivation:** the HostKey derives symmetric keys (`antq:endpoint-encrypt:v1`, `antq:endpoint-key:v1`) that encrypt the stored ML-DSA-65 keypair. Endpoint keypairs are not derived from the HostKey, and there is no `derive_endpoint_key`.
+> - **Storage:** it uses the `keyring` crate plus encrypted and plain file fallbacks, not `security-framework` or `secret-service`.
+> - **API:** the entry points are `Node::with_host_identity` and `P2pConfigBuilder::with_host_identity`.
+> - **CLI:** the `identity` and `doctor` commands don't exist; the CLI was removed in #228.
+>
+> The decision to keep the HostKey local-only is unchanged.
+
 Amended (2026-05-28): bootstrap cache integration was removed. HostKey remains
 the local root secret for endpoint key derivation and encrypted local state, but
 there is no current public `BootstrapCache` API, cache CLI, or

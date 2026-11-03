@@ -4,6 +4,8 @@
 
 Accepted (2025-12-21)
 
+> **Note (2026-11-03, V2-1798):** `src/masque/migration.rs` and the legacy relay frames `0x44`–`0x46` no longer exist. The module table and test counts below are as of December 2025 and aren't maintained. Relay resource budgets now live in `src/relay/` and the MASQUE server config, not in ADR-002, which is superseded. See also ADR-009, ADR-011 and ADR-013. The decision itself is unchanged.
+
 ## Context
 
 ### The Problem

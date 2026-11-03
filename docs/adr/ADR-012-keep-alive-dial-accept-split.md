@@ -4,6 +4,8 @@
 
 Proposed
 
+> **Note (2026-11-03, V2-1798):** Amended by ADR-014. The accepting side now has a 25-second backstop keep-alive (`ACCEPT_KEEP_ALIVE_BACKSTOP`), so the `keep_alive_interval(None)` shown below for the accepting side no longer applies. The dialling-side cadence is unchanged.
+
 ## Context
 
 We wanted to cut wasted egress. A node in this network holds many connections

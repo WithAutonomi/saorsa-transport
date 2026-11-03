@@ -4,6 +4,8 @@
 
 Accepted (2025-12-21)
 
+> **Note (2026-11-03, V2-1798):** `docs/SYMMETRIC_P2P.md` and `src/quic_node.rs`, named in the references, no longer exist; the node API is `src/node.rs` and `src/p2p_endpoint.rs`. The relay service is on by default but can be turned off (`NatConfig::enable_relay_service`). The decision itself is unchanged.
+
 ## Context
 
 Traditional P2P systems often have role distinctions:

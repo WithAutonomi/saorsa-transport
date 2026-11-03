@@ -241,8 +241,12 @@ pub mod structured_events;
 /// Zero-configuration P2P node - THE PRIMARY API
 ///
 /// Use [`Node`] for the simplest possible P2P experience:
-/// ```rust,ignore
+/// ```no_run
+/// # use saorsa_transport::Node;
+/// # async fn example() -> anyhow::Result<()> {
 /// let node = Node::new().await?;
+/// # Ok(())
+/// # }
 /// ```
 #[cfg(feature = "native")]
 pub mod node;
@@ -797,3 +801,9 @@ pub use token::TokenStore;
 pub(crate) use token::{NoneTokenLog, ResetToken, TokenLog};
 #[cfg(feature = "native")]
 pub(crate) use token_memory_cache::TokenMemoryCache;
+
+// Compile the README's Rust code blocks as doctests, so its Quick Start can't drift
+// from the API (V2-1798). `sh` blocks are not Rust and are skipped.
+#[cfg(all(doctest, feature = "native"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
