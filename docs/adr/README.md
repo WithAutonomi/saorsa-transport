@@ -59,5 +59,4 @@ Relevant commits, RFCs, code paths.
 
 - [Architecture Overview](../architecture/ARCHITECTURE.md)
 - [Symmetric P2P Design](../SYMMETRIC_P2P.md)
-- [NAT Traversal Guide](../NAT_TRAVERSAL_GUIDE.md)
 - [PQC Authentication Spec](../rfcs/saorsa-transport-pqc-authentication.md)

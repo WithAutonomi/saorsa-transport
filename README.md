@@ -174,8 +174,6 @@ NAT traversal is built into the QUIC protocol via extension frames, not STUN/TUR
 | Symmetric | 60-80% | Prediction algorithms |
 | CGNAT | 50-70% | Relay fallback may be needed |
 
-See [docs/NAT_TRAVERSAL_GUIDE.md](docs/NAT_TRAVERSAL_GUIDE.md) for detailed information.
-
 ## Raw Public Key Identity (v0.2)
 
 Each node has a single ML-DSA-65 key pair for both identity and authentication:
@@ -328,9 +326,8 @@ See [docs/review.md](docs/review.md) for detailed RFC compliance analysis.
 
 ## Documentation
 
-- [API Guide](docs/API_GUIDE.md) - Complete API reference
+- [API reference](https://docs.rs/saorsa-transport) - on docs.rs
 - [Symmetric P2P](docs/SYMMETRIC_P2P.md) - Architecture explanation
-- [NAT Traversal Guide](docs/NAT_TRAVERSAL_GUIDE.md) - NAT traversal details
 - [PQC Configuration](docs/guides/pqc-configuration.md) - PQC tuning
 - [Architecture](docs/architecture/ARCHITECTURE.md) - System design
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues
