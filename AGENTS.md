@@ -96,7 +96,7 @@ cargo check --all-features && cargo check --no-default-features
 
 ### Debugging
 
-`RUST_LOG` targets are module paths under the `saorsa_transport` crate (only `pub` modules are useful as filters; private ones like `congestion` and `token` inherit the crate target). Examples:
+`RUST_LOG` targets are module paths under the `saorsa_transport` crate. A `tracing` event's target is the module it is logged from (`module_path!()`), whether that module is public or private, so `saorsa_transport::token` filters as well as `saorsa_transport::p2p_endpoint`. Filters match by prefix. A few events set their own target instead: the periodic byte-count summaries use `saorsa_transport::traffic` (`nat_traversal_api.rs`) and `saorsa_transport::relay::traffic` (`masque/relay_server.rs`), and the `src/logging` helpers use `saorsa_transport::connection::lifecycle` and `saorsa_transport::frame::*`. Examples:
 
 ```bash
 RUST_LOG=saorsa_transport::nat_traversal_api=debug cargo test --test nat_traversal_api_tests -- --nocapture
@@ -105,7 +105,7 @@ RUST_LOG=saorsa_transport::crypto=debug cargo test --test pqc_basic_integration 
 RUST_LOG=debug cargo run --example simple_p2p
 ```
 
-Other useful `pub` targets: `nat_traversal`, `candidate_discovery`, `p2p_endpoint`, `masque`, `relay`, `discovery`, `high_level`, `trust`.
+Other useful targets: `nat_traversal`, `candidate_discovery`, `p2p_endpoint`, `masque`, `relay`, `discovery`, `high_level`, `trust`.
 
 ## Pull requests: fill the template
 
