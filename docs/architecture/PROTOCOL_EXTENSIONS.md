@@ -175,7 +175,7 @@ Every connection with NAT traversal active can act as a coordinator. A relayed h
 
 1. The initiator sends PUNCH_ME_NOW to a connected peer, the coordinator, with the trailer flag 1, Target Peer Id set to the peer it wants to reach, its own external address, and Paired With Sequence Number 0.
 2. The coordinator validates the frame and silently ignores it if it fails. It is rejected for: rate limits (300 coordination requests per 60 s), the address checks above, a round above 1,000,000, a paired sequence number above 10,000, or a target equal to the sender.
-3. The coordinator finds a connection to the target by Target Peer Id. It first looks for a connection registered under that id, then compares it with each connection's address-derived 32-byte id: byte 0 = 4 or 6, then the IP octets, then the port, zero-padded. Peer ids are registered by the embedding application through `P2pEndpoint::register_connection_peer_id`; this crate does not derive them. The relayed punches this crate sends itself use the address-derived id.
+3. The coordinator finds a connection to the target by Target Peer Id. It first looks for a connection registered under that id, then compares it with each connection's address-derived 32-byte id: byte 0 = 4 or 6, then the IP octets, then the port, zero-padded. Peer ids are registered by the embedding application through `P2pEndpoint::register_connection_peer_id`; this crate does not derive them. When this crate sends the request itself, Target Peer Id is the peer id the caller supplied for the target: through `P2pEndpoint::set_hole_punch_target_peer_id` before the hole punch, or the `target_peer_id` argument of `NatTraversalEndpoint::initiate_nat_traversal_for_peer`. Only when no id is supplied, as with `NatTraversalEndpoint::initiate_nat_traversal`, does it use the target's address-derived id.
 4. The coordinator forwards the frame to the target with the trailer flag 0, keeping Round, Paired With Sequence Number and address. If it has no connection to the target, nothing is sent and the initiator is not told.
 5. The target (flag 0) checks the round. A round of 0, or one more than 100 away from its own current round, is a PROTOCOL_VIOLATION on the connection to the coordinator. Otherwise it starts sending hole-punch packets to the address in the frame.
 
@@ -217,5 +217,6 @@ All tracked in V2-1823.
 - `src/connection/mod.rs`: frame send and receive handling, the per-space frame rules, format and capability negotiation, address discovery.
 - `src/connection/nat_traversal.rs`: candidate validation and limits, coordinator and round checks.
 - `src/endpoint.rs` and `src/shared.rs`: relaying PUNCH_ME_NOW to the target and the address-derived peer id.
+- `src/nat_traversal_api.rs` (`send_coordination_request_with_peer_id`) and `src/p2p_endpoint.rs` (`try_hole_punch`): the Target Peer Id this crate sends.
 - `docs/rfcs/draft-seemann-quic-nat-traversal-02.txt`, `docs/rfcs/draft-ietf-quic-address-discovery-00.txt`.
 - ADRs: `docs/adr/ADR-004`, `ADR-005`, `ADR-008`.
