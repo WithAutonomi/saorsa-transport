@@ -6,7 +6,7 @@ CI runs on pull requests, on a schedule, and by hand (`workflow_dispatch`). Noth
 
 | Workflow | Job | What it runs |
 | -- | -- | -- |
-| `ci.yml` | Quick Checks | fmt; clippy `--all-features --all-targets`; clippy on the portable WebRTC profile; `cargo check` of lib/bins/examples; both WASM checks; licence headers |
+| `ci.yml` | Quick Checks | fmt; clippy `--all-features --all-targets`; clippy on the portable WebRTC profile; `cargo doc` with `-D warnings` (default and all features); `cargo check` of lib/bins/examples; both WASM checks; licence headers |
 | | Test Suite (Linux) | build; lib tests with all features and with no default features; WebRTC profile tests; every integration test target (`--test '*'`); doc tests |
 | | Tests (windows-latest), Tests (macos-latest) | default features: lib tests and the `quick` and `auto_binding_integration` targets. macOS also builds `x86_64-apple-darwin` |
 | | MSRV (1.95.0) | `cargo check` with all features and with no default features |

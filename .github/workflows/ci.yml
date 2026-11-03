@@ -56,6 +56,16 @@ jobs:
       - name: Clippy portable WebRTC profile
         run: cargo clippy -p saorsa-transport --lib --no-default-features --features webrtc -- -D warnings
 
+      # Rustdoc warnings (broken or private intra-doc links, bad doc markup) fail
+      # the build. Default features is what docs.rs builds; --all-features covers
+      # the feature-gated modules (webrtc, ble), where links broke unseen before.
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --locked
+          cargo doc --no-deps --locked --all-features
+
       - name: Build check
         run: cargo check --lib --bins --examples
 
