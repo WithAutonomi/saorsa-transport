@@ -157,7 +157,7 @@ enable_local_discovery = true
 enable_stun_like_discovery = true
 # v0.13.0+: Uses known_peers instead of bootstrap_nodes
 known_peers = [
-    "quic.saorsalabs.com:9000",
+    "203.0.113.10:9000",
     "backup.example.com:9000"
 ]
 
