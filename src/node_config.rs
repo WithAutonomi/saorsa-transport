@@ -31,7 +31,7 @@
 //!
 //! // Only configure what you need
 //! let config = NodeConfig::builder()
-//!     .known_peer("quic.saorsalabs.com:9000".parse()?)
+//!     .known_peer("203.0.113.10:9000".parse()?)
 //!     .build();
 //!
 //! let node = Node::with_config(config).await?;

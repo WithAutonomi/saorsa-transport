@@ -39,7 +39,7 @@
 //!     println!("Acting as relay: {}", status.is_relaying);
 //!
 //!     // Connect to a peer
-//!     let conn = node.connect_addr("quic.saorsalabs.com:9000".parse()?).await?;
+//!     let conn = node.connect_addr("203.0.113.10:9000".parse()?).await?;
 //!
 //!     // Accept connections
 //!     let incoming = node.accept().await;
@@ -116,7 +116,7 @@ pub enum NodeError {
 /// let node = Node::new().await?;
 ///
 /// // Or with known peers
-/// let node = Node::with_peers(vec!["quic.saorsalabs.com:9000".parse()?]).await?;
+/// let node = Node::with_peers(vec!["203.0.113.10:9000".parse()?]).await?;
 ///
 /// // Or with persistent identity
 /// let keypair = load_keypair()?;
@@ -183,7 +183,7 @@ impl Node {
     ///
     /// ```rust,ignore
     /// let node = Node::with_peers(vec![
-    ///     "quic.saorsalabs.com:9000".parse()?,
+    ///     "203.0.113.10:9000".parse()?,
     ///     "peer2.example.com:9000".parse()?,
     /// ]).await?;
     /// ```
@@ -256,7 +256,7 @@ impl Node {
     /// ```rust,ignore
     /// let config = NodeConfig::builder()
     ///     .bind_addr("0.0.0.0:9000".parse()?)
-    ///     .known_peer("quic.saorsalabs.com:9000".parse()?)
+    ///     .known_peer("203.0.113.10:9000".parse()?)
     ///     .keypair(load_keypair()?)
     ///     .build();
     ///
@@ -415,7 +415,7 @@ impl Node {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let conn = node.connect_addr("quic.saorsalabs.com:9000".parse()?).await?;
+    /// let conn = node.connect_addr("203.0.113.10:9000".parse()?).await?;
     /// println!("Connected to: {:?}", conn.peer_id);
     /// ```
     pub async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection, NodeError> {

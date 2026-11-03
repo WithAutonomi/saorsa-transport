@@ -241,8 +241,8 @@ pub mod tracing;
 /// Best-effort UPnP IGD port mapping for NAT traversal assistance.
 ///
 /// This module is feature-gated behind `upnp` (enabled by default). When
-/// disabled, [`UpnpMappingService`] is still present but is a no-op stub
-/// that always reports [`UpnpState::Unavailable`].
+/// disabled, [`UpnpMappingService`](crate::upnp::UpnpMappingService) is still present but is a no-op stub
+/// that always reports [`UpnpState::Unavailable`](crate::upnp::UpnpState::Unavailable).
 #[cfg(feature = "native")]
 pub mod upnp;
 

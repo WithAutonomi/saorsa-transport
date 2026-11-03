@@ -27,11 +27,12 @@ This guide helps diagnose and resolve common issues with saorsa-transport's v0.1
 
 1. **Check network connectivity**
    ```bash
-   # Test basic network connectivity
-   ping quic.saorsalabs.com
+   # Test basic network connectivity (<peer-address> is one of your known peers)
+   ping <peer-address>
 
-   # Check if port is reachable
-   nc -zv quic.saorsalabs.com 9000
+   # Check if the UDP port is reachable (QUIC runs over UDP; a missing reply
+   # is not conclusive, since UDP has no handshake)
+   nc -zvu <peer-address> 9000
    ```
 
 2. **Verify known peers are running**

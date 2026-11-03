@@ -1222,7 +1222,7 @@ pub struct NatTraversalEndpoint {
 /// BBRv2 is the default: its per-packet delivery-rate sampler, loss-aware
 /// startup exit, and short-term `inflight_hi`/`inflight_lo` caps handle
 /// lossy paths and shared bottlenecks better than BBRv1, while preserving
-/// BBR's rate-based pacing (wired through [`crate::connection::pacing::Pacer`])
+/// BBR's rate-based pacing (wired through the connection's internal `Pacer`)
 /// and BDP-sized congestion window that fill high-BDP paths like MASQUE
 /// relay hops. CUBIC remains available as a conservative fallback, and
 /// BBRv1 is kept for comparison / debugging.
@@ -1369,7 +1369,7 @@ pub struct NatTraversalConfig {
     /// Internally tunes the QUIC per-stream receive window so that a single
     /// message of this size can be transmitted without flow-control rejection.
     ///
-    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
+    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`](crate::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE) (1 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 

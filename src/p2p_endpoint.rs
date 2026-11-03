@@ -33,7 +33,7 @@
 //!     // All nodes are symmetric - they can both connect and accept connections
 //!     let config = P2pConfig::builder()
 //!         .bind_addr("0.0.0.0:9000".parse()?)
-//!         .known_peer("quic.saorsalabs.com:9000".parse()?)
+//!         .known_peer("203.0.113.10:9000".parse()?)
 //!         .build()?;
 //!
 //!     let endpoint = P2pEndpoint::new(config).await?;
