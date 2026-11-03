@@ -31,7 +31,7 @@ Negotiation:
 
 ## Frame types
 
-Frame types are encoded as varints. All of them are larger than 16383 and smaller than 2^30, so each takes 4 bytes on the wire. Odd types carry an IPv6 address, even types an IPv4 address.
+Frame types are encoded as varints. All of them are larger than 16383 and smaller than 2^30, so each takes 4 bytes on the wire. Each frame that carries an address has one type for IPv4 and one for IPv6, as listed below. Take the address family from this table, not from the type's parity: for ADD_ADDRESS, PUNCH_ME_NOW and OBSERVED_ADDRESS the IPv4 type is even, but for TRY_CONNECT_TO and TRY_CONNECT_TO_RESPONSE it is odd.
 
 | Frame | IPv4 | IPv6 |
 |---|---|---|
@@ -175,7 +175,7 @@ Every connection with NAT traversal active can act as a coordinator. A relayed h
 
 1. The initiator sends PUNCH_ME_NOW to a connected peer, the coordinator, with the trailer flag 1, Target Peer Id set to the peer it wants to reach, its own external address, and Paired With Sequence Number 0.
 2. The coordinator validates the frame and silently ignores it if it fails. It is rejected for: rate limits (300 coordination requests per 60 s), the address checks above, a round above 1,000,000, a paired sequence number above 10,000, or a target equal to the sender.
-3. The coordinator finds a connection to the target. The Target Peer Id is either the target's authenticated peer id, which is the BLAKE3 hash of its ML-DSA-65 public key, or an address-derived 32-byte id: byte 0 = 4 or 6, then the IP octets, then the port, zero-padded.
+3. The coordinator finds a connection to the target. The Target Peer Id is either the target's authenticated peer id, or an address-derived 32-byte id: byte 0 = 4 or 6, then the IP octets, then the port, zero-padded. The peer id is BLAKE3 over the ASCII prefix `AUTONOMI_PEER_ID_V2:` followed by the peer's ML-DSA-65 public key (`fingerprint_public_key` in `src/crypto/raw_public_keys/pqc.rs`).
 4. The coordinator forwards the frame to the target with the trailer flag 0, keeping Round, Paired With Sequence Number and address. If it has no connection to the target, nothing is sent and the initiator is not told.
 5. The target (flag 0) checks the round. A round of 0, or one more than 100 away from its own current round, is a PROTOCOL_VIOLATION on the connection to the coordinator. Otherwise it starts sending hole-punch packets to the address in the frame.
 
