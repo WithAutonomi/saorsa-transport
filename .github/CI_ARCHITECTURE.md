@@ -16,8 +16,6 @@ CI runs on pull requests, on a schedule, and by hand (`workflow_dispatch`). Noth
 | `coverage.yml` | Coverage | `cargo llvm-cov --lib`; HTML report artifact; warns below the threshold, doesn't gate |
 | `security.yml` | Vulnerability Scan (`cargo audit`), Policy Check (`cargo deny`), SBOM, Security Report, Dependency Review, Security Gate | only when `Cargo.toml` or `Cargo.lock` changes |
 
-`claude.yml` runs only when someone mentions `@claude`.
-
 ## Scheduled and manual
 
 | Workflow | When | What |
