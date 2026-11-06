@@ -29,8 +29,11 @@
 mod admission;
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "plain_stun.rs"]
+mod plain_stun;
 use diagnostics::{ConnectionObserver, ConnectionTracker};
 pub use diagnostics::{WebRtcConnectionMetrics, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot};
+pub use plain_stun::PlainBindingPolicy;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -300,6 +303,14 @@ impl WebRtcDirectListener {
     /// Return local listener and connection diagnostics.
     pub fn diagnostics(&self) -> WebRtcDiagnostics {
         self.mux.diagnostics.clone()
+    }
+
+    /// Answer plain STUN Binding requests (no ICE credentials) from the
+    /// sources `policy` allows, each rate limited, so the clients this
+    /// listener serves can learn their public address from it. `None`, the
+    /// default, drops them.
+    pub fn set_plain_binding_policy(&self, policy: Option<PlainBindingPolicy>) {
+        self.mux.plain_binding.set_policy(policy);
     }
 
     /// Return the listener certificate.
@@ -1267,6 +1278,7 @@ struct DirectUdpMux {
     limits: WebRtcAdmissionLimits,
     next_generation: AtomicU64,
     admission: parking_lot::Mutex<admission::Admission>,
+    plain_binding: plain_stun::PlainBinding,
     incoming: mpsc::Sender<IncomingAssociation>,
     socket: Weak<UdpSocket>,
     shutdown: CancellationToken,
@@ -1303,6 +1315,7 @@ impl DirectUdpMux {
             limits,
             next_generation: AtomicU64::new(1),
             admission: parking_lot::Mutex::new(admission::Admission::default()),
+            plain_binding: plain_stun::PlainBinding::default(),
             incoming,
             socket: Arc::downgrade(&socket),
             shutdown: CancellationToken::new(),
@@ -1332,6 +1345,16 @@ impl DirectUdpMux {
                 }
             };
             let packet = &buffer[..length];
+            // A plain Binding request asks this socket for the sender's
+            // public address; answered only where the application allows.
+            match self.plain_binding.verdict(packet, remote_addr) {
+                plain_stun::PlainVerdict::Reply(reply) => {
+                    let _ = socket.send_to(&reply, remote_addr).await;
+                    continue;
+                }
+                plain_stun::PlainVerdict::Drop => continue,
+                plain_stun::PlainVerdict::NotPlain => {}
+            }
             // Probe responses must bypass stale source mappings when a browser
             // replaces an association while reusing its UDP port.
             let probe_response = self.admission.lock().expects_response(packet, remote_addr);
